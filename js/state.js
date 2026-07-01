@@ -5,9 +5,11 @@
   const LSKEY = 'vessel_annotator_v1';
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
   let win = { center: 128, width: 255 };
+  let loupe = { zoom: 6, R: 3, mean: false };
 
   const key = (c, u) => c + '/' + u;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, coordOrder, window: win })); } catch (e) { } }
+  const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, coordOrder, window: win, loupe })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
@@ -15,6 +17,8 @@
         selections = o.selections || {}; visited = o.visited || {};
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
+        if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
+          loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean };
       }
     } catch (e) { }
   }
@@ -23,6 +27,8 @@
   function setCoordOrder(o) { coordOrder = (o === 'yx') ? 'yx' : 'xy'; persist(); }
   const getWindow = () => ({ center: win.center, width: win.width });
   function setWindow(C, W) { win = { center: C, width: W }; persist(); }
+  const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean });
+  function setLoupe(zoom, R, mean) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean }; persist(); }
 
   const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});
   const hasLocal = (c, u) => key(c, u) in selections;
@@ -73,6 +79,6 @@
 
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited)])];
 
-  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, hasLocal, selectedIds, count, toggle, undo,
+  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, hasLocal, selectedIds, count, toggle, undo,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);

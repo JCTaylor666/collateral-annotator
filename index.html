@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=4">
+<link rel="stylesheet" href="./css/style.css?v=5">
 </head>
 <body>
 <header class="toolbar">
@@ -29,6 +29,10 @@
   <label class="ctl">窗宽 <input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></label>
   <button id="btnAuto" class="btn sm">自动</button>
   <button id="btnWinReset" class="btn sm">复位窗</button>
+  <span class="sep"></span>
+  <label class="ctl">放大率 <input id="loupeZoom" type="range" min="2" max="16" step="1" value="6"><span id="loupeZoomv" class="val">6</span></label>
+  <label class="ctl">前后帧数 <input id="loupeR" type="range" min="1" max="6" step="1" value="3"><span id="loupeRv" class="val">3</span></label>
+  <label class="ctl loupe-meanctl"><input type="checkbox" id="loupeMean"> 3×3均值</label>
   <span class="spacer"></span>
 </header>
 
@@ -47,6 +51,16 @@
     <div id="tree" class="tree"></div>
   </aside>
 </main>
+
+<div id="loupePanel" class="loupe-panel hidden">
+  <div class="loupe-head">
+    <span id="loupeCoord" class="loupe-coord">—</span>
+  </div>
+  <div class="loupe-sub muted">按住 Cmd/Ctrl 检视 · 松开关闭 · 检视时不标注</div>
+  <div id="loupeStrip" class="loupe-strip"></div>
+  <div class="loupe-sub muted">跨帧原始灰度（虚线右为 minip 投影）</div>
+  <canvas id="loupeCurve" class="loupe-curve"></canvas>
+</div>
 
 <div id="confirmClear" class="modal-overlay hidden">
   <div class="modal">
@@ -69,11 +83,12 @@
   <div id="cursor" class="muted"></div>
 </footer>
 
-<script src="./js/npy.js?v=4"></script>
-<script src="./js/fs.js?v=4"></script>
-<script src="./js/loader.js?v=4"></script>
-<script src="./js/canvas.js?v=4"></script>
-<script src="./js/state.js?v=4"></script>
-<script src="./js/app.js?v=4"></script>
+<script src="./js/npy.js?v=5"></script>
+<script src="./js/fs.js?v=5"></script>
+<script src="./js/loader.js?v=5"></script>
+<script src="./js/canvas.js?v=5"></script>
+<script src="./js/state.js?v=5"></script>
+<script src="./js/loupe.js?v=5"></script>
+<script src="./js/app.js?v=5"></script>
 </body>
 </html>

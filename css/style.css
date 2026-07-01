@@ -47,3 +47,17 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .btn-danger:hover:not(:disabled){border-color:var(--warn)}
 .btn-cancel{font-size:18px;font-weight:700;padding:13px 34px;border-radius:10px;border-color:var(--accent);background:var(--accent);color:#fff}
 .btn-cancel:hover:not(:disabled){filter:brightness(1.06);border-color:var(--accent)}
+.loupe-panel{position:fixed;top:52px;right:0;width:320px;max-height:calc(100vh - 96px);overflow:auto;background:var(--panel);border-left:1px solid var(--border);box-shadow:-8px 0 24px rgba(0,0,0,.18);z-index:90;padding:10px 12px;pointer-events:none}
+.loupe-panel.hidden{display:none}
+.loupe-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:2px}
+.loupe-coord{font-weight:600;font-variant-numeric:tabular-nums}
+.loupe-meanctl input{accent-color:var(--accent)}
+.loupe-sub{font-size:11px;margin:6px 0 4px}
+.loupe-strip{display:flex;flex-wrap:wrap;gap:5px}
+.loupe-tile{display:flex;flex-direction:column;align-items:center;gap:2px}
+.loupe-tile canvas{width:92px;height:92px;display:block;border:1px solid var(--border);border-radius:4px;background:#2b2f36}
+.loupe-tile.cur canvas{border:2px solid var(--accent)}
+.loupe-tile .cap{font-size:10px;color:var(--muted);line-height:1.1;text-align:center}
+.loupe-tile.cur .cap{color:var(--accent);font-weight:600}
+.loupe-curve{width:100%;height:120px;display:block}
+body.inspecting #view{cursor:zoom-in}

@@ -4,6 +4,7 @@
 
   const CASE_RE = /^case_\d+$/;
   const FRAME_RE = /^frame_(\d+)$/;
+  let grayCanvas = null; // reused offscreen canvas for loadGray
 
   async function discover(rootHandle) {
     const cases = [];
@@ -65,5 +66,32 @@
     return { W, H, img, url, label: parsed.data, mask, annotation };
   }
 
-  root.Loader = { discover, loadUnit };
+  // Lightweight read for the inspect loupe: only frames.png -> grayscale (R channel).
+  // No npy, no annotation. Returns { W, H, gray:Uint8Array(W*H) }.
+  async function loadGray(unit) {
+    const pngH = await unit.handle.getFileHandle('frames.png');
+    const file = await pngH.getFile();
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image();
+        im.onload = () => resolve(im);
+        im.onerror = () => reject(new Error(unit.id + ': failed to load frames.png'));
+        im.src = url;
+      });
+      const W = img.naturalWidth, H = img.naturalHeight;
+      const cv = grayCanvas || (grayCanvas = document.createElement('canvas'));
+      cv.width = W; cv.height = H;
+      const cx = cv.getContext('2d', { willReadFrequently: true });
+      cx.drawImage(img, 0, 0, W, H);
+      const raw = cx.getImageData(0, 0, W, H).data;
+      const gray = new Uint8Array(W * H);
+      for (let i = 0; i < gray.length; i++) gray[i] = raw[i * 4];
+      return { W, H, gray };
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  root.Loader = { discover, loadUnit, loadGray };
 })(typeof window !== 'undefined' ? window : globalThis);

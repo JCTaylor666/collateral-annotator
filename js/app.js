@@ -9,6 +9,12 @@
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
 
+  // inspect (Cmd/Ctrl loupe) state
+  let inspect = false, overCanvas = false, swallowClick = false;
+  let lastCX = 0, lastCY = 0, loupeRAF = false, stripSig = '';
+  const tileEls = new Map();  // unit index -> { wrap, canvas, cap }
+  const isInspectMod = e => e.metaKey || e.ctrlKey;
+
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
 
@@ -23,7 +29,7 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
-      cache.clear(); ci = 0; ui = 0; buildTree();
+      cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildTree();
       await showUnit(0, 0); setBanner('');
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('打开失败:' + e.message, 'warn'); }
   }
@@ -48,6 +54,7 @@
     view.setSelected(new Set(State.selectedIds(c.id, u.id)));
     view.layout(); view.render();
     refreshMeta(); highlightTree();
+    if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
   function refreshCanvasSelection() {
@@ -89,6 +96,8 @@
   }
 
   function onClick(ev) {
+    if (swallowClick) { swallowClick = false; return; }   // consumed by an inspect gesture
+    if (inspect || isInspectMod(ev)) return;               // never annotate while inspecting
     if (!cur) return;
     const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
     if (!seg) return;
@@ -97,13 +106,102 @@
   }
   function onMove(ev) {
     if (!cur) return;
+    lastCX = ev.clientX; lastCY = ev.clientY; overCanvas = true;
     const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
     $('cursor').textContent = view.inBounds(x, y)
       ? ('光标 seg ' + seg + (seg ? ' · ' + view.segSize(seg) + 'px' : '') + ' · (' + x + ', ' + y + ')')
       : '光标在图外';
+    if (!inspect && isInspectMod(ev)) enterInspect();
+    if (inspect) { scheduleLoupe(); return; }               // freeze hover during inspect
     if (view.setHovered(seg) && !hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
   }
-  function onLeave() { $('cursor').textContent = ''; if (view.setHovered(0)) view.render(); }
+  function onLeave() { overCanvas = false; $('cursor').textContent = ''; if (view.setHovered(0)) view.render(); }
+
+  // ---- inspect (Cmd/Ctrl cross-frame loupe) ----
+  const Loupe = window.Loupe;
+  function enterInspect() {
+    if (inspect || !cur) return;
+    inspect = true; swallowClick = false; stripSig = '';
+    document.body.classList.add('inspecting');
+    $('loupePanel').classList.remove('hidden');
+    preloadCase(); scheduleLoupe();
+  }
+  function exitInspect() {
+    if (!inspect) return;
+    inspect = false; swallowClick = false;
+    document.body.classList.remove('inspecting');
+    $('loupePanel').classList.add('hidden');
+    if (overCanvas) { view.setHovered(0); view.render(); }  // drop frozen hover, restore interactivity
+  }
+  function scheduleLoupe() {
+    if (loupeRAF) return;
+    loupeRAF = true;
+    requestAnimationFrame(() => { loupeRAF = false; if (inspect) renderLoupe(); });
+  }
+  function preloadCase() {
+    const c = curCase(); if (!c) return;
+    for (const u of c.units) Loupe.ensure(State.key(c.id, u.id), u);
+  }
+  // gray of a unit for the loupe: fresh snapshot for the current unit (never stored),
+  // cache for neighbors. Returns { W, H, gray } or null (not yet loaded / failed).
+  function grayOf(c, i) {
+    if (i === ui) return view.getGray();
+    return Loupe.get(State.key(c.id, c.units[i].id));
+  }
+  function sampleVal(g, x, y, mean) {
+    const W = g.W, H = g.H;
+    if (x < 0 || y < 0 || x >= W || y >= H) return null;
+    if (!mean) return g.gray[y * W + x];
+    let s = 0, n = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const xx = x + dx, yy = y + dy;
+      if (xx >= 0 && yy >= 0 && xx < W && yy < H) { s += g.gray[yy * W + xx]; n++; }
+    }
+    return n ? Math.round(s / n) : null;
+  }
+  function rebuildStrip(lo, hi, units) {
+    const strip = $('loupeStrip'); strip.innerHTML = ''; tileEls.clear();
+    for (let i = lo; i <= hi; i++) {
+      const wrap = document.createElement('div');
+      wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '');
+      const cv = document.createElement('canvas');
+      const cap = document.createElement('div'); cap.className = 'cap';
+      cap.textContent = units[i].id + (units[i].kind === 'minip' ? '（投影）' : '');
+      wrap.appendChild(cv); wrap.appendChild(cap); strip.appendChild(wrap);
+      tileEls.set(i, { wrap, canvas: cv });
+    }
+  }
+  function renderLoupe() {
+    if (!inspect || !cur) return;
+    const c = curCase(), units = c.units, n = units.length;
+    const [x, y] = view.eventToImage({ clientX: lastCX, clientY: lastCY });
+    const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked;
+    const snap = view.getGray(), W = snap.W, H = snap.H;
+    const win = view.getWindow(), lut = Loupe.buildLut(win.center, win.width);
+    $('loupeCoord').textContent = view.inBounds(x, y) ? ('(' + x + ', ' + y + ')') : '光标在图外';
+
+    let S = Math.max(3, Math.round(92 / zoom)); if (S % 2 === 0) S++;
+    const lo = Math.max(0, ui - R), hi = Math.min(n - 1, ui + R);
+    const sig = lo + '-' + hi + '@' + ui;
+    if (sig !== stripSig) { rebuildStrip(lo, hi, units); stripSig = sig; }
+    for (let i = lo; i <= hi; i++) {
+      const el = tileEls.get(i); if (!el) continue;
+      const g = grayOf(c, i);
+      let st = 'ok';
+      if (!g) st = Loupe.state(State.key(c.id, units[i].id));
+      else if (g.W !== W || g.H !== H) st = 'mismatch';
+      Loupe.drawTile(el.canvas, st === 'ok' ? g : null, x, y, S, lut, st);
+    }
+
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const g = grayOf(c, i);
+      let val = null;
+      if (g && g.W === W && g.H === H) val = sampleVal(g, x, y, mean);
+      pts.push({ val, label: units[i].id, isMinip: units[i].kind === 'minip' });
+    }
+    Loupe.drawCurve($('loupeCurve'), pts, ui);
+  }
 
   async function save() {
     if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
@@ -146,6 +244,10 @@
     $('winC').value = w0.center; $('winW').value = w0.width;
     $('winCv').textContent = w0.center; $('winWv').textContent = w0.width;
     view.setWindow(w0.center, w0.width);
+    const l0 = State.getLoupe();
+    $('loupeZoom').value = l0.zoom; $('loupeZoomv').textContent = l0.zoom;
+    $('loupeR').value = l0.R; $('loupeRv').textContent = l0.R;
+    $('loupeMean').checked = !!l0.mean;
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
     $('btnUndo').onclick = undo;
@@ -167,6 +269,10 @@
     $('winW').oninput = scheduleWindow;
     $('btnAuto').onclick = () => { const w = view.autoWindow(); $('winC').value = w.center; $('winW').value = w.width; $('winCv').textContent = w.center; $('winWv').textContent = w.width; view.render(); State.setWindow(w.center, w.width); };
     $('btnWinReset').onclick = () => { $('winC').value = 128; $('winW').value = 255; $('winCv').textContent = 128; $('winWv').textContent = 255; view.setWindow(128, 255); view.render(); State.setWindow(128, 255); };
+    $('loupeZoom').oninput = e => { $('loupeZoomv').textContent = e.target.value; State.setLoupe(+e.target.value, +$('loupeR').value, $('loupeMean').checked); if (inspect) scheduleLoupe(); };
+    $('loupeR').oninput = e => { $('loupeRv').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +e.target.value, $('loupeMean').checked); if (inspect) scheduleLoupe(); };
+    $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked); if (inspect) scheduleLoupe(); };
+    Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
     $('prevCase').onclick = () => stepCase(-1);
@@ -175,14 +281,21 @@
     cv.addEventListener('click', onClick);
     cv.addEventListener('mousemove', onMove);
     cv.addEventListener('mouseleave', onLeave);
+    cv.addEventListener('mouseenter', ev => { overCanvas = true; lastCX = ev.clientX; lastCY = ev.clientY; });
+    cv.addEventListener('mousedown', ev => { if (inspect || isInspectMod(ev)) swallowClick = true; });
+    cv.addEventListener('contextmenu', ev => { if (inspect || isInspectMod(ev)) ev.preventDefault(); });
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
+      if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey) && !inspect) { e.preventDefault(); undo(); }
     });
+    window.addEventListener('keyup', e => { if (!e.metaKey && !e.ctrlKey) exitInspect(); });
+    window.addEventListener('blur', exitInspect);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) exitInspect(); });
     view.setOpacity($('opacity').value / 100);
     view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {

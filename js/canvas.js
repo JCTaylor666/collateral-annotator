@@ -140,9 +140,12 @@
     function inBounds(x, y) { return x >= 0 && y >= 0 && x < W && y < H; }
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
+    // Live grayscale of the CURRENT unit. Callers must use it immediately and never
+    // store it — setUnit reallocates gray on every unit switch.
+    function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, inBounds,
+             layout, render, eventToImage, segAt, segSize, inBounds, getGray,
              get W() { return W; }, get H() { return H; } };
   }
 
