@@ -12,7 +12,9 @@
   function createView(canvas) {
     const ctx = canvas.getContext('2d');
     let img = null, W = 0, H = 0, label = null;
-    let scale = 1, offX = 0, offY = 0;
+    // live affine: screen = scale*image + off. fitScale = fit-to-viewport; needFit
+    // re-fits on next layout (set when image dims change). User pan/zoom mutate scale/off.
+    let scale = 1, offX = 0, offY = 0, fitScale = 1, needFit = true;
     let sel = new Set(), hov = 0, opacity = 0.55;
     let maskData = null, maskOpacity = 0.45;
     let gray = null, center = 128, width = 255;
@@ -23,6 +25,7 @@
     const baseCv = document.createElement('canvas'), baseCtx = baseCv.getContext('2d', { willReadFrequently: true });
 
     function setUnit(image, w, h, lab, maskArr) {
+      if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
       selCv.width = hovCv.width = maskCv.width = baseCv.width = W;
       selCv.height = hovCv.height = maskCv.height = baseCv.height = H;
@@ -90,6 +93,14 @@
       buildBase(); return { center, width };
     }
 
+    function computeFit() { fitScale = Math.min(canvas.clientWidth / W, canvas.clientHeight / H); }
+    const minScale = () => fitScale;                       // never zoom out past fit
+    const maxScale = () => Math.max(fitScale * 16, 24);
+    function clampPan() {                                   // keep image filling / centered in viewport
+      const cssW = canvas.clientWidth, cssH = canvas.clientHeight, iw = W * scale, ih = H * scale;
+      offX = iw <= cssW ? (cssW - iw) / 2 : Math.min(0, Math.max(cssW - iw, offX));
+      offY = ih <= cssH ? (cssH - ih) / 2 : Math.min(0, Math.max(cssH - ih, offY));
+    }
     function layout() {
       const dpr = window.devicePixelRatio || 1;
       const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
@@ -97,9 +108,20 @@
       canvas.height = Math.max(1, Math.round(cssH * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       if (!W || !H) return;
-      scale = Math.min(cssW / W, cssH / H);
-      offX = (cssW - W * scale) / 2; offY = (cssH - H * scale) / 2;
+      computeFit();
+      if (needFit) { scale = fitScale; needFit = false; }
+      else scale = Math.max(minScale(), Math.min(maxScale(), scale));  // keep zoom sane across resize
+      clampPan();
     }
+    function fitView() { computeFit(); scale = fitScale; clampPan(); }
+    function zoomAt(cx, cy, factor) {                       // zoom toward viewport point (cx,cy)
+      const ns = Math.max(minScale(), Math.min(maxScale(), scale * factor));
+      if (ns === scale) return;
+      const ix = (cx - offX) / scale, iy = (cy - offY) / scale;
+      scale = ns; offX = cx - ix * scale; offY = cy - iy * scale; clampPan();
+    }
+    function panBy(dx, dy) { offX += dx; offY += dy; clampPan(); }
+    const getZoom = () => (fitScale ? scale / fitScale : 1);  // 1.0 = fit
     function render() {
       const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
       ctx.clearRect(0, 0, cssW, cssH);
@@ -146,6 +168,7 @@
 
     return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, inBounds, getGray,
+             fitView, zoomAt, panBy, getZoom,
              get W() { return W; }, get H() { return H; } };
   }
 

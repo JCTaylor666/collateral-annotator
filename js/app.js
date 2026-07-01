@@ -16,6 +16,11 @@
   const tileEls = new Map();  // unit index -> { wrap, canvas, cap }
   const isInspectMod = e => e.metaKey || e.ctrlKey;
 
+  // pan/zoom (main view) state
+  let dragging = false, dragMoved = false, suppressClick = false;
+  let dragSX = 0, dragSY = 0, dragLX = 0, dragLY = 0;
+  const DRAG_THRESH = 4;
+
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
 
@@ -53,7 +58,7 @@
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setSelected(new Set(State.selectedIds(c.id, u.id)));
-    view.layout(); view.render();
+    view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); highlightTree();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
@@ -97,6 +102,7 @@
   }
 
   function onClick(ev) {
+    if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag, not an annotate
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
     if (!seg) return;
@@ -201,6 +207,48 @@
     Loupe.drawCurve($('loupeCurve'), pts, ui);
   }
 
+  // ---- pan / zoom (main view) ----
+  function updateZoomReadout() { $('zoomv').textContent = view.getZoom().toFixed(1) + '×'; }
+  function afterViewChange() { view.render(); updateZoomReadout(); if (inspect) scheduleLoupe(); }
+  // Heuristic: line/page-mode wheels and chunky vertical-only pixel steps are a mouse
+  // wheel (-> zoom). Smooth/horizontal pixel deltas are trackpad two-finger (-> pan).
+  function isMouseWheel(e) {
+    return e.deltaMode !== 0 || (e.deltaX === 0 && Math.abs(e.deltaY) >= 50 && Number.isInteger(e.deltaY));
+  }
+  function onWheel(ev) {
+    if (!cur) return;
+    ev.preventDefault();
+    const rect = $('view').getBoundingClientRect();
+    const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
+    if (!ev.ctrlKey && !isMouseWheel(ev)) {
+      view.panBy(-ev.deltaX, -ev.deltaY);                   // trackpad two-finger scroll -> pan
+    } else {
+      const step = ev.deltaMode === 0 ? ev.deltaY : ev.deltaY * 16;   // normalize line/page mode
+      view.zoomAt(cx, cy, Math.exp(-step * (ev.ctrlKey ? 0.01 : 0.0015)));  // wheel / pinch -> zoom at cursor
+    }
+    afterViewChange();
+  }
+  function onDragStart(ev) {
+    if (ev.button !== 0 || !cur) return;
+    dragging = true; dragMoved = false; suppressClick = false;
+    dragSX = dragLX = ev.clientX; dragSY = dragLY = ev.clientY;
+  }
+  function onDragMove(ev) {
+    if (!dragging) return;
+    if (!dragMoved && Math.hypot(ev.clientX - dragSX, ev.clientY - dragSY) > DRAG_THRESH) {
+      dragMoved = true; $('view').style.cursor = 'grabbing';
+    }
+    if (!dragMoved) return;
+    view.panBy(ev.clientX - dragLX, ev.clientY - dragLY);
+    dragLX = ev.clientX; dragLY = ev.clientY;
+    afterViewChange();
+  }
+  function onDragEnd() {
+    if (!dragging) return;
+    dragging = false; $('view').style.cursor = '';
+    if (dragMoved) suppressClick = true;                    // swallow the click that follows a real drag
+  }
+
   async function save() {
     if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
     try {
@@ -232,7 +280,7 @@
     showUnit(nc, nu);
   }
   function stepCase(d) { const nc = ci + d; if (nc < 0 || nc >= cases.length) return; showUnit(nc, 0); }
-  function onResize() { if (view) { view.layout(); view.render(); } }
+  function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } }
 
   function init() {
     view = window.CanvasView.create($('view'));
@@ -281,6 +329,11 @@
     cv.addEventListener('mouseleave', onLeave);
     cv.addEventListener('mouseenter', ev => { overCanvas = true; lastCX = ev.clientX; lastCY = ev.clientY; });
     cv.addEventListener('contextmenu', ev => { if (inspect || isInspectMod(ev)) ev.preventDefault(); });
+    cv.addEventListener('wheel', onWheel, { passive: false });
+    cv.addEventListener('mousedown', onDragStart);
+    window.addEventListener('mousemove', onDragMove);
+    window.addEventListener('mouseup', onDragEnd);
+    $('btnFit').onclick = () => { view.fitView(); afterViewChange(); };
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
@@ -299,7 +352,7 @@
       setBanner('此浏览器不支持自动写盘(File System Access API)。请用 Chrome 或 Edge 打开本页。', 'warn');
       $('btnOpen').disabled = true; $('btnSave').disabled = true;
     }
-    view.layout(); view.render();
+    view.layout(); view.render(); updateZoomReadout();
   }
   window.addEventListener('DOMContentLoaded', init);
 })();
