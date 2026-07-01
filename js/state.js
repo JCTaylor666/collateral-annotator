@@ -7,6 +7,7 @@
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let notes = {};    // caseUnit -> note text (mirrors note.txt on disk)
+  let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false };
   let autoSave = true;
@@ -17,12 +18,12 @@
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, dirty, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
-        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {};
+        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; dirty = o.dirty || {};
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
@@ -88,6 +89,12 @@
     persist(); return e;
   }
   function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  // wipe a unit's in-memory annotation so it can be re-seeded from disk (used for clean units on load)
+  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+
+  const isDirty = (c, u) => !!dirty[key(c, u)];
+  function markDirty(c, u) { dirty[key(c, u)] = true; persist(); }
+  function markClean(c, u) { delete dirty[key(c, u)]; persist(); }
 
   function markVisited(c, u) { visited[key(c, u)] = true; persist(); }
   const isVisited = (c, u) => !!visited[key(c, u)];
@@ -132,5 +139,6 @@
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, pointList, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
+    isDirty, markDirty, markClean, resetUnit,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);

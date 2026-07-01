@@ -72,6 +72,14 @@
     return { W, H, img, url, label: parsed.data, mask, annotation, note };
   }
 
+  // light re-read of just the mutable per-unit files (annotation.json + note.txt) — no image decode
+  async function loadAnnotation(unit) {
+    let annotation = null, note = null;
+    try { const h = await unit.handle.getFileHandle('annotation.json'); annotation = JSON.parse(await (await h.getFile()).text()); } catch (e) { }
+    try { const h = await unit.handle.getFileHandle('note.txt'); note = await (await h.getFile()).text(); } catch (e) { }
+    return { annotation, note };
+  }
+
   // read the dataset-level class definitions from classes.json at the root (or [] if none)
   async function loadClasses(rootHandle) {
     try {
@@ -110,5 +118,5 @@
     }
   }
 
-  root.Loader = { discover, loadUnit, loadGray, loadClasses };
+  root.Loader = { discover, loadUnit, loadAnnotation, loadGray, loadClasses };
 })(typeof window !== 'undefined' ? window : globalThis);
