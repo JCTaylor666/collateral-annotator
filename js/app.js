@@ -9,8 +9,9 @@
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
 
-  // inspect (Cmd/Ctrl loupe) state
-  let inspect = false, overCanvas = false, swallowClick = false;
+  // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
+  // and hover keep working normally while inspecting.
+  let inspect = false, overCanvas = false;
   let lastCX = 0, lastCY = 0, loupeRAF = false, stripSig = '';
   const tileEls = new Map();  // unit index -> { wrap, canvas, cap }
   const isInspectMod = e => e.metaKey || e.ctrlKey;
@@ -96,9 +97,7 @@
   }
 
   function onClick(ev) {
-    if (swallowClick) { swallowClick = false; return; }   // consumed by an inspect gesture
-    if (inspect || isInspectMod(ev)) return;               // never annotate while inspecting
-    if (!cur) return;
+    if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
     if (!seg) return;
     State.toggle(cur.caseId, cur.unitId, seg, [x, y]);
@@ -112,7 +111,7 @@
       ? ('光标 seg ' + seg + (seg ? ' · ' + view.segSize(seg) + 'px' : '') + ' · (' + x + ', ' + y + ')')
       : '光标在图外';
     if (!inspect && isInspectMod(ev)) enterInspect();
-    if (inspect) { scheduleLoupe(); return; }               // freeze hover during inspect
+    if (inspect) scheduleLoupe();                           // update loupe; hover still tracks below
     if (view.setHovered(seg) && !hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
   }
   function onLeave() { overCanvas = false; $('cursor').textContent = ''; if (view.setHovered(0)) view.render(); }
@@ -121,17 +120,16 @@
   const Loupe = window.Loupe;
   function enterInspect() {
     if (inspect || !cur) return;
-    inspect = true; swallowClick = false; stripSig = '';
+    inspect = true; stripSig = '';
     document.body.classList.add('inspecting');
     $('loupePanel').classList.remove('hidden');
     preloadCase(); scheduleLoupe();
   }
   function exitInspect() {
     if (!inspect) return;
-    inspect = false; swallowClick = false;
+    inspect = false;
     document.body.classList.remove('inspecting');
     $('loupePanel').classList.add('hidden');
-    if (overCanvas) { view.setHovered(0); view.render(); }  // drop frozen hover, restore interactivity
   }
   function scheduleLoupe() {
     if (loupeRAF) return;
@@ -282,7 +280,6 @@
     cv.addEventListener('mousemove', onMove);
     cv.addEventListener('mouseleave', onLeave);
     cv.addEventListener('mouseenter', ev => { overCanvas = true; lastCX = ev.clientX; lastCY = ev.clientY; });
-    cv.addEventListener('mousedown', ev => { if (inspect || isInspectMod(ev)) swallowClick = true; });
     cv.addEventListener('contextmenu', ev => { if (inspect || isInspectMod(ev)) ev.preventDefault(); });
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
@@ -291,7 +288,7 @@
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey) && !inspect) { e.preventDefault(); undo(); }
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
     });
     window.addEventListener('keyup', e => { if (!e.metaKey && !e.ctrlKey) exitInspect(); });
     window.addEventListener('blur', exitInspect);
