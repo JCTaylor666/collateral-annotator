@@ -8,6 +8,7 @@
   let rootHandle = null, cases = [], ci = 0, ui = 0;
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
+  let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -50,6 +51,7 @@
   }
 
   async function showUnit(nci, nui) {
+    flushAutoSave();          // persist the outgoing unit before we move off it
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
     let data;
@@ -146,7 +148,7 @@
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
       else State.addPoint(cur.caseId, cur.unitId, [x, y]);
     }
-    refreshCanvasSelection(); refreshMeta(); highlightNav();
+    refreshCanvasSelection(); refreshMeta(); highlightNav(); scheduleAutoSave();
   }
   function onMove(ev) {
     if (!cur) return;
@@ -290,6 +292,7 @@
 
   async function save() {
     if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
     try {
       if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('没有写入权限,无法保存。', 'warn'); return; }
       const map = new Map();
@@ -304,13 +307,39 @@
         n++;
       }
       setBanner('已保存 ' + n + ' 个单元的 annotation.json 到各自文件夹。', 'ok');
+      setSaveStatus('已保存 ' + hhmm());
     } catch (e) { setBanner('保存失败:' + e.message, 'warn'); }
   }
 
-  function undo() { if (!cur) return; State.undo(); refreshCanvasSelection(); refreshMeta(); highlightNav(); }
+  // ---- debounced auto-write-to-disk (toggle in 设置; default on) ----
+  function hhmm() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
+  function setSaveStatus(msg, warn) { const el = $('saveStatus'); if (!el) return; el.textContent = msg || ''; el.classList.toggle('warn-text', !!warn); }
+  function scheduleAutoSave() {
+    if (!$('autoSave').checked || !rootHandle || !cur) return;
+    pendingSave = { c: cur.caseId, u: cur.unitId, unit: curUnit() };   // capture the unit now, in case we navigate
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(runAutoSave, 1000);
+    setSaveStatus('待保存…');
+  }
+  function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
+  async function runAutoSave() {
+    saveTimer = null;
+    const p = pendingSave; pendingSave = null;
+    if (!p || !rootHandle || !$('autoSave').checked) return;
+    try {
+      setSaveStatus('保存中…');
+      let data = cache.get(State.key(p.c, p.u));
+      if (!data) data = await Loader.loadUnit(p.unit);
+      const ann = State.buildAnnotation(p.c, p.u, data.W, data.H);
+      await FS.writeText(p.unit.handle, 'annotation.json', JSON.stringify(ann, null, 2));
+      setSaveStatus('已保存 ' + hhmm());
+    } catch (e) { setSaveStatus('自动保存失败', true); }
+  }
+
+  function undo() { if (!cur) return; State.undo(); refreshCanvasSelection(); refreshMeta(); highlightNav(); scheduleAutoSave(); }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
-  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); }
+  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); scheduleAutoSave(); }
   function stepUnit(d) {
     if (!cases.length) return;
     let nu = ui + d, nc = ci;
@@ -342,6 +371,12 @@
     $('doClear').onclick = () => { closeClear(); clear(); };
     $('confirmClear').addEventListener('click', e => { if (e.target === $('confirmClear')) closeClear(); });
     $('coordOrder').onchange = e => State.setCoordOrder(e.target.value);
+    $('autoSave').checked = State.getAutoSave();
+    $('autoSave').onchange = e => {
+      State.setAutoSave(e.target.checked);
+      if (e.target.checked) scheduleAutoSave();
+      else { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } setSaveStatus(''); }
+    };
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
     $('maskOpacity').oninput = e => { view.setMaskOpacity(e.target.value / 100); view.render(); };
     let winRAF = false;

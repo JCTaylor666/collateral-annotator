@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=9">
+<link rel="stylesheet" href="./css/style.css?v=10">
 </head>
 <body>
 <header class="strip">
@@ -15,6 +15,7 @@
   <span class="strip-spacer"></span>
   <span id="chips" class="chips"><span class="muted">（无）</span></span>
   <span id="progress" class="ro">—</span>
+  <span id="saveStatus" class="ro"></span>
   <span id="zoomv" class="ro accent">1.0×</span>
   <span id="cursor" class="ro"></span>
 </header>
@@ -83,6 +84,7 @@
       <summary><span class="chev">▶</span>设置</summary>
       <div class="grp-body">
         <div class="ctl-row"><label>坐标顺序</label><select id="coordOrder"><option value="xy">x,y</option><option value="yx">y,x</option></select></div>
+        <label class="check-row"><input type="checkbox" id="autoSave" checked> 自动保存（改动后自动写盘）</label>
       </div>
     </details>
 
@@ -117,12 +119,12 @@
   </div>
 </div>
 
-<script src="./js/npy.js?v=9"></script>
-<script src="./js/fs.js?v=9"></script>
-<script src="./js/loader.js?v=9"></script>
-<script src="./js/canvas.js?v=9"></script>
-<script src="./js/state.js?v=9"></script>
-<script src="./js/loupe.js?v=9"></script>
-<script src="./js/app.js?v=9"></script>
+<script src="./js/npy.js?v=10"></script>
+<script src="./js/fs.js?v=10"></script>
+<script src="./js/loader.js?v=10"></script>
+<script src="./js/canvas.js?v=10"></script>
+<script src="./js/state.js?v=10"></script>
+<script src="./js/loupe.js?v=10"></script>
+<script src="./js/app.js?v=10"></script>
 </body>
 </html>

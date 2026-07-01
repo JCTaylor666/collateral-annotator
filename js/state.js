@@ -7,10 +7,11 @@
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false };
+  let autoSave = true;
 
   const key = (c, u) => c + '/' + u;
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, coordOrder, window: win, loupe })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, coordOrder, window: win, loupe, autoSave })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
@@ -20,6 +21,7 @@
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
           loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean };
+        if (typeof o.autoSave === 'boolean') autoSave = o.autoSave;
       }
     } catch (e) { }
   }
@@ -30,6 +32,8 @@
   function setWindow(C, W) { win = { center: C, width: W }; persist(); }
   const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean });
   function setLoupe(zoom, R, mean) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean }; persist(); }
+  const getAutoSave = () => autoSave;
+  function setAutoSave(b) { autoSave = !!b; persist(); }
 
   const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});
   const pts = (c, u) => points[key(c, u)] || (points[key(c, u)] = []);
@@ -98,7 +102,7 @@
 
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points)])];
 
-  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, hasLocal, selectedIds, count,
+  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, pointList, pointCount, markCount, toggle, addPoint, removePoint, undo,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);
