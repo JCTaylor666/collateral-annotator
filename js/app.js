@@ -35,7 +35,7 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
-      cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildTree();
+      cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       await showUnit(0, 0); setBanner('');
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('打开失败:' + e.message, 'warn'); }
   }
@@ -60,7 +60,7 @@
     view.setSelected(new Set(State.selectedIds(c.id, u.id)));
     refreshDots();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); highlightTree();
+    refreshMeta(); buildFrameList();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
@@ -83,27 +83,39 @@
     $('progress').textContent = '本单元已标 ' + ids.length + ' 段 · ' + State.pointCount(c.id, u.id) + ' 点';
   }
 
-  function buildTree() {
-    const t = $('tree'); t.innerHTML = '';
+  function buildCaseOptions() {
+    const sel = $('caseSelect'); sel.innerHTML = '';
     cases.forEach((c, idx) => {
-      const cd = document.createElement('div'); cd.className = 'tcase'; cd.textContent = c.id; t.appendChild(cd);
-      c.units.forEach((u, uidx) => {
-        const el = document.createElement('div');
-        el.className = 'tunit'; el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id; el.textContent = u.id;
-        el.onclick = () => showUnit(idx, uidx);
-        t.appendChild(el);
-      });
+      const o = document.createElement('option');
+      o.value = idx; o.textContent = c.id;
+      sel.appendChild(o);
     });
-    highlightTree();
   }
-  function highlightTree() {
-    const k = curCase() ? State.key(curCase().id, curUnit().id) : '';
-    document.querySelectorAll('.tunit').forEach(el => {
+  function buildFrameList() {
+    const c = curCase(), list = $('frameList'); list.innerHTML = '';
+    if (!c) return;
+    c.units.forEach((u, uidx) => {
+      const el = document.createElement('div');
+      el.className = 'frm'; el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id;
+      const name = document.createElement('span'); name.textContent = u.id;
+      const badge = document.createElement('span'); badge.className = 'frm-b';
+      el.appendChild(name); el.appendChild(badge);
+      el.onclick = () => showUnit(ci, uidx);
+      list.appendChild(el);
+    });
+    highlightNav();
+  }
+  function highlightNav() {
+    if (!curCase()) return;
+    $('caseSelect').value = ci;
+    const k = State.key(curCase().id, curUnit().id);
+    document.querySelectorAll('#frameList .frm').forEach(el => {
       const [cc, uu] = el.dataset.k.split('/');
-      const n = State.markCount(cc, uu);
-      el.classList.toggle('active', el.dataset.k === k);
+      const n = State.markCount(cc, uu), active = el.dataset.k === k;
+      el.classList.toggle('active', active);
       el.classList.toggle('done', State.isVisited(cc, uu));
-      el.textContent = el.dataset.base + (n ? ' · ' + n : '');
+      el.querySelector('.frm-b').textContent = n ? n : '';
+      if (active) el.scrollIntoView({ block: 'nearest' });
     });
   }
 
@@ -134,7 +146,7 @@
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
       else State.addPoint(cur.caseId, cur.unitId, [x, y]);
     }
-    refreshCanvasSelection(); refreshMeta(); highlightTree();
+    refreshCanvasSelection(); refreshMeta(); highlightNav();
   }
   function onMove(ev) {
     if (!cur) return;
@@ -295,10 +307,10 @@
     } catch (e) { setBanner('保存失败:' + e.message, 'warn'); }
   }
 
-  function undo() { if (!cur) return; State.undo(); refreshCanvasSelection(); refreshMeta(); highlightTree(); }
+  function undo() { if (!cur) return; State.undo(); refreshCanvasSelection(); refreshMeta(); highlightNav(); }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
-  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightTree(); }
+  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); }
   function stepUnit(d) {
     if (!cases.length) return;
     let nu = ui + d, nc = ci;
@@ -308,6 +320,7 @@
   }
   function stepCase(d) { const nc = ci + d; if (nc < 0 || nc >= cases.length) return; showUnit(nc, 0); }
   function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } }
+  function toggleRail() { document.body.classList.toggle('rail-collapsed'); onResize(); }
 
   function init() {
     view = window.CanvasView.create($('view'));
@@ -346,6 +359,8 @@
     $('loupeR').oninput = e => { $('loupeRv').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +e.target.value, $('loupeMean').checked); if (inspect) scheduleLoupe(); };
     $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked); if (inspect) scheduleLoupe(); };
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
+    $('caseSelect').onchange = e => showUnit(+e.target.value, 0);
+    $('railToggle').onclick = toggleRail;
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
     $('prevCase').onclick = () => stepCase(-1);
@@ -368,6 +383,7 @@
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
+      else if (e.key === '\\') toggleRail();
       else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
     });
     window.addEventListener('keyup', e => { if (!e.metaKey && !e.ctrlKey) exitInspect(); });
