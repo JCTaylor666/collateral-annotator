@@ -140,6 +140,10 @@
     view = window.CanvasView.create($('view'));
     State.load();
     $('coordOrder').value = State.getCoordOrder();
+    const w0 = State.getWindow();
+    $('winC').value = w0.center; $('winW').value = w0.width;
+    $('winCv').textContent = w0.center; $('winWv').textContent = w0.width;
+    view.setWindow(w0.center, w0.width);
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
     $('btnUndo').onclick = undo;
@@ -147,6 +151,17 @@
     $('coordOrder').onchange = e => State.setCoordOrder(e.target.value);
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
     $('maskOpacity').oninput = e => { view.setMaskOpacity(e.target.value / 100); view.render(); };
+    let winRAF = false;
+    function scheduleWindow() {
+      $('winCv').textContent = $('winC').value; $('winWv').textContent = $('winW').value;
+      if (winRAF) return;
+      winRAF = true;
+      requestAnimationFrame(() => { winRAF = false; const c = +$('winC').value, w = +$('winW').value; view.setWindow(c, w); view.render(); State.setWindow(c, w); });
+    }
+    $('winC').oninput = scheduleWindow;
+    $('winW').oninput = scheduleWindow;
+    $('btnAuto').onclick = () => { const w = view.autoWindow(); $('winC').value = w.center; $('winW').value = w.width; $('winCv').textContent = w.center; $('winWv').textContent = w.width; view.render(); State.setWindow(w.center, w.width); };
+    $('btnWinReset').onclick = () => { $('winC').value = 128; $('winW').value = 255; $('winCv').textContent = 128; $('winWv').textContent = 255; view.setWindow(128, 255); view.render(); State.setWindow(128, 255); };
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
     $('prevCase').onclick = () => stepCase(-1);

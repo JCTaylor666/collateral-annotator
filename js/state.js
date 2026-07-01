@@ -4,18 +4,25 @@
   'use strict';
   const LSKEY = 'vessel_annotator_v1';
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
+  let win = { center: 128, width: 255 };
 
   const key = (c, u) => c + '/' + u;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, coordOrder })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, coordOrder, window: win })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
-      if (o) { selections = o.selections || {}; visited = o.visited || {}; coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy'; }
+      if (o) {
+        selections = o.selections || {}; visited = o.visited || {};
+        coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
+        if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
+      }
     } catch (e) { }
   }
 
   const getCoordOrder = () => coordOrder;
   function setCoordOrder(o) { coordOrder = (o === 'yx') ? 'yx' : 'xy'; persist(); }
+  const getWindow = () => ({ center: win.center, width: win.width });
+  function setWindow(C, W) { win = { center: C, width: W }; persist(); }
 
   const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});
   const hasLocal = (c, u) => key(c, u) in selections;
@@ -66,6 +73,6 @@
 
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited)])];
 
-  root.State = { load, getCoordOrder, setCoordOrder, hasLocal, selectedIds, count, toggle, undo,
+  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, hasLocal, selectedIds, count, toggle, undo,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);

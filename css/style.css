@@ -15,6 +15,7 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .spacer{flex:1}
 .ctl{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
 .ctl select,.ctl input{accent-color:var(--accent)}
+.val{color:var(--muted);font-size:12px;min-width:26px;display:inline-block;text-align:right}
 .banner{padding:8px 12px;font-size:13px}
 .banner.warn{background:var(--warn-bg);color:var(--warn)}
 .banner.ok{background:var(--ok-bg);color:var(--ok)}

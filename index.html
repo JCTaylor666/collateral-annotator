@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=2">
+<link rel="stylesheet" href="./css/style.css?v=3">
 </head>
 <body>
 <header class="toolbar">
@@ -24,6 +24,11 @@
   <label class="ctl">血管mask
     <input id="maskOpacity" type="range" min="0" max="100" value="45">
   </label>
+  <span class="sep"></span>
+  <label class="ctl">窗中心 <input id="winC" type="range" min="0" max="255" value="128"><span id="winCv" class="val">128</span></label>
+  <label class="ctl">窗宽 <input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></label>
+  <button id="btnAuto" class="btn sm">自动</button>
+  <button id="btnWinReset" class="btn sm">复位窗</button>
   <span class="spacer"></span>
 </header>
 
@@ -54,11 +59,11 @@
   <div id="cursor" class="muted"></div>
 </footer>
 
-<script src="./js/npy.js?v=2"></script>
-<script src="./js/fs.js?v=2"></script>
-<script src="./js/loader.js?v=2"></script>
-<script src="./js/canvas.js?v=2"></script>
-<script src="./js/state.js?v=2"></script>
-<script src="./js/app.js?v=2"></script>
+<script src="./js/npy.js?v=3"></script>
+<script src="./js/fs.js?v=3"></script>
+<script src="./js/loader.js?v=3"></script>
+<script src="./js/canvas.js?v=3"></script>
+<script src="./js/state.js?v=3"></script>
+<script src="./js/app.js?v=3"></script>
 </body>
 </html>

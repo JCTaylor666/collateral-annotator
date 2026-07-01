@@ -15,15 +15,33 @@
     let scale = 1, offX = 0, offY = 0;
     let sel = new Set(), hov = 0, opacity = 0.55;
     let maskData = null, maskOpacity = 0.45;
+    let gray = null, center = 128, width = 255;
     let segPix = null;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
     const maskCv = document.createElement('canvas'), maskCtx = maskCv.getContext('2d');
+    const baseCv = document.createElement('canvas'), baseCtx = baseCv.getContext('2d', { willReadFrequently: true });
 
     function setUnit(image, w, h, lab, maskArr) {
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
-      selCv.width = hovCv.width = maskCv.width = W; selCv.height = hovCv.height = maskCv.height = H;
-      buildSegPix(); buildSelLayer(); buildMaskLayer(); hovCtx.clearRect(0, 0, W, H);
+      selCv.width = hovCv.width = maskCv.width = baseCv.width = W;
+      selCv.height = hovCv.height = maskCv.height = baseCv.height = H;
+      baseCtx.drawImage(image, 0, 0, W, H);
+      const raw = baseCtx.getImageData(0, 0, W, H).data;
+      gray = new Uint8Array(W * H);
+      for (let i = 0; i < gray.length; i++) gray[i] = raw[i * 4];
+      buildSegPix(); buildSelLayer(); buildMaskLayer(); buildBase(); hovCtx.clearRect(0, 0, W, H);
+    }
+    function buildLut(C, Wd) {
+      const lo = C - Wd / 2, lut = new Uint8Array(256);
+      for (let v = 0; v < 256; v++) { const o = Math.round((v - lo) / Wd * 255); lut[v] = o < 0 ? 0 : o > 255 ? 255 : o; }
+      return lut;
+    }
+    function buildBase() {
+      if (!gray) return;
+      const lut = buildLut(center, width), id = baseCtx.createImageData(W, H), d = id.data;
+      for (let i = 0; i < gray.length; i++) { const v = lut[gray[i]], p = i * 4; d[p] = d[p + 1] = d[p + 2] = v; d[p + 3] = 255; }
+      baseCtx.putImageData(id, 0, 0);
     }
     function buildSegPix() {
       const counts = new Map();
@@ -57,6 +75,20 @@
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
     function setOpacity(o) { opacity = o; }
     function setMaskOpacity(o) { maskOpacity = o; }
+    function setWindow(C, Wd) { center = C; width = Wd; if (gray) buildBase(); }
+    function getWindow() { return { center, width }; }
+    function autoWindow() {
+      if (!gray) return { center, width };
+      const hist = new Uint32Array(256);
+      for (let i = 0; i < gray.length; i++) hist[gray[i]]++;
+      const n = gray.length, loT = n * 0.02, hiT = n * 0.98;
+      let acc = 0, lo = 0, hi = 255;
+      for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= loT) { lo = v; break; } }
+      acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= hiT) { hi = v; break; } }
+      if (hi <= lo) { lo = 0; hi = 255; }
+      width = Math.max(1, hi - lo); center = Math.round((lo + hi) / 2);
+      buildBase(); return { center, width };
+    }
 
     function layout() {
       const dpr = window.devicePixelRatio || 1;
@@ -73,7 +105,7 @@
       ctx.clearRect(0, 0, cssW, cssH);
       if (!img) return;
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(img, offX, offY, W * scale, H * scale);
+      ctx.drawImage(baseCv, offX, offY, W * scale, H * scale);
       if (maskData && maskOpacity > 0) { ctx.globalAlpha = maskOpacity; ctx.drawImage(maskCv, offX, offY, W * scale, H * scale); }
       ctx.globalAlpha = opacity; ctx.drawImage(selCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = Math.min(1, opacity + 0.25); ctx.drawImage(hovCv, offX, offY, W * scale, H * scale);
@@ -109,7 +141,8 @@
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
 
-    return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, layout, render, eventToImage, segAt, segSize, inBounds,
+    return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
+             layout, render, eventToImage, segAt, segSize, inBounds,
              get W() { return W; }, get H() { return H; } };
   }
 
