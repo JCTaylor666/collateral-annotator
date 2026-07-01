@@ -218,23 +218,26 @@
     exitCopyPick();
   }
   function doCopyFrom(srcCaseId, srcUnit) {
-    // gather source clicks: vessel segments (with class) + background points (no class)
+    // gather source clicks (segments + background points) — each carries the class chosen when it was clicked
     const clicks = State.selectedSegs(srcCaseId, srcUnit.id).map(s => ({ xy: s.xy, cls: s.cls }))
-      .concat(State.pointList(srcCaseId, srcUnit.id).map(p => ({ xy: p, cls: null })));
+      .concat(State.pointItems(srcCaseId, srcUnit.id));
     if (!clicks.length) { setBanner('“' + srcUnit.id + '” 没有可复制的标注。', 'warn'); return; }
-    // re-resolve EACH coordinate against the current frame's label: segment there -> mark; background -> red dot
+    // re-resolve EACH coordinate against the current frame's label: segment there -> class mark; background -> red dot.
+    // clicks with no class are dropped.
     const segMap = new Map(), ptSeen = new Set(), pts = [];
+    let dropped = 0;
     for (const { xy, cls } of clicks) {
+      if (cls == null) { dropped++; continue; }
       if (!xy || !view.inBounds(xy[0], xy[1])) continue;
       const seg = view.segAt(xy[0], xy[1]);
       if (seg > 0) { if (!segMap.has(seg)) segMap.set(seg, { xy, cls }); }
-      else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push(xy); } }
+      else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push({ xy, cls }); } }
     }
     for (const [seg, v] of segMap) State.applyClass(cur.caseId, cur.unitId, seg, v.xy, v.cls);
-    for (const xy of pts) State.addPoint(cur.caseId, cur.unitId, xy);
+    for (const p of pts) State.addPoint(cur.caseId, cur.unitId, p.xy, p.cls);
     State.markDirty(cur.caseId, cur.unitId);
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
-    setBanner('已从 “' + srcUnit.id + '” 复制并按当前帧重新解析：' + segMap.size + ' 段 · ' + pts.length + ' 点。', 'ok');
+    setBanner('已从 “' + srcUnit.id + '” 复制并重新解析：' + segMap.size + ' 段 · ' + pts.length + ' 点' + (dropped ? '（' + dropped + ' 个无类别已跳过）' : '') + '。', 'ok');
   }
 
   function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
@@ -323,7 +326,7 @@
     } else {                                                // background: toggle a red dot (remove nearby, else add)
       const idx = nearestBgPoint(ev);
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
-      else State.addPoint(cur.caseId, cur.unitId, [x, y]);
+      else State.addPoint(cur.caseId, cur.unitId, [x, y], State.getActiveClass());   // record active class on the point
     }
     State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }

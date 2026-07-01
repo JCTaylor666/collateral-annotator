@@ -55,7 +55,11 @@
   const selectedSegs = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
   // all class indices currently assigned to any segment across every unit in memory
   const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } return [...set]; };
-  const pointList = (c, u) => pts(c, u).map(p => [p[0], p[1]]);
+  // background points now carry a class (the active class at click time). Old data may be a bare [x,y].
+  const ptXY = p => Array.isArray(p) ? p : (p && p.xy) || [-1, -1];
+  const ptCls = p => (Array.isArray(p) || !p || p.cls == null) ? null : p.cls;
+  const pointList = (c, u) => pts(c, u).map(p => { const xy = ptXY(p); return [xy[0], xy[1]]; });   // coords, for red dots
+  const pointItems = (c, u) => pts(c, u).map(p => ({ xy: ptXY(p), cls: ptCls(p) }));                // coords + class, for copy/json
   const pointCount = (c, u) => pts(c, u).length;
   const markCount = (c, u) => count(c, u) + pointCount(c, u);
 
@@ -77,13 +81,13 @@
     undoStack.push({ kind: 'seg', c, u, ks, prev });
     persist();
   }
-  function addPoint(c, u, xy) { pts(c, u).push([xy[0], xy[1]]); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
-  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const xy = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, xy }); persist(); }
+  function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
+  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, item }); persist(); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
     if (e.kind === 'point') {
       const a = pts(e.c, e.u);
-      if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.xy);
+      if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
     } else {
       const s = sel(e.c, e.u);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
@@ -118,7 +122,7 @@
       const a = pts(c, u);
       for (const item of ann.points) {
         const click = Array.isArray(item) ? item : (item && item.click);
-        if (Array.isArray(click) && click.length === 2) a.push(conv(click));
+        if (Array.isArray(click) && click.length === 2) a.push({ xy: conv(click), cls: (item && Number.isFinite(item.class)) ? item.class : null });
       }
     }
     persist();
@@ -132,14 +136,14 @@
       if (cls != null) o.class = cls;
       return o;
     });
-    const pointsOut = pts(c, u).map(xy => ({ click: enc(xy) }));
-    return { schema_version: 3, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
+    const pointsOut = pts(c, u).map(p => { const o = { click: enc(ptXY(p)) }; const cl = ptCls(p); if (cl != null) o.class = cl; return o; });
+    return { schema_version: 4, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
   }
 
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes)])];
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
-    selectedClicks, selectedSegs, usedClasses, pointList, pointCount, markCount, applyClass, addPoint, removePoint, undo,
+    selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     isDirty, markDirty, markClean, resetUnit,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
