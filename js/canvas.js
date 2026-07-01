@@ -108,7 +108,7 @@
       canvas.width = Math.max(1, Math.round(cssW * dpr));
       canvas.height = Math.max(1, Math.round(cssH * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      if (!W || !H) return;
+      if (!W || !H || cssW < 1 || cssH < 1) return;   // don't recompute fit from a degenerate size
       computeFit();
       if (needFit) { scale = fitScale; needFit = false; }
       else scale = Math.max(minScale(), Math.min(maxScale(), scale));  // keep zoom sane across resize
