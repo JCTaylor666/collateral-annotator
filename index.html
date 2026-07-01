@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>血管分段侧支标注器</title>
+<link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+<header class="toolbar">
+  <strong class="brand">侧支标注器</strong>
+  <button id="btnOpen" class="btn">打开数据文件夹</button>
+  <button id="btnSave" class="btn">保存到文件夹</button>
+  <span class="sep"></span>
+  <button id="btnUndo" class="btn">撤销</button>
+  <button id="btnClear" class="btn">清空本单元</button>
+  <span class="sep"></span>
+  <label class="ctl">坐标顺序
+    <select id="coordOrder"><option value="xy">x,y</option><option value="yx">y,x</option></select>
+  </label>
+  <label class="ctl">高亮透明度
+    <input id="opacity" type="range" min="0" max="100" value="55">
+  </label>
+  <span class="spacer"></span>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main class="body">
+  <section class="stage"><canvas id="view"></canvas></section>
+  <aside class="side">
+    <div class="curlabel" id="curLabel">未载入</div>
+    <div class="hint muted">用 Chrome/Edge 点“打开数据文件夹”，选包含 case_* 的目录；点击血管段即标为侧支（再点取消）。</div>
+    <div class="section-title">本单元侧支段</div>
+    <div id="chips" class="chips"><span class="muted">（无）</span></div>
+    <div class="section-title">进度</div>
+    <div id="progress" class="muted">—</div>
+    <div class="section-title">病例 / 单元</div>
+    <div id="tree" class="tree"></div>
+  </aside>
+</main>
+
+<footer class="statusbar">
+  <div class="nav">
+    <button id="prevCase" class="btn sm" title="上一病例">« 病例</button>
+    <button id="prevUnit" class="btn sm">‹ 上一单元</button>
+    <span id="unitIndicator" class="muted">—</span>
+    <button id="nextUnit" class="btn sm">下一单元 ›</button>
+    <button id="nextCase" class="btn sm" title="下一病例">病例 »</button>
+  </div>
+  <div id="cursor" class="muted"></div>
+</footer>
+
+<script src="./js/npy.js"></script>
+<script src="./js/fs.js"></script>
+<script src="./js/loader.js"></script>
+<script src="./js/canvas.js"></script>
+<script src="./js/state.js"></script>
+<script src="./js/app.js"></script>
+</body>
+</html>
