@@ -53,6 +53,8 @@
   const selectedClicks = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => segXY(s[k])).filter(xy => xy && xy[0] >= 0 && xy[1] >= 0); };
   // selected segments with their class (for per-class coloring)
   const selectedSegs = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
+  // all class indices currently assigned to any segment across every unit in memory
+  const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } return [...set]; };
   const pointList = (c, u) => pts(c, u).map(p => [p[0], p[1]]);
   const pointCount = (c, u) => pts(c, u).length;
   const markCount = (c, u) => count(c, u) + pointCount(c, u);
@@ -137,7 +139,7 @@
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes)])];
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
-    selectedClicks, selectedSegs, pointList, pointCount, markCount, applyClass, addPoint, removePoint, undo,
+    selectedClicks, selectedSegs, usedClasses, pointList, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     isDirty, markDirty, markClean, resetUnit,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };

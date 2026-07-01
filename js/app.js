@@ -39,7 +39,10 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
-      classes = await Loader.loadClasses(rootHandle); ensureActiveClass();
+      classes = await Loader.loadClasses(rootHandle);
+      setBanner('正在扫描已有标注，补全类别…');
+      await reconcileClassesFromAnnotations();
+      ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
       await showUnit(0, 0); setBanner('');
@@ -108,6 +111,28 @@
     try { await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2)); setSaveStatus('类别已保存 ' + hhmm()); }
     catch (e) { setSaveStatus('类别保存失败', true); }
   }
+  function randomName() { return '未命名-' + Math.random().toString(36).slice(2, 6); }
+  // every class index actually used by any annotation — in-memory (incl unsaved) + on disk across all units
+  async function usedClassSet() {
+    const used = new Set(State.usedClasses());
+    for (const c of cases) for (const u of c.units) {
+      try {
+        const { annotation } = await Loader.loadAnnotation(u);
+        if (annotation && Array.isArray(annotation.collaterals))
+          for (const it of annotation.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
+      } catch (e) { }
+    }
+    return used;
+  }
+  // startup: any class used by an annotation but missing from classes.json gets auto-added with a random name to rename
+  async function reconcileClassesFromAnnotations() {
+    const used = await usedClassSet();
+    const have = new Set(classes.map(c => c.index));
+    let added = 0;
+    for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
+    if (added) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
+    return added;
+  }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
     const idx = classes.reduce((m, c) => Math.max(m, c.index), 0) + 1;
@@ -118,7 +143,8 @@
     const c = classes.find(c => c.index === idx); if (!c) return;
     c.name = name; buildClassPicker(); saveClasses();
   }
-  function deleteClass(idx) {
+  async function deleteClass(idx) {
+    if ((await usedClassSet()).has(idx)) { setBanner('类别 ' + idx + ' 已被标注使用，不能删除（先取消相关标注、或保存后再删）。', 'warn'); return; }
     classes = classes.filter(c => c.index !== idx);
     ensureActiveClass(); buildClassMgr(); buildClassPicker();
     if (cur) refreshCanvasSelection();
