@@ -49,6 +49,8 @@ body.rpanel-collapsed .rpanel{display:none}
 .sel-full{width:100%}
 .stepper{display:flex;gap:5px;margin:7px 0}
 .frame-list{max-height:40vh;overflow-y:auto}
+.frame-list.picking{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px;background:var(--accent-bg)}
+body.copy-picking .frm{cursor:copy}
 .frm{display:flex;justify-content:space-between;align-items:center;padding:5px 9px;border-radius:6px;color:var(--muted);cursor:pointer}
 .frm:hover{background:var(--bg)}
 .frm.done{color:var(--ink)}

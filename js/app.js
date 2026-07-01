@@ -10,6 +10,7 @@
   const cache = new Map();
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
+  let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
   const PALETTE = ['#e5484d', '#1d9e75', '#3b7dd8', '#e5a50a', '#7c3aed', '#d6409f', '#0f9b8e', '#c2410c'];
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
 
@@ -40,8 +41,8 @@
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
       classes = await Loader.loadClasses(rootHandle);
-      setBanner('正在扫描已有标注，补全类别…');
-      await reconcileClassesFromAnnotations();
+      setBanner('正在扫描已有标注…');
+      await scanDataset();
       ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
@@ -77,7 +78,7 @@
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
     $('note').value = State.getNote(c.id, u.id);
-    updateDirtyUI();
+    updateDirtyUI(); updateCopyBtn();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
@@ -124,14 +125,24 @@
     }
     return used;
   }
-  // startup: any class used by an annotation but missing from classes.json gets auto-added with a random name to rename
-  async function reconcileClassesFromAnnotations() {
-    const used = await usedClassSet();
+  // startup: read every unit's annotation from disk. Import clean units into memory (disk-as-truth, so frame
+  // badges are accurate on open + any frame is a valid copy source); auto-add any class used but missing from meta.
+  async function scanDataset() {
+    const used = new Set(State.usedClasses());
+    for (const c of cases) for (const u of c.units) {
+      let ann = null, note = null;
+      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; } catch (e) { }
+      if (!State.isDirty(c.id, u.id)) {
+        State.resetUnit(c.id, u.id);
+        if (ann) State.importAnnotation(c.id, u.id, ann);
+        if (note != null) State.importNote(c.id, u.id, note);
+      }
+      if (ann && Array.isArray(ann.collaterals)) for (const it of ann.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
+    }
     const have = new Set(classes.map(c => c.index));
     let added = 0;
     for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
     if (added) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
-    return added;
   }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
@@ -178,6 +189,54 @@
       box.appendChild(row);
     });
   }
+  // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
+  function updateCopyBtn() {
+    const b = $('btnCopyFrom'); if (!b) return;
+    b.disabled = !cur || State.markCount(cur.caseId, cur.unitId) > 0;
+    b.textContent = copyPickMode ? '取消复制' : '从其他帧复制…';
+  }
+  function enterCopyPick() {
+    if (!cur || State.markCount(cur.caseId, cur.unitId) > 0) return;
+    copyPickMode = true;
+    $('frameList').classList.add('picking');
+    document.body.classList.add('copy-picking');
+    setBanner('点击左侧要复制标注的帧（Esc 取消）。');
+    updateCopyBtn();
+  }
+  function exitCopyPick() {
+    if (!copyPickMode) return;
+    copyPickMode = false;
+    $('frameList').classList.remove('picking');
+    document.body.classList.remove('copy-picking');
+    setBanner('');
+    updateCopyBtn();
+  }
+  function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
+  function pickCopySource(uidx) {
+    const src = curCase().units[uidx];
+    if (src && uidx !== ui) doCopyFrom(curCase().id, src);
+    exitCopyPick();
+  }
+  function doCopyFrom(srcCaseId, srcUnit) {
+    // gather source clicks: vessel segments (with class) + background points (no class)
+    const clicks = State.selectedSegs(srcCaseId, srcUnit.id).map(s => ({ xy: s.xy, cls: s.cls }))
+      .concat(State.pointList(srcCaseId, srcUnit.id).map(p => ({ xy: p, cls: null })));
+    if (!clicks.length) { setBanner('“' + srcUnit.id + '” 没有可复制的标注。', 'warn'); return; }
+    // re-resolve EACH coordinate against the current frame's label: segment there -> mark; background -> red dot
+    const segMap = new Map(), ptSeen = new Set(), pts = [];
+    for (const { xy, cls } of clicks) {
+      if (!xy || !view.inBounds(xy[0], xy[1])) continue;
+      const seg = view.segAt(xy[0], xy[1]);
+      if (seg > 0) { if (!segMap.has(seg)) segMap.set(seg, { xy, cls }); }
+      else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push(xy); } }
+    }
+    for (const [seg, v] of segMap) State.applyClass(cur.caseId, cur.unitId, seg, v.xy, v.cls);
+    for (const xy of pts) State.addPoint(cur.caseId, cur.unitId, xy);
+    State.markDirty(cur.caseId, cur.unitId);
+    refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+    setBanner('已从 “' + srcUnit.id + '” 复制并按当前帧重新解析：' + segMap.size + ' 段 · ' + pts.length + ' 点。', 'ok');
+  }
+
   function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur) return;
@@ -220,7 +279,7 @@
       const name = document.createElement('span'); name.textContent = u.id;
       const badge = document.createElement('span'); badge.className = 'frm-b';
       el.appendChild(name); el.appendChild(badge);
-      el.onclick = () => showUnit(ci, uidx);
+      el.onclick = () => { if (copyPickMode) pickCopySource(uidx); else showUnit(ci, uidx); };
       list.appendChild(el);
     });
     highlightNav();
@@ -266,7 +325,7 @@
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
       else State.addPoint(cur.caseId, cur.unitId, [x, y]);
     }
-    State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); scheduleAutoSave();
+    State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
   function onMove(ev) {
     if (!cur) return;
@@ -464,10 +523,10 @@
     } catch (e) { setSaveStatus('自动保存失败', true); }
   }
 
-  function undo() { if (!cur) return; State.undo(); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); scheduleAutoSave(); }
+  function undo() { if (!cur) return; State.undo(); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
-  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); scheduleAutoSave(); }
+  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
   function stepUnit(d) {
     if (!cases.length) return;
     let nu = ui + d, nc = ci;
@@ -526,6 +585,7 @@
     $('railToggle').onclick = toggleRail;
     $('rpanelToggle').onclick = toggleRPanel;
     $('btnAddClass').onclick = addClass;
+    $('btnCopyFrom').onclick = toggleCopyPick;
     $('className').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addClass(); } });
     $('note').oninput = onNoteInput;
     $('btnSaveNote').onclick = saveNote;
@@ -547,6 +607,7 @@
     $('btnFit').onclick = () => { view.fitView(); afterViewChange(); };
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
