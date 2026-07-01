@@ -269,9 +269,21 @@
     const sel = $('caseSelect'); sel.innerHTML = '';
     cases.forEach((c, idx) => {
       const o = document.createElement('option');
-      o.value = idx; o.textContent = c.id;
+      o.value = idx;
+      o.textContent = c.id + (State.caseStarred(c.id, c.units.map(u => u.id)) ? ' ★' : '');
       sel.appendChild(o);
     });
+  }
+  async function toggleStar(uidx) {
+    const c = curCase(); if (!c) return;
+    const u = c.units[uidx];
+    State.setStarred(c.id, u.id, !State.isStarred(c.id, u.id));
+    State.markDirty(c.id, u.id);
+    buildCaseOptions(); buildFrameList(); updateDirtyUI();
+    if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
+      try { setSaveStatus('保存中…'); await writeUnit(c.id, u); setSaveStatus('已保存 ' + hhmm()); updateDirtyUI(); }
+      catch (e) { setSaveStatus('保存失败', true); }
+    }
   }
   function buildFrameList() {
     const c = curCase(), list = $('frameList'); list.innerHTML = '';
@@ -279,9 +291,12 @@
     c.units.forEach((u, uidx) => {
       const el = document.createElement('div');
       el.className = 'frm'; el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id;
-      const name = document.createElement('span'); name.textContent = u.id;
+      const name = document.createElement('span'); name.className = 'frm-name'; name.textContent = u.id;
       const badge = document.createElement('span'); badge.className = 'frm-b';
-      el.appendChild(name); el.appendChild(badge);
+      const on = State.isStarred(c.id, u.id);
+      const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = '星标该帧';
+      star.onclick = (e) => { e.stopPropagation(); toggleStar(uidx); };
+      el.appendChild(name); el.appendChild(badge); el.appendChild(star);
       el.onclick = () => { if (copyPickMode) pickCopySource(uidx); else showUnit(ci, uidx); };
       list.appendChild(el);
     });
@@ -510,20 +525,19 @@
     setSaveStatus('待保存…');
   }
   function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
+  async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note) and mark it clean
+    const k = State.key(caseId, unit.id);
+    let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
+    await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+    if (State.hasNote(caseId, unit.id)) await FS.writeText(unit.handle, 'note.txt', State.getNote(caseId, unit.id));
+    State.markClean(caseId, unit.id);
+  }
   async function runAutoSave() {
     saveTimer = null;
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
-    try {
-      setSaveStatus('保存中…');
-      let data = cache.get(State.key(p.c, p.u));
-      if (!data) data = await Loader.loadUnit(p.unit);
-      const ann = State.buildAnnotation(p.c, p.u, data.W, data.H);
-      await FS.writeText(p.unit.handle, 'annotation.json', JSON.stringify(ann, null, 2));
-      if (State.hasNote(p.c, p.u)) await FS.writeText(p.unit.handle, 'note.txt', State.getNote(p.c, p.u));
-      State.markClean(p.c, p.u); updateDirtyUI();
-      setSaveStatus('已保存 ' + hhmm());
-    } catch (e) { setSaveStatus('自动保存失败', true); }
+    try { setSaveStatus('保存中…'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSaveStatus('已保存 ' + hhmm()); }
+    catch (e) { setSaveStatus('自动保存失败', true); }
   }
 
   function undo() { if (!cur) return; State.undo(); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
