@@ -4,17 +4,18 @@
   'use strict';
   const LSKEY = 'vessel_annotator_v1';
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
+  let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false };
 
   const key = (c, u) => c + '/' + u;
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, coordOrder, window: win, loupe })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, coordOrder, window: win, loupe })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
-        selections = o.selections || {}; visited = o.visited || {};
+        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {};
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
@@ -31,54 +32,73 @@
   function setLoupe(zoom, R, mean) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean }; persist(); }
 
   const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});
-  const hasLocal = (c, u) => key(c, u) in selections;
+  const pts = (c, u) => points[key(c, u)] || (points[key(c, u)] = []);
+  const hasLocal = (c, u) => (key(c, u) in selections) || (key(c, u) in points);
   const selectedIds = (c, u) => Object.keys(sel(c, u)).map(Number).sort((a, b) => a - b);
   const count = (c, u) => Object.keys(sel(c, u)).length;
+  // click coords of selected segments (for red dots); skip any without a real coord
+  const selectedClicks = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => s[k]).filter(xy => xy && xy[0] >= 0 && xy[1] >= 0); };
+  const pointList = (c, u) => pts(c, u).map(p => [p[0], p[1]]);
+  const pointCount = (c, u) => pts(c, u).length;
+  const markCount = (c, u) => count(c, u) + pointCount(c, u);
 
   function toggle(c, u, seg, clickXY) {
     const s = sel(c, u), ks = String(seg);
-    if (ks in s) { const prev = s[ks]; delete s[ks]; undoStack.push({ c, u, ks, prev }); }
-    else { s[ks] = clickXY; undoStack.push({ c, u, ks, prev: null }); }
+    if (ks in s) { const prev = s[ks]; delete s[ks]; undoStack.push({ kind: 'seg', c, u, ks, prev }); }
+    else { s[ks] = clickXY; undoStack.push({ kind: 'seg', c, u, ks, prev: null }); }
     persist();
   }
+  function addPoint(c, u, xy) { pts(c, u).push([xy[0], xy[1]]); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
+  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const xy = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, xy }); persist(); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
-    const s = sel(e.c, e.u);
-    if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
+    if (e.kind === 'point') {
+      const a = pts(e.c, e.u);
+      if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.xy);
+    } else {
+      const s = sel(e.c, e.u);
+      if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
+    }
     persist(); return e;
   }
-  function clearUnit(c, u) { selections[key(c, u)] = {}; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
 
   function markVisited(c, u) { visited[key(c, u)] = true; persist(); }
   const isVisited = (c, u) => !!visited[key(c, u)];
 
-  // seed selections from a file's annotation.json (convert its coord_order to internal x,y)
+  // seed selections + background points from a file's annotation.json (convert its coord_order to internal x,y)
   function importAnnotation(c, u, ann) {
-    if (!ann || !Array.isArray(ann.collaterals)) return;
+    if (!ann) return;
     const order = ann.coord_order === 'yx' ? 'yx' : 'xy';
-    const s = sel(c, u);
-    for (const item of ann.collaterals) {
-      const id = Number(item.id); if (!Number.isFinite(id)) continue;
-      let x = -1, y = -1;
-      if (Array.isArray(item.click) && item.click.length === 2) {
-        if (order === 'xy') { x = item.click[0]; y = item.click[1]; } else { y = item.click[0]; x = item.click[1]; }
+    const conv = arr => order === 'xy' ? [arr[0], arr[1]] : [arr[1], arr[0]];
+    if (Array.isArray(ann.collaterals)) {
+      const s = sel(c, u);
+      for (const item of ann.collaterals) {
+        const id = Number(item.id); if (!Number.isFinite(id)) continue;
+        s[String(id)] = (Array.isArray(item.click) && item.click.length === 2) ? conv(item.click) : [-1, -1];
       }
-      s[String(id)] = [x, y];
+    }
+    if (Array.isArray(ann.points)) {
+      const a = pts(c, u);
+      for (const item of ann.points) {
+        const click = Array.isArray(item) ? item : (item && item.click);
+        if (Array.isArray(click) && click.length === 2) a.push(conv(click));
+      }
     }
     persist();
   }
 
   function buildAnnotation(c, u, W, H) {
     const s = sel(c, u);
-    const collaterals = Object.keys(s).map(Number).sort((a, b) => a - b).map(id => {
-      const xy = s[String(id)];
-      return { id, click: coordOrder === 'xy' ? [xy[0], xy[1]] : [xy[1], xy[0]] };
-    });
-    return { schema_version: 1, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals };
+    const enc = xy => coordOrder === 'xy' ? [xy[0], xy[1]] : [xy[1], xy[0]];
+    const collaterals = Object.keys(s).map(Number).sort((a, b) => a - b).map(id => ({ id, click: enc(s[String(id)]) }));
+    const pointsOut = pts(c, u).map(xy => ({ click: enc(xy) }));
+    return { schema_version: 2, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
   }
 
-  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited)])];
+  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points)])];
 
-  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, hasLocal, selectedIds, count, toggle, undo,
+  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, hasLocal, selectedIds, count,
+    selectedClicks, pointList, pointCount, markCount, toggle, addPoint, removePoint, undo,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);

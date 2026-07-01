@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=7">
+<link rel="stylesheet" href="./css/style.css?v=8">
 </head>
 <body>
 <header class="toolbar">
@@ -45,7 +45,7 @@
   <section class="stage"><canvas id="view"></canvas></section>
   <aside class="side">
     <div class="curlabel" id="curLabel">未载入</div>
-    <div class="hint muted">用 Chrome/Edge 点“打开数据文件夹”，选包含 case_* 的目录；点击血管段即标为侧支（再点取消）。颜色：血管mask=亮蓝，选中=绿，悬停=橙。</div>
+    <div class="hint muted">用 Chrome/Edge 点“打开数据文件夹”，选包含 case_* 的目录；点击血管段即标为侧支（再点取消）。点击处会留红点记录坐标；点背景（无血管）也会留红点，在红点附近再点即删除。颜色：血管mask=亮蓝，选中=绿，悬停=橙，红点=点击坐标。</div>
     <div class="section-title">本单元侧支段</div>
     <div id="chips" class="chips"><span class="muted">（无）</span></div>
     <div class="section-title">进度</div>
@@ -86,12 +86,12 @@
   <div id="cursor" class="muted"></div>
 </footer>
 
-<script src="./js/npy.js?v=7"></script>
-<script src="./js/fs.js?v=7"></script>
-<script src="./js/loader.js?v=7"></script>
-<script src="./js/canvas.js?v=7"></script>
-<script src="./js/state.js?v=7"></script>
-<script src="./js/loupe.js?v=7"></script>
-<script src="./js/app.js?v=7"></script>
+<script src="./js/npy.js?v=8"></script>
+<script src="./js/fs.js?v=8"></script>
+<script src="./js/loader.js?v=8"></script>
+<script src="./js/canvas.js?v=8"></script>
+<script src="./js/state.js?v=8"></script>
+<script src="./js/loupe.js?v=8"></script>
+<script src="./js/app.js?v=8"></script>
 </body>
 </html>

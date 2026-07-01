@@ -17,6 +17,7 @@
     let scale = 1, offX = 0, offY = 0, fitScale = 1, needFit = true;
     let sel = new Set(), hov = 0, opacity = 0.55;
     let maskData = null, maskOpacity = 0.45;
+    let dots = [];   // recorded click coords [x,y] to mark with red dots
     let gray = null, center = 128, width = 255;
     let segPix = null;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
@@ -133,6 +134,17 @@
       ctx.globalAlpha = Math.min(1, opacity + 0.25); ctx.drawImage(hovCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = 1;
       drawRuler(cssW, cssH);
+      drawDots();
+    }
+    function drawDots() {
+      if (!dots.length) return;
+      ctx.save();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = '#fff'; ctx.fillStyle = '#e5484d';
+      for (let i = 0; i < dots.length; i++) {
+        const sx = offX + (dots[i][0] + 0.5) * scale, sy = offY + (dots[i][1] + 0.5) * scale;
+        ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 6.29); ctx.fill(); ctx.stroke();
+      }
+      ctx.restore();
     }
     function drawRuler() {
       ctx.save();
@@ -162,13 +174,15 @@
     function inBounds(x, y) { return x >= 0 && y >= 0 && x < W && y < H; }
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
+    function setDots(arr) { dots = arr || []; }
+    function imageToScreen(ix, iy) { return [offX + ix * scale, offY + iy * scale]; }  // canvas-relative CSS px
     // Live grayscale of the CURRENT unit. Callers must use it immediately and never
     // store it — setUnit reallocates gray on every unit switch.
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, inBounds, getGray,
-             fitView, zoomAt, panBy, getZoom,
+             fitView, zoomAt, panBy, getZoom, setDots, imageToScreen,
              get W() { return W; }, get H() { return H; } };
   }
 

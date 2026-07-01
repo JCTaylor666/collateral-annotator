@@ -58,13 +58,19 @@
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setSelected(new Set(State.selectedIds(c.id, u.id)));
+    refreshDots();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); highlightTree();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
+  function refreshDots() {
+    if (!cur) return;
+    view.setDots(State.selectedClicks(cur.caseId, cur.unitId).concat(State.pointList(cur.caseId, cur.unitId)));
+  }
   function refreshCanvasSelection() {
     view.setSelected(new Set(State.selectedIds(cur.caseId, cur.unitId)));
+    refreshDots();
     view.render();
   }
 
@@ -74,7 +80,7 @@
     $('unitIndicator').textContent = '单元 ' + (ui + 1) + '/' + curCase().units.length + ' · 病例 ' + (ci + 1) + '/' + cases.length;
     const ids = State.selectedIds(c.id, u.id);
     $('chips').innerHTML = ids.length ? ids.map(i => '<span class="chip">' + i + '</span>').join('') : '<span class="muted">（无）</span>';
-    $('progress').textContent = '本单元已标 ' + ids.length + ' 段';
+    $('progress').textContent = '本单元已标 ' + ids.length + ' 段 · ' + State.pointCount(c.id, u.id) + ' 点';
   }
 
   function buildTree() {
@@ -94,19 +100,40 @@
     const k = curCase() ? State.key(curCase().id, curUnit().id) : '';
     document.querySelectorAll('.tunit').forEach(el => {
       const [cc, uu] = el.dataset.k.split('/');
-      const n = State.count(cc, uu);
+      const n = State.markCount(cc, uu);
       el.classList.toggle('active', el.dataset.k === k);
       el.classList.toggle('done', State.isVisited(cc, uu));
       el.textContent = el.dataset.base + (n ? ' · ' + n : '');
     });
   }
 
+  const PICK_PX = 10;   // screen-space radius to hit an existing red dot
+  function nearestBgPoint(ev) {
+    const list = State.pointList(cur.caseId, cur.unitId);
+    if (!list.length) return -1;
+    const rect = $('view').getBoundingClientRect();
+    const sx = ev.clientX - rect.left, sy = ev.clientY - rect.top;
+    let best = PICK_PX, idx = -1;
+    for (let i = 0; i < list.length; i++) {
+      const p = view.imageToScreen(list[i][0] + 0.5, list[i][1] + 0.5);
+      const d = Math.hypot(p[0] - sx, p[1] - sy);
+      if (d <= best) { best = d; idx = i; }
+    }
+    return idx;
+  }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag, not an annotate
     if (!cur) return;                                       // inspect no longer blocks annotation
-    const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
-    if (!seg) return;
-    State.toggle(cur.caseId, cur.unitId, seg, [x, y]);
+    const [x, y] = view.eventToImage(ev);
+    if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
+    const seg = view.segAt(x, y);
+    if (seg) {
+      State.toggle(cur.caseId, cur.unitId, seg, [x, y]);
+    } else {                                                // background: toggle a red dot (remove nearby, else add)
+      const idx = nearestBgPoint(ev);
+      if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
+      else State.addPoint(cur.caseId, cur.unitId, [x, y]);
+    }
     refreshCanvasSelection(); refreshMeta(); highlightTree();
   }
   function onMove(ev) {
