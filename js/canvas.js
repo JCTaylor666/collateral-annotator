@@ -15,7 +15,7 @@
     // live affine: screen = scale*image + off. fitScale = fit-to-viewport; needFit
     // re-fits on next layout (set when image dims change). User pan/zoom mutate scale/off.
     let scale = 1, offX = 0, offY = 0, fitScale = 1, needFit = true;
-    let sel = new Set(), hov = 0, opacity = 0.55;
+    let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color)
     let maskData = null, maskOpacity = 0.45;
     let dots = [];   // recorded click coords [x,y] to mark with red dots
     let gray = null, center = 128, width = 255;
@@ -63,7 +63,7 @@
     function buildSelLayer() {
       selCtx.clearRect(0, 0, W, H);
       const id = selCtx.createImageData(W, H), d = id.data;
-      for (const seg of sel) { const px = segPixels(seg); for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = SEL_RGB[0]; d[p + 1] = SEL_RGB[1]; d[p + 2] = SEL_RGB[2]; d[p + 3] = 255; } }
+      for (const [seg, rgb] of sel) { const px = segPixels(seg); for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; } }
       selCtx.putImageData(id, 0, 0);
     }
     function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) paint(hovCtx, segPixels(hov), HOV_RGB); }
@@ -75,7 +75,7 @@
       maskCtx.putImageData(id, 0, 0);
     }
 
-    function setSelected(s) { sel = s; if (W) buildSelLayer(); }
+    function setSelected(s) { sel = (s instanceof Map) ? s : new Map(); if (W) buildSelLayer(); }
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
     function setOpacity(o) { opacity = o; }
     function setMaskOpacity(o) { maskOpacity = o; }

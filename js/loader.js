@@ -63,7 +63,24 @@
       annotation = JSON.parse(await (await annH.getFile()).text());
     } catch (e) { /* not annotated yet */ }
 
-    return { W, H, img, url, label: parsed.data, mask, annotation };
+    let note = null;
+    try {
+      const nH = await unit.handle.getFileHandle('note.txt');
+      note = await (await nH.getFile()).text();
+    } catch (e) { /* no note yet */ }
+
+    return { W, H, img, url, label: parsed.data, mask, annotation, note };
+  }
+
+  // read the dataset-level class definitions from classes.json at the root (or [] if none)
+  async function loadClasses(rootHandle) {
+    try {
+      const fh = await rootHandle.getFileHandle('classes.json');
+      const o = JSON.parse(await (await fh.getFile()).text());
+      if (o && Array.isArray(o.classes))
+        return o.classes.filter(c => Number.isFinite(c.index)).map(c => ({ index: c.index, name: String(c.name || ('类别 ' + c.index)) }));
+    } catch (e) { /* no classes.json */ }
+    return [];
   }
 
   // Lightweight read for the inspect loupe: only frames.png -> grayscale (R channel).
@@ -93,5 +110,5 @@
     }
   }
 
-  root.Loader = { discover, loadUnit, loadGray };
+  root.Loader = { discover, loadUnit, loadGray, loadClasses };
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -9,6 +9,9 @@
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
+  let classes = [];                           // dataset class defs [{index,name}] from classes.json
+  const PALETTE = ['#e5484d', '#1d9e75', '#3b7dd8', '#e5a50a', '#7c3aed', '#d6409f', '#0f9b8e', '#c2410c'];
+  const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -36,7 +39,9 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
+      classes = await Loader.loadClasses(rootHandle); ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
+      buildClassMgr(); buildClassPicker();
       await showUnit(0, 0); setBanner('');
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('打开失败:' + e.message, 'warn'); }
   }
@@ -47,6 +52,7 @@
     const data = await Loader.loadUnit(u);
     cache.set(k, data);
     if (!State.hasLocal(c.id, u.id) && data.annotation) State.importAnnotation(c.id, u.id, data.annotation);
+    if (!State.hasNote(c.id, u.id) && data.note) State.importNote(c.id, u.id, data.note);
     return data;
   }
 
@@ -59,10 +65,11 @@
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
-    view.setSelected(new Set(State.selectedIds(c.id, u.id)));
+    view.setSelected(selColorMap());
     refreshDots();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
+    $('note').value = State.getNote(c.id, u.id);
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
@@ -71,10 +78,84 @@
     view.setDots(State.selectedClicks(cur.caseId, cur.unitId).concat(State.pointList(cur.caseId, cur.unitId)));
   }
   function refreshCanvasSelection() {
-    view.setSelected(new Set(State.selectedIds(cur.caseId, cur.unitId)));
+    view.setSelected(selColorMap());
     refreshDots();
     view.render();
   }
+
+  // ---- multiclass: colors, class management, active class ----
+  function defaultColor(idx) { return PALETTE[((idx - 1) % PALETTE.length + PALETTE.length) % PALETTE.length]; }
+  function classColor(cls) { return cls == null ? null : (State.getClassColor(cls) || defaultColor(cls)); }
+  function hexToRgb(hex) { const n = parseInt(hex.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+  function segRgb(cls) { const c = classColor(cls); return c ? hexToRgb(c) : UNCLASSIFIED_RGB; }
+  function selColorMap() {
+    const m = new Map();
+    if (!cur) return m;
+    for (const it of State.selectedSegs(cur.caseId, cur.unitId)) m.set(it.seg, segRgb(it.cls));
+    return m;
+  }
+  function ensureActiveClass() {
+    if (!classes.length) { State.setActiveClass(null); return; }
+    if (!classes.some(c => c.index === State.getActiveClass())) State.setActiveClass(classes[0].index);
+  }
+  async function saveClasses() {
+    if (!rootHandle) return;
+    try { await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2)); setSaveStatus('类别已保存 ' + hhmm()); }
+    catch (e) { setSaveStatus('类别保存失败', true); }
+  }
+  function addClass() {
+    const inp = $('className'), name = inp.value.trim(); if (!name) return;
+    const idx = classes.reduce((m, c) => Math.max(m, c.index), 0) + 1;
+    classes.push({ index: idx, name }); inp.value = '';
+    ensureActiveClass(); buildClassMgr(); buildClassPicker(); saveClasses();
+  }
+  function renameClass(idx, name) {
+    const c = classes.find(c => c.index === idx); if (!c) return;
+    c.name = name; buildClassPicker(); saveClasses();
+  }
+  function deleteClass(idx) {
+    classes = classes.filter(c => c.index !== idx);
+    ensureActiveClass(); buildClassMgr(); buildClassPicker();
+    if (cur) refreshCanvasSelection();
+    saveClasses();
+  }
+  function buildClassMgr() {
+    const box = $('classMgr'); box.innerHTML = '';
+    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">还没有类别，输入名字点“添加”。</div>'; return; }
+    classes.forEach(c => {
+      const row = document.createElement('div'); row.className = 'cls-mgr-row';
+      const idx = document.createElement('span'); idx.className = 'cls-idx'; idx.textContent = c.index;
+      const inp = document.createElement('input'); inp.type = 'text'; inp.value = c.name; inp.className = 'cls-name-inp';
+      inp.onchange = () => renameClass(c.index, inp.value.trim() || ('类别 ' + c.index));
+      const del = document.createElement('button'); del.className = 'btn sm'; del.textContent = '删除';
+      del.onclick = () => deleteClass(c.index);
+      row.appendChild(idx); row.appendChild(inp); row.appendChild(del); box.appendChild(row);
+    });
+  }
+  function buildClassPicker() {
+    const box = $('classPicker'); box.innerHTML = '';
+    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">在左栏“分类管理”添加类别后，这里选择当前标注类别与颜色。</div>'; return; }
+    const active = State.getActiveClass();
+    classes.forEach(c => {
+      const row = document.createElement('div'); row.className = 'cls-row' + (c.index === active ? ' active' : '');
+      const color = document.createElement('input'); color.type = 'color'; color.value = classColor(c.index); color.className = 'cls-color';
+      color.oninput = e => { State.setClassColor(c.index, e.target.value); if (cur) refreshCanvasSelection(); };
+      color.onclick = e => e.stopPropagation();
+      const name = document.createElement('span'); name.className = 'cls-name'; name.textContent = c.index + ' · ' + c.name;
+      row.appendChild(color); row.appendChild(name);
+      row.onclick = () => { State.setActiveClass(c.index); buildClassPicker(); };
+      box.appendChild(row);
+    });
+  }
+  function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); scheduleAutoSave(); }
+  async function saveNote() {
+    if (!cur) return;
+    if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
+    State.setNote(cur.caseId, cur.unitId, $('note').value);
+    try { await FS.writeText(curUnit().handle, 'note.txt', $('note').value); setSaveStatus('笔记已保存 ' + hhmm()); }
+    catch (e) { setSaveStatus('笔记保存失败', true); }
+  }
+  function toggleRPanel() { document.body.classList.toggle('rpanel-collapsed'); onResize(); }
 
   function refreshMeta() {
     const c = curCase(), u = curUnit();
@@ -142,7 +223,7 @@
     if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
     const seg = view.segAt(x, y);
     if (seg) {
-      State.toggle(cur.caseId, cur.unitId, seg, [x, y]);
+      State.applyClass(cur.caseId, cur.unitId, seg, [x, y], State.getActiveClass());
     } else {                                                // background: toggle a red dot (remove nearby, else add)
       const idx = nearestBgPoint(ev);
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
@@ -304,6 +385,7 @@
         if (!data) { data = await Loader.loadUnit(ref.u); cache.set(k, data); }
         const ann = State.buildAnnotation(ref.c.id, ref.u.id, data.W, data.H);
         await FS.writeText(ref.u.handle, 'annotation.json', JSON.stringify(ann, null, 2));
+        if (State.hasNote(ref.c.id, ref.u.id)) await FS.writeText(ref.u.handle, 'note.txt', State.getNote(ref.c.id, ref.u.id));
         n++;
       }
       setBanner('已保存 ' + n + ' 个单元的 annotation.json 到各自文件夹。', 'ok');
@@ -332,6 +414,7 @@
       if (!data) data = await Loader.loadUnit(p.unit);
       const ann = State.buildAnnotation(p.c, p.u, data.W, data.H);
       await FS.writeText(p.unit.handle, 'annotation.json', JSON.stringify(ann, null, 2));
+      if (State.hasNote(p.c, p.u)) await FS.writeText(p.unit.handle, 'note.txt', State.getNote(p.c, p.u));
       setSaveStatus('已保存 ' + hhmm());
     } catch (e) { setSaveStatus('自动保存失败', true); }
   }
@@ -396,6 +479,12 @@
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
     $('caseSelect').onchange = e => showUnit(+e.target.value, 0);
     $('railToggle').onclick = toggleRail;
+    $('rpanelToggle').onclick = toggleRPanel;
+    $('btnAddClass').onclick = addClass;
+    $('className').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addClass(); } });
+    $('note').oninput = onNoteInput;
+    $('btnSaveNote').onclick = saveNote;
+    buildClassMgr(); buildClassPicker();
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
     $('prevCase').onclick = () => stepCase(-1);
