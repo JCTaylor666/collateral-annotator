@@ -38,3 +38,12 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .tunit.active{background:var(--accent-bg);color:var(--accent)}
 .statusbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 12px;background:var(--panel);border-top:1px solid var(--border)}
 .nav{display:flex;align-items:center;gap:6px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100}
+.modal-overlay.hidden{display:none}
+.modal{background:var(--panel);border-radius:12px;padding:26px 30px;max-width:440px;box-shadow:0 12px 44px rgba(0,0,0,.28);text-align:center}
+.modal-warn{color:#dc2626;font-size:17px;font-weight:700;margin:0 0 22px;line-height:1.7}
+.modal-actions{display:flex;align-items:center;justify-content:center;gap:20px}
+.btn-danger{font-size:12px;padding:6px 12px;color:var(--warn);border-color:var(--border)}
+.btn-danger:hover:not(:disabled){border-color:var(--warn)}
+.btn-cancel{font-size:18px;font-weight:700;padding:13px 34px;border-radius:10px;border-color:var(--accent);background:var(--accent);color:#fff}
+.btn-cancel:hover:not(:disabled){filter:brightness(1.06);border-color:var(--accent)}

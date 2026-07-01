@@ -125,6 +125,8 @@
   }
 
   function undo() { if (!cur) return; State.undo(); refreshCanvasSelection(); refreshMeta(); highlightTree(); }
+  function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
+  function closeClear() { $('confirmClear').classList.add('hidden'); }
   function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightTree(); }
   function stepUnit(d) {
     if (!cases.length) return;
@@ -147,7 +149,10 @@
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
     $('btnUndo').onclick = undo;
-    $('btnClear').onclick = clear;
+    $('btnClear').onclick = askClear;
+    $('cancelClear').onclick = closeClear;
+    $('doClear').onclick = () => { closeClear(); clear(); };
+    $('confirmClear').addEventListener('click', e => { if (e.target === $('confirmClear')) closeClear(); });
     $('coordOrder').onchange = e => State.setCoordOrder(e.target.value);
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
     $('maskOpacity').oninput = e => { view.setMaskOpacity(e.target.value / 100); view.render(); };
@@ -172,6 +177,7 @@
     cv.addEventListener('mouseleave', onLeave);
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=3">
+<link rel="stylesheet" href="./css/style.css?v=4">
 </head>
 <body>
 <header class="toolbar">
@@ -48,6 +48,16 @@
   </aside>
 </main>
 
+<div id="confirmClear" class="modal-overlay hidden">
+  <div class="modal">
+    <p class="modal-warn">真的要清理么？<br>清理以后本 frame 全部标记都将消失。</p>
+    <div class="modal-actions">
+      <button id="doClear" class="btn btn-danger">继续清理</button>
+      <button id="cancelClear" class="btn btn-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
 <footer class="statusbar">
   <div class="nav">
     <button id="prevCase" class="btn sm" title="上一病例">« 病例</button>
@@ -59,11 +69,11 @@
   <div id="cursor" class="muted"></div>
 </footer>
 
-<script src="./js/npy.js?v=3"></script>
-<script src="./js/fs.js?v=3"></script>
-<script src="./js/loader.js?v=3"></script>
-<script src="./js/canvas.js?v=3"></script>
-<script src="./js/state.js?v=3"></script>
-<script src="./js/app.js?v=3"></script>
+<script src="./js/npy.js?v=4"></script>
+<script src="./js/fs.js?v=4"></script>
+<script src="./js/loader.js?v=4"></script>
+<script src="./js/canvas.js?v=4"></script>
+<script src="./js/state.js?v=4"></script>
+<script src="./js/app.js?v=4"></script>
 </body>
 </html>
