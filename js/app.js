@@ -44,7 +44,7 @@
     try { data = await loadCur(); } catch (e) { setBanner(u.id + ' 载入失败:' + e.message, 'warn'); return; }
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
-    view.setUnit(data.img, data.W, data.H, data.label);
+    view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setSelected(new Set(State.selectedIds(c.id, u.id)));
     view.layout(); view.render();
     refreshMeta(); highlightTree();
@@ -146,6 +146,7 @@
     $('btnClear').onclick = clear;
     $('coordOrder').onchange = e => State.setCoordOrder(e.target.value);
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
+    $('maskOpacity').oninput = e => { view.setMaskOpacity(e.target.value / 100); view.render(); };
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
     $('prevCase').onclick = () => stepCase(-1);
@@ -162,6 +163,7 @@
       else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
     });
     view.setOpacity($('opacity').value / 100);
+    view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {
       setBanner('此浏览器不支持自动写盘(File System Access API)。请用 Chrome 或 Edge 打开本页。', 'warn');
       $('btnOpen').disabled = true; $('btnSave').disabled = true;

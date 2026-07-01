@@ -21,6 +21,9 @@
   <label class="ctl">高亮透明度
     <input id="opacity" type="range" min="0" max="100" value="55">
   </label>
+  <label class="ctl">血管mask
+    <input id="maskOpacity" type="range" min="0" max="100" value="45">
+  </label>
   <span class="spacer"></span>
 </header>
 
@@ -30,7 +33,7 @@
   <section class="stage"><canvas id="view"></canvas></section>
   <aside class="side">
     <div class="curlabel" id="curLabel">未载入</div>
-    <div class="hint muted">用 Chrome/Edge 点“打开数据文件夹”，选包含 case_* 的目录；点击血管段即标为侧支（再点取消）。</div>
+    <div class="hint muted">用 Chrome/Edge 点“打开数据文件夹”，选包含 case_* 的目录；点击血管段即标为侧支（再点取消）。颜色：血管mask=亮蓝，选中=绿，悬停=橙。</div>
     <div class="section-title">本单元侧支段</div>
     <div id="chips" class="chips"><span class="muted">（无）</span></div>
     <div class="section-title">进度</div>

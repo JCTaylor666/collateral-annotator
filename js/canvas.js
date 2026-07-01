@@ -4,8 +4,9 @@
   'use strict';
 
   const EMPTY = new Int32Array(0);
-  const SEL_RGB = [76, 132, 168];    // selected segments
-  const HOV_RGB = [245, 133, 24];    // hovered segment
+  const SEL_RGB = [39, 174, 96];     // selected segments (green)
+  const HOV_RGB = [245, 133, 24];    // hovered segment (orange)
+  const MASK_RGB = [28, 176, 246];   // vessel mask overlay (bright blue)
   const RULER = '#3b7dd8';
 
   function createView(canvas) {
@@ -13,14 +14,16 @@
     let img = null, W = 0, H = 0, label = null;
     let scale = 1, offX = 0, offY = 0;
     let sel = new Set(), hov = 0, opacity = 0.55;
+    let maskData = null, maskOpacity = 0.45;
     let segPix = null;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
+    const maskCv = document.createElement('canvas'), maskCtx = maskCv.getContext('2d');
 
-    function setUnit(image, w, h, lab) {
-      img = image; W = w; H = h; label = lab; hov = 0;
-      selCv.width = hovCv.width = W; selCv.height = hovCv.height = H;
-      buildSegPix(); buildSelLayer(); hovCtx.clearRect(0, 0, W, H);
+    function setUnit(image, w, h, lab, maskArr) {
+      img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
+      selCv.width = hovCv.width = maskCv.width = W; selCv.height = hovCv.height = maskCv.height = H;
+      buildSegPix(); buildSelLayer(); buildMaskLayer(); hovCtx.clearRect(0, 0, W, H);
     }
     function buildSegPix() {
       const counts = new Map();
@@ -42,10 +45,18 @@
       selCtx.putImageData(id, 0, 0);
     }
     function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) paint(hovCtx, segPixels(hov), HOV_RGB); }
+    function buildMaskLayer() {
+      maskCtx.clearRect(0, 0, W, H);
+      if (!maskData) return;
+      const id = maskCtx.createImageData(W, H), d = id.data;
+      for (let i = 0; i < maskData.length; i++) { if (maskData[i]) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
+      maskCtx.putImageData(id, 0, 0);
+    }
 
     function setSelected(s) { sel = s; if (W) buildSelLayer(); }
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
     function setOpacity(o) { opacity = o; }
+    function setMaskOpacity(o) { maskOpacity = o; }
 
     function layout() {
       const dpr = window.devicePixelRatio || 1;
@@ -63,6 +74,7 @@
       if (!img) return;
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(img, offX, offY, W * scale, H * scale);
+      if (maskData && maskOpacity > 0) { ctx.globalAlpha = maskOpacity; ctx.drawImage(maskCv, offX, offY, W * scale, H * scale); }
       ctx.globalAlpha = opacity; ctx.drawImage(selCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = Math.min(1, opacity + 0.25); ctx.drawImage(hovCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = 1;
@@ -97,7 +109,7 @@
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
 
-    return { setUnit, setSelected, setHovered, setOpacity, layout, render, eventToImage, segAt, segSize, inBounds,
+    return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, layout, render, eventToImage, segAt, segSize, inBounds,
              get W() { return W; }, get H() { return H; } };
   }
 

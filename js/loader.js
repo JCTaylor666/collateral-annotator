@@ -49,13 +49,20 @@
       throw new Error(`${unit.id}: image ${img.naturalWidth}x${img.naturalHeight} != label ${W}x${H} (W=shape[1],H=shape[0])`);
     }
 
+    let mask = null;
+    try {
+      const mH = await unit.handle.getFileHandle('mask.npy');
+      const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
+      if (mp.shape.length === 2 && mp.shape[0] === H && mp.shape[1] === W) mask = mp.data;
+    } catch (e) { /* no mask.npy */ }
+
     let annotation = null;
     try {
       const annH = await unit.handle.getFileHandle('annotation.json');
       annotation = JSON.parse(await (await annH.getFile()).text());
     } catch (e) { /* not annotated yet */ }
 
-    return { W, H, img, url, label: parsed.data, annotation };
+    return { W, H, img, url, label: parsed.data, mask, annotation };
   }
 
   root.Loader = { discover, loadUnit };
