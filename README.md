@@ -58,7 +58,6 @@ Pick a case from the dropdown at the top of the left rail, then click a frame in
 
 ![Annotate a segment](docs/media/annotationprocess.gif)
 
-*(This clip is sped up.)*
 
 Pick the active class in the right panel (**Annotation class**), then click on the image.
 
