@@ -15,7 +15,7 @@
 │  │  ├─ label.npy              ← input · segment-id map (this frame's segmentation)
 │  │  ├─ mask.npy               ← input · 0/1 vessel mask (optional)
 │  │  ├─ annotation.json        ← output · your annotations for this frame
-│  │  └─ note.txt               ← output · frame note (only if you wrote one)
+│  │  └─ note.json              ← output · frame note + numbered markers
 │  ├─ frame_1/ …
 │  └─ minip/                    ← minimum-intensity projection · same files, listed last
 └─ case_0002/ …</pre>
@@ -67,8 +67,13 @@
 <li><code>starred</code> — present (true) only when the frame is starred.</li>
 <li><code>paint</code> — brush layer, row run-length encoded; present only if painted. <code>classes</code> maps class index → list of runs <code>[row, col, length]</code>: row = y (0 = top), col = x of the run start (0 = left), length = number of consecutive pixels toward +x. <code>width</code>/<code>height</code> record the encoding dimensions, and the <code>axes</code> field documents the run layout inside the file itself.</li>
 </ul></div>
-<div class="doc-sec"><h4><code>note.txt</code> — output</h4><ul>
-<li>Plain UTF-8 text of the frame's Notes box; written only if a note exists.</li>
+<div class="doc-sec"><h4><code>note.json</code> — output</h4>
+<pre class="doc-tree">{ "schema_version": 1, "coord_order": "xy",
+  "text": "free-text note…",
+  "markers": [ { "id": 1, "click": [321, 187] } ] }</pre>
+<ul>
+<li><code>text</code> — the frame's Notes box. <code>markers</code> — the numbered circle markers placed from the note panel: <code>id</code> = the number shown in the circle (stable, never renumbered), <code>click</code> = image coordinate, serialized with <code>coord_order</code> like annotation.json.</li>
+<li>Written when the frame has note text or markers. Legacy <code>note.txt</code> files are no longer read or written.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>classes.json</code> — output, dataset root</h4>
 <pre class="doc-tree">{ "classes": [ { "index": 1, "name": "Collateral A" } ] }</pre>
@@ -87,7 +92,7 @@
 │  │  ├─ label.npy              ← 输入 · 血管段 id 图（本帧自己的分割）
 │  │  ├─ mask.npy               ← 输入 · 0/1 血管 mask（可选）
 │  │  ├─ annotation.json        ← 输出 · 本帧的标注结果
-│  │  └─ note.txt               ← 输出 · 本帧笔记（写过才有）
+│  │  └─ note.json              ← 输出 · 本帧笔记 + 编号标记
 │  ├─ frame_1/ …
 │  └─ minip/                    ← 最小强度投影 · 文件相同，排在最后
 └─ case_0002/ …</pre>
@@ -139,8 +144,13 @@
 <li><code>starred</code> — 仅在该帧被星标时存在（true）。</li>
 <li><code>paint</code> — 笔刷图层，按行游程编码（RLE），涂过才存在。<code>classes</code> 把类别索引映射到游程列表 <code>[row, col, length]</code>：row = y（第几行，0 = 顶部），col = 游程起点的 x（第几列，0 = 左侧），length = 向 +x 方向连续的像素数。<code>width</code>/<code>height</code> 记录编码时的尺寸，<code>axes</code> 字段在文件内部自己说明了维度含义。</li>
 </ul></div>
-<div class="doc-sec"><h4><code>note.txt</code> — 输出</h4><ul>
-<li>本帧笔记框的纯文本（UTF-8）；写过笔记才会生成。</li>
+<div class="doc-sec"><h4><code>note.json</code> — 输出</h4>
+<pre class="doc-tree">{ "schema_version": 1, "coord_order": "xy",
+  "text": "自由文本笔记…",
+  "markers": [ { "id": 1, "click": [321, 187] } ] }</pre>
+<ul>
+<li><code>text</code> — 本帧笔记框的内容。<code>markers</code> — 从笔记面板放置的编号圆圈标记：<code>id</code> = 圆圈里显示的数字（编号稳定、不重排），<code>click</code> = 图像坐标，和 annotation.json 一样按 <code>coord_order</code> 序列化。</li>
+<li>有笔记文字或标记时写入。旧的 <code>note.txt</code> 不再读取也不再写入。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>classes.json</code> — 输出，位于数据根目录</h4>
 <pre class="doc-tree">{ "classes": [ { "index": 1, "name": "侧支 A" } ] }</pre>

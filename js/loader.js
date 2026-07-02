@@ -63,20 +63,20 @@
       annotation = JSON.parse(await (await annH.getFile()).text());
     } catch (e) { /* not annotated yet */ }
 
-    let note = null;
+    let note = null;   // parsed note.json object { text, markers, ... } or null (old note.txt is ignored)
     try {
-      const nH = await unit.handle.getFileHandle('note.txt');
-      note = await (await nH.getFile()).text();
+      const nH = await unit.handle.getFileHandle('note.json');
+      note = JSON.parse(await (await nH.getFile()).text());
     } catch (e) { /* no note yet */ }
 
     return { W, H, img, url, label: parsed.data, mask, annotation, note };
   }
 
-  // light re-read of just the mutable per-unit files (annotation.json + note.txt) — no image decode
+  // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode
   async function loadAnnotation(unit) {
     let annotation = null, note = null;
     try { const h = await unit.handle.getFileHandle('annotation.json'); annotation = JSON.parse(await (await h.getFile()).text()); } catch (e) { }
-    try { const h = await unit.handle.getFileHandle('note.txt'); note = await (await h.getFile()).text(); } catch (e) { }
+    try { const h = await unit.handle.getFileHandle('note.json'); note = JSON.parse(await (await h.getFile()).text()); } catch (e) { }
     return { annotation, note };
   }
 

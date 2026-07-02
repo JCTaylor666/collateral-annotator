@@ -18,6 +18,7 @@
     let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color)
     let maskData = null, maskOpacity = 0.45;
     let dots = [];   // recorded click coords [x,y] to mark with red dots
+    let noteMks = [], noteMkHi = 0;   // note markers [{id, xy}] + highlighted id (chip hover)
     let gray = null, center = 128, width = 255;
     let segPix = null;
     let paint = null, paintColorFn = null, brushCur = null;   // paint: Uint16Array(W*H) class-per-pixel (0=unpainted)
@@ -204,7 +205,23 @@
       ctx.globalAlpha = 1;
       drawRuler(cssW, cssH);
       drawDots();
+      drawMarkers();
       drawBrushCursor();
+    }
+    function drawMarkers() {   // numbered note markers: constant screen size, so readable at any zoom
+      if (!noteMks.length) return;
+      ctx.save();
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      for (const m of noteMks) {
+        const sx = offX + (m.xy[0] + 0.5) * scale, sy = offY + (m.xy[1] + 0.5) * scale;
+        const hi = m.id === noteMkHi, r = hi ? 12 : 9;
+        ctx.beginPath(); ctx.arc(sx, sy, r, 0, 6.29);
+        ctx.fillStyle = '#7c3aed'; ctx.fill();
+        ctx.lineWidth = hi ? 2.5 : 1.5; ctx.strokeStyle = '#fff'; ctx.stroke();
+        ctx.fillStyle = '#fff'; ctx.font = '500 ' + (hi ? 13 : 11) + 'px sans-serif';
+        ctx.fillText(String(m.id), sx, sy);
+      }
+      ctx.restore();
     }
     function drawBrushCursor() {
       if (!brushCur) return;
@@ -254,6 +271,8 @@
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
     function setDots(arr) { dots = arr || []; }
+    function setMarkers(arr) { noteMks = arr || []; }
+    function setMarkerHighlight(id) { noteMkHi = id || 0; }
     function imageToScreen(ix, iy) { return [offX + ix * scale, offY + iy * scale]; }  // canvas-relative CSS px
     // Live grayscale of the CURRENT unit. Callers must use it immediately and never
     // store it — setUnit reallocates gray on every unit switch.
@@ -261,7 +280,7 @@
 
     return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, inBounds, getGray,
-             fitView, zoomAt, panBy, getZoom, setDots, imageToScreen,
+             fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,
              get W() { return W; }, get H() { return H; } };

@@ -26,6 +26,7 @@
   let dragSX = 0, dragSY = 0, dragLX = 0, dragLY = 0;
   const DRAG_THRESH = 4;
   let painting = false, spaceHeld = false, brushRAF = false;   // brush tool state
+  let markerArm = false;   // true while waiting for the user to click the image to place a note marker
 
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
@@ -62,7 +63,7 @@
     if (!State.isDirty(c.id, u.id)) {
       State.resetUnit(c.id, u.id);
       if (data.annotation) State.importAnnotation(c.id, u.id, data.annotation);
-      if (data.note != null) State.importNote(c.id, u.id, data.note);
+      if (data.note) State.importNoteJson(c.id, u.id, data.note);
     }
     return data;
   }
@@ -79,6 +80,7 @@
     view.setSelected(selColorMap());
     view.setPaint(State.paintDense(c.id, u.id, data.W, data.H));   // load brush paint layer
     refreshDots();
+    exitMarkerArm(); refreshMarkers();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
     $('note').value = State.getNote(c.id, u.id);
@@ -141,7 +143,7 @@
       if (!State.isDirty(c.id, u.id)) {
         State.resetUnit(c.id, u.id);
         if (ann) State.importAnnotation(c.id, u.id, ann);
-        if (note != null) State.importNote(c.id, u.id, note);
+        if (note) State.importNoteJson(c.id, u.id, note);
       }
       if (ann && Array.isArray(ann.collaterals)) for (const it of ann.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
     }
@@ -203,6 +205,7 @@
   }
   function enterCopyPick() {
     if (!cur || State.markCount(cur.caseId, cur.unitId) > 0) return;
+    exitMarkerArm();                                        // the two click-capturing modes are mutually exclusive
     copyPickMode = true;
     $('frameList').classList.add('picking');
     document.body.classList.add('copy-picking');
@@ -247,6 +250,55 @@
     setBanner('copyDone', { id: srcUnit.id, segs: segMap.size, pts: pts.length, dropped: droppedTxt }, 'ok');
   }
 
+  // ---- note markers: place numbered circles from the note panel ----
+  function refreshMarkers() {
+    if (!cur) return;
+    view.setMarkerHighlight(0);                             // never carry a chip-hover highlight across rebuilds/frames
+    view.setMarkers(State.markerList(cur.caseId, cur.unitId));
+    buildMarkerChips();
+    if (markerArm) setBanner('markerPlaceHint', { n: State.nextMarkerId(cur.caseId, cur.unitId) });   // keep the promised number fresh
+  }
+  function buildMarkerChips() {
+    const box = $('markerChips'); if (!box) return;
+    box.innerHTML = '';
+    if (!cur) return;
+    for (const m of State.markerList(cur.caseId, cur.unitId)) {
+      const chip = document.createElement('span'); chip.className = 'mk-chip';
+      const dot = document.createElement('span'); dot.className = 'mk-dot'; dot.textContent = m.id;
+      const x = document.createElement('span'); x.className = 'mk-x'; x.textContent = '×'; x.title = I18n.t('markerDelete');
+      x.onclick = () => {
+        State.removeMarker(cur.caseId, cur.unitId, m.id);
+        view.setMarkerHighlight(0);
+        State.markDirty(cur.caseId, cur.unitId);
+        refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
+      };
+      chip.onmouseenter = () => { view.setMarkerHighlight(m.id); view.render(); };
+      chip.onmouseleave = () => { view.setMarkerHighlight(0); view.render(); };
+      chip.appendChild(dot); chip.appendChild(x); box.appendChild(chip);
+    }
+  }
+  function enterMarkerArm() {
+    if (!cur || markerArm) return;
+    exitCopyPick();                                         // the two click-capturing modes are mutually exclusive
+    markerArm = true;
+    document.body.classList.add('marker-arming');
+    setBanner('markerPlaceHint', { n: State.nextMarkerId(cur.caseId, cur.unitId) });
+  }
+  function exitMarkerArm() {
+    if (!markerArm) return;
+    markerArm = false;
+    document.body.classList.remove('marker-arming');
+    if (lastBanner && lastBanner.key === 'markerPlaceHint') setBanner(null);   // never eat another mode's banner
+  }
+  function placeMarker(ev) {   // one-shot: place at the clicked pixel, then leave arm mode
+    const [x, y] = view.eventToImage(ev);
+    if (!view.inBounds(x, y)) return;   // ignore letterbox clicks, stay armed
+    State.addMarker(cur.caseId, cur.unitId, [x, y]);
+    exitMarkerArm();
+    State.markDirty(cur.caseId, cur.unitId);
+    refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
+  }
+
   function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur) return;
@@ -256,7 +308,7 @@
     try {
       const data = cache.get(State.key(c, u)) || await Loader.loadUnit(unit);
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
-      await FS.writeText(unit.handle, 'note.txt', $('note').value);
+      await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(c, u), null, 2));
       State.markClean(c, u); updateDirtyUI();
       setSaveStatus('noteSaved', { time: hhmm() });
     } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
@@ -339,6 +391,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
+    if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // brush mode: clicks paint, not select
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev);
@@ -421,12 +474,19 @@
     }
     return n ? Math.round(s / n) : null;
   }
+  const loupeSizePx = () => State.getLoupe().size || 92;
+  function applyLoupeSize() {   // panel grows with the tile size (3 tiles per row when they fit); never below the old 320px
+    const s = loupeSizePx();
+    $('loupePanel').style.width = Math.max(320, Math.min(s * 3 + 34, Math.round(window.innerWidth * 0.55))) + 'px';
+  }
   function rebuildStrip(lo, hi, units) {
     const strip = $('loupeStrip'); strip.innerHTML = ''; tileEls.clear();
+    const s = loupeSizePx();
     for (let i = lo; i <= hi; i++) {
       const wrap = document.createElement('div');
       wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '');
       const cv = document.createElement('canvas');
+      cv.style.width = cv.style.height = s + 'px';
       const cap = document.createElement('div'); cap.className = 'cap';
       cap.textContent = units[i].id + (units[i].kind === 'minip' ? I18n.t('projectionSuffix') : '');
       wrap.appendChild(cv); wrap.appendChild(cap); strip.appendChild(wrap);
@@ -437,14 +497,14 @@
     if (!inspect || !cur) return;
     const c = curCase(), units = c.units, n = units.length;
     const [x, y] = view.eventToImage({ clientX: lastCX, clientY: lastCY });
-    const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked;
+    const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked, size = loupeSizePx();
     const snap = view.getGray(), W = snap.W, H = snap.H;
     const win = view.getWindow(), lut = Loupe.buildLut(win.center, win.width);
     $('loupeCoord').textContent = view.inBounds(x, y) ? ('(' + x + ', ' + y + ')') : I18n.t('cursorOutside');
 
-    let S = Math.max(3, Math.round(92 / zoom)); if (S % 2 === 0) S++;
+    let S = Math.max(3, Math.round(size / zoom)); if (S % 2 === 0) S++;   // field of view = tile size / magnification
     const lo = Math.max(0, ui - R), hi = Math.min(n - 1, ui + R);
-    const sig = lo + '-' + hi + '@' + ui;
+    const sig = lo + '-' + hi + '@' + ui + 'x' + size;
     if (sig !== stripSig) { rebuildStrip(lo, hi, units); stripSig = sig; }
     for (let i = lo; i <= hi; i++) {
       const el = tileEls.get(i); if (!el) continue;
@@ -488,7 +548,9 @@
   }
   function onDragStart(ev) {
     if (ev.button !== 0 || !cur) return;
-    if (State.getTool() === 'brush' && !spaceHeld) {        // brush mode: left-drag paints (space+drag still pans)
+    // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
+    // panning working, and its click suppression stops a drag-release from placing a marker
+    if (!markerArm && State.getTool() === 'brush' && !spaceHeld) {   // brush mode: left-drag paints (space+drag still pans)
       const b = State.getBrush();
       if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
@@ -549,7 +611,7 @@
         if (!data) { data = await Loader.loadUnit(ref.u); cache.set(k, data); }
         const ann = State.buildAnnotation(ref.c.id, ref.u.id, data.W, data.H);
         await FS.writeText(ref.u.handle, 'annotation.json', JSON.stringify(ann, null, 2));
-        if (State.hasNote(ref.c.id, ref.u.id)) await FS.writeText(ref.u.handle, 'note.txt', State.getNote(ref.c.id, ref.u.id));
+        if (State.hasNoteData(ref.c.id, ref.u.id)) await FS.writeText(ref.u.handle, 'note.json', JSON.stringify(State.buildNote(ref.c.id, ref.u.id), null, 2));
         State.markClean(ref.c.id, ref.u.id);
         n++;
       }
@@ -581,11 +643,11 @@
     setSaveStatus('pendingSave');
   }
   function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
-  async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note) and mark it clean
+  async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
     const k = State.key(caseId, unit.id);
     let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
-    if (State.hasNote(caseId, unit.id)) await FS.writeText(unit.handle, 'note.txt', State.getNote(caseId, unit.id));
+    if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
     State.markClean(caseId, unit.id);
   }
   async function runAutoSave() {
@@ -599,11 +661,26 @@
   function undo() {
     if (!cur) return;
     const e = State.undo();
-    if (e && e.kind === 'paint' && e.c === cur.caseId && e.u === cur.unitId) {
+    if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
+    const isCur = e.c === cur.caseId && e.u === cur.unitId;
+    if (e.kind === 'paint') {
+      if (!isCur) return;                                   // another unit's paint can't be applied without its dense array (entry consumed)
       view.applyPaintUndo(e.changes);                       // paint undo needs the view's dense array
       State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
     }
-    State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+    State.markDirty(e.c, e.u);                              // dirty the unit the undo actually touched
+    if (!isCur) {                                           // persist THAT unit directly, leave the displayed one alone
+      highlightNav(); updateDirtyUI();
+      const oc = cases.find(c => c.id === e.c), ou = oc && oc.units.find(u => u.id === e.u);
+      if (ou && rootHandle && State.getAutoSave()) {
+        setSaveStatus('saving');
+        writeUnit(e.c, ou).then(() => { setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); })
+          .catch(() => setSaveStatus('saveFailed', null, true));
+      }
+      return;
+    }
+    refreshMarkers();
+    refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
@@ -616,7 +693,7 @@
     showUnit(nc, nu);
   }
   function stepCase(d) { const nc = ci + d; if (nc < 0 || nc >= cases.length) return; showUnit(nc, 0); }
-  function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } }
+  function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } applyLoupeSize(); }
   function toggleRail() { document.body.classList.toggle('rail-collapsed'); onResize(); }
 
   // ---- language switcher: re-render every live piece of UI text after a switch ----
@@ -624,7 +701,7 @@
     if (cur) refreshMeta();
     else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
     updateCopyBtn(); updateDirtyUI();
-    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker();
+    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips();
     if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
     if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
   }
@@ -647,6 +724,8 @@
     $('loupeZoom').value = l0.zoom; $('loupeZoomv').textContent = l0.zoom;
     $('loupeR').value = l0.R; $('loupeRv').textContent = l0.R;
     $('loupeMean').checked = !!l0.mean;
+    $('loupeSize').value = l0.size; $('loupeSizev').textContent = l0.size;
+    applyLoupeSize();
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
     $('btnUndo').onclick = undo;
@@ -674,9 +753,10 @@
     $('winW').oninput = scheduleWindow;
     $('btnAuto').onclick = () => { const w = view.autoWindow(); $('winC').value = w.center; $('winW').value = w.width; $('winCv').textContent = w.center; $('winWv').textContent = w.width; view.render(); State.setWindow(w.center, w.width); };
     $('btnWinReset').onclick = () => { $('winC').value = 128; $('winW').value = 255; $('winCv').textContent = 128; $('winWv').textContent = 255; view.setWindow(128, 255); view.render(); State.setWindow(128, 255); };
-    $('loupeZoom').oninput = e => { $('loupeZoomv').textContent = e.target.value; State.setLoupe(+e.target.value, +$('loupeR').value, $('loupeMean').checked); if (inspect) scheduleLoupe(); };
-    $('loupeR').oninput = e => { $('loupeRv').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +e.target.value, $('loupeMean').checked); if (inspect) scheduleLoupe(); };
-    $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked); if (inspect) scheduleLoupe(); };
+    $('loupeZoom').oninput = e => { $('loupeZoomv').textContent = e.target.value; State.setLoupe(+e.target.value, +$('loupeR').value, $('loupeMean').checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
+    $('loupeR').oninput = e => { $('loupeRv').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +e.target.value, $('loupeMean').checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
+    $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
+    $('loupeSize').oninput = e => { $('loupeSizev').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, $('loupeMean').checked, +e.target.value); applyLoupeSize(); if (inspect) scheduleLoupe(); };
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
     $('caseSelect').onchange = e => showUnit(+e.target.value, 0);
     $('railToggle').onclick = toggleRail;
@@ -686,6 +766,7 @@
     $('className').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addClass(); } });
     $('note').oninput = onNoteInput;
     $('btnSaveNote').onclick = saveNote;
+    $('btnAddMarker').onclick = () => { if (markerArm) exitMarkerArm(); else enterMarkerArm(); };
     function syncToolUI() {
       const brush = State.getTool() === 'brush';
       $('toolClick').classList.toggle('active', !brush);
@@ -723,6 +804,7 @@
     $('btnFit').onclick = () => { view.fitView(); afterViewChange(); };
     window.addEventListener('resize', onResize);
     window.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }

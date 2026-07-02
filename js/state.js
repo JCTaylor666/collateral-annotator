@@ -6,14 +6,15 @@
   // selection value = { xy:[x,y], cls:classIndex|null }. Old data may be a bare [x,y] — normalized on read.
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
-  let notes = {};    // caseUnit -> note text (mirrors note.txt on disk)
+  let notes = {};    // caseUnit -> note text (mirrors note.json on disk)
+  let noteMarkers = {}; // caseUnit -> [{id, xy:[x,y]}] : numbered circle markers referenced from the note
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
   let tool = 'click';                                  // 'click' | 'brush' (UI mode)
   let brush = { mode: 'add', radius: 6, onmask: false };
   let win = { center: 128, width: 255 };
-  let loupe = { zoom: 6, R: 3, mean: false };
+  let loupe = { zoom: 6, R: 3, mean: false, size: 92 };   // size = loupe tile edge in CSS px (bigger = wider field of view)
   let autoSave = true;
   let classColors = {};     // classIndex -> hex (UI only, not in annotation.json)
   let activeClass = null;   // active class index for new clicks (null = unclassified)
@@ -22,18 +23,18 @@
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
-        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
+        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
         if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
         if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
-          loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean };
+          loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean, size: clamp(o.loupe.size || 92, 92, 280) };
         if (typeof o.autoSave === 'boolean') autoSave = o.autoSave;
         if (o.classColors && typeof o.classColors === 'object') classColors = o.classColors;
         if (Number.isFinite(o.activeClass)) activeClass = o.activeClass;
@@ -45,8 +46,8 @@
   function setCoordOrder(o) { coordOrder = (o === 'yx') ? 'yx' : 'xy'; persist(); }
   const getWindow = () => ({ center: win.center, width: win.width });
   function setWindow(C, W) { win = { center: C, width: W }; persist(); }
-  const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean });
-  function setLoupe(zoom, R, mean) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean }; persist(); }
+  const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean, size: loupe.size || 92 });
+  function setLoupe(zoom, R, mean, size) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean, size: clamp(size || 92, 92, 280) }; persist(); }
   const getAutoSave = () => autoSave;
   function setAutoSave(b) { autoSave = !!b; persist(); }
 
@@ -79,6 +80,47 @@
   function setNote(c, u, text) { notes[noteKey(c, u)] = text; persist(); }
   function importNote(c, u, text) { if (!hasNote(c, u) && typeof text === 'string') { notes[noteKey(c, u)] = text; persist(); } }
 
+  // ---- note markers: numbered circles on the image, saved inside note.json ----
+  const mksGet = (c, u) => noteMarkers[key(c, u)] || [];                                  // read: never creates the key
+  const mksMut = (c, u) => noteMarkers[key(c, u)] || (noteMarkers[key(c, u)] = []);       // write: create-on-demand
+  const markerList = (c, u) => mksGet(c, u).map(m => ({ id: m.id, xy: [m.xy[0], m.xy[1]] }));
+  const nextMarkerId = (c, u) => mksGet(c, u).reduce((m, x) => Math.max(m, x.id), 0) + 1;   // ids are stable, never reused while any remain
+  function addMarker(c, u, xy) {
+    const a = mksMut(c, u), id = nextMarkerId(c, u);
+    a.push({ id, xy: [xy[0], xy[1]] });
+    undoStack.push({ kind: 'marker', c, u, op: 'add' });
+    persist(); return id;
+  }
+  function removeMarker(c, u, id) {
+    const a = mksGet(c, u), i = a.findIndex(m => m.id === id); if (i < 0) return;
+    const item = a.splice(i, 1)[0];
+    undoStack.push({ kind: 'marker', c, u, op: 'remove', index: i, item });
+    persist();
+  }
+  // key-existence (not length) so deleting the LAST marker still rewrites note.json — otherwise the stale file resurrects it
+  const hasNoteData = (c, u) => hasNote(c, u) || (key(c, u) in noteMarkers);
+  // note.json (schema v1): { schema_version, coord_order, text, markers:[{id, click}] }
+  function buildNote(c, u) {
+    const enc = xy => coordOrder === 'xy' ? [xy[0], xy[1]] : [xy[1], xy[0]];
+    return { schema_version: 1, coord_order: coordOrder, text: getNote(c, u), markers: mksGet(c, u).map(m => ({ id: m.id, click: enc(m.xy) })) };
+  }
+  function importNoteJson(c, u, o) {
+    if (!o || typeof o !== 'object') return;
+    if (typeof o.text === 'string') importNote(c, u, o.text);
+    const k = key(c, u);
+    if (!mksGet(c, u).length && Array.isArray(o.markers)) {
+      const order = o.coord_order === 'yx' ? 'yx' : 'xy';
+      const conv = a => order === 'xy' ? [a[0], a[1]] : [a[1], a[0]];
+      const list = [];
+      for (const m of o.markers) {
+        const id = m && Number(m.id);
+        if (m && Array.isArray(m.click) && m.click.length === 2 && Number.isFinite(id)) list.push({ id, xy: conv(m.click) });
+      }
+      if (list.length) noteMarkers[k] = list;
+    }
+    persist();
+  }
+
   // assign the active class to a segment: unassigned -> add; same class -> remove; other class -> reassign
   function applyClass(c, u, seg, clickXY, cls) {
     const s = sel(c, u), ks = String(seg), prev = (ks in s) ? s[ks] : null;
@@ -95,6 +137,9 @@
     if (e.kind === 'point') {
       const a = pts(e.c, e.u);
       if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
+    } else if (e.kind === 'marker') {
+      const a = mksMut(e.c, e.u);
+      if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
     } else if (e.kind === 'paint') {
       /* paint undo needs the view's dense array — the caller (app) applies e.changes then re-encodes */
     } else {
@@ -105,7 +150,7 @@
   }
   function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; delete paintR[key(c, u)]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
   // wipe a unit's in-memory annotation so it can be re-seeded from disk (used for clean units on load)
-  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete starred[k]; delete paintR[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete paintR[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
   function markDirty(c, u) { dirty[key(c, u)] = true; persist(); }
@@ -204,11 +249,12 @@
     return out;
   }
 
-  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(starred), ...Object.keys(paintR)])];
+  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(paintR)])];
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
+    markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };

@@ -98,6 +98,16 @@ body.copy-picking .frm{cursor:copy}
 .cls-row.active .cls-name{color:var(--accent);font-weight:500}
 .note-area{flex:1;min-height:130px;width:100%;resize:vertical;border:1px solid var(--border);border-radius:8px;padding:8px;font:inherit;font-size:13px;color:var(--ink);background:var(--panel)}
 .note-area:focus{outline:none;border-color:var(--accent)}
+/* note markers (numbered circles placed from the note panel) */
+.marker-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+.marker-chips{display:flex;gap:4px;flex-wrap:wrap}
+.mk-chip{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--border);border-radius:999px;padding:2px 7px 2px 3px;font-size:12px}
+.mk-chip:hover{border-color:#7c3aed}
+.mk-dot{width:17px;height:17px;border-radius:50%;background:#7c3aed;color:#fff;display:inline-flex;align-items:center;justify-content:center;font-size:11px}
+.mk-x{cursor:pointer;color:var(--muted);padding:0 2px}
+.mk-x:hover{color:var(--warn)}
+body.marker-arming #btnAddMarker{background:var(--accent-bg);border-color:var(--accent);color:var(--accent)}
+body.marker-arming #view{cursor:crosshair}
 .tool-switch{display:flex;gap:6px;margin-bottom:8px}
 .btn.active{background:var(--accent-bg);border-color:var(--accent);color:var(--accent);font-weight:500}
 .brush-opts{display:none}

@@ -37,6 +37,7 @@
       grpLoupe: 'Inspect loupe',
       loupeZoomLabel: 'Zoom',
       loupeRLabel: 'Neighbor frames',
+      loupeSizeLabel: 'View size',
       loupeMeanLabel: '3×3 mean',
       loupeHoldHintShort: 'Hold Cmd/Ctrl to inspect (release to close; click-to-annotate still works while inspecting)',
 
@@ -74,7 +75,10 @@
       classesLabel: 'Annotation class (click to activate; swatch on the left picks its color)',
       noteLabel: 'Notes',
       btnSaveNote: 'Save notes',
-      notePlaceholder: 'Notes for this frame, saved to note.txt in the frame folder',
+      notePlaceholder: 'Notes for this frame, saved to note.json in the frame folder',
+      btnAddMarker: 'Add marker',
+      markerPlaceHint: 'Click on the image to place marker {n} (Esc to cancel).',
+      markerDelete: 'Delete this marker',
 
       loupeHoldHintLong: 'Hold Cmd/Ctrl for detail · release to close · click-to-annotate still works while inspecting',
       loupeCrossFrameHint: 'Cross-frame raw grayscale (right of dashed line = minip projection)',
@@ -153,6 +157,7 @@
       grpLoupe: '检视放大镜',
       loupeZoomLabel: '放大率',
       loupeRLabel: '前后帧数',
+      loupeSizeLabel: '视野大小',
       loupeMeanLabel: '3×3均值',
       loupeHoldHintShort: '按住 Cmd/Ctrl 检视（松开关闭，检视时仍可点击标注）',
 
@@ -190,7 +195,10 @@
       classesLabel: '标注分类（点击选为当前类别，左侧色块选颜色）',
       noteLabel: '笔记',
       btnSaveNote: '保存笔记',
-      notePlaceholder: '本帧笔记，保存到该帧文件夹的 note.txt',
+      notePlaceholder: '本帧笔记，保存到该帧文件夹的 note.json',
+      btnAddMarker: '添加标记',
+      markerPlaceHint: '在图上点一下放置标记 {n}（Esc 取消）。',
+      markerDelete: '删除该标记',
 
       loupeHoldHintLong: '按住 Cmd/Ctrl 看细节 · 松开关闭 · 检视时仍可点击标注',
       loupeCrossFrameHint: '跨帧原始灰度（虚线右为 minip 投影）',
