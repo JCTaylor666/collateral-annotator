@@ -3,7 +3,7 @@
 (function () {
   'use strict';
   const $ = id => document.getElementById(id);
-  const State = window.State, Loader = window.Loader, FS = window.FS;
+  const State = window.State, Loader = window.Loader, FS = window.FS, I18n = window.I18n;
 
   let rootHandle = null, cases = [], ci = 0, ui = 0;
   let view = null, cur = null, hovRAF = false;
@@ -30,25 +30,27 @@
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
 
-  function setBanner(msg, kind) {
+  let lastBanner = null;   // { key, vars, kind } | null — replayed on language switch
+  function setBanner(key, vars, kind) {
     const b = $('banner');
-    b.textContent = msg || '';
-    b.className = 'banner' + (msg ? (kind ? ' ' + kind : '') : ' hidden');
+    lastBanner = key ? { key, vars, kind } : null;
+    b.textContent = key ? I18n.t(key, vars) : '';
+    b.className = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
   }
 
   async function openFolder() {
     try {
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
-      if (!cases.length) { setBanner('没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。', 'warn'); return; }
+      if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
       classes = await Loader.loadClasses(rootHandle);
-      setBanner('正在扫描已有标注…');
+      setBanner('scanningExisting');
       await scanDataset();
       ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
-      await showUnit(0, 0); setBanner('');
-    } catch (e) { if (e && e.name === 'AbortError') return; setBanner('打开失败:' + e.message, 'warn'); }
+      await showUnit(0, 0); setBanner(null);
+    } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
   }
 
   async function loadCur() {
@@ -70,7 +72,7 @@
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
     let data;
-    try { data = await loadCur(); } catch (e) { setBanner(u.id + ' 载入失败:' + e.message, 'warn'); return; }
+    try { data = await loadCur(); } catch (e) { setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn'); return; }
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
@@ -111,10 +113,10 @@
   }
   async function saveClasses() {
     if (!rootHandle) return;
-    try { await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2)); setSaveStatus('类别已保存 ' + hhmm()); }
-    catch (e) { setSaveStatus('类别保存失败', true); }
+    try { await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2)); setSaveStatus('classesSaved', { time: hhmm() }); }
+    catch (e) { setSaveStatus('classesSaveFailed', null, true); }
   }
-  function randomName() { return '未命名-' + Math.random().toString(36).slice(2, 6); }
+  function randomName() { return I18n.t('unnamedPrefix') + Math.random().toString(36).slice(2, 6); }
   // every class index actually used by any annotation — in-memory (incl unsaved) + on disk across all units
   async function usedClassSet() {
     const used = new Set(State.usedClasses());
@@ -159,7 +161,7 @@
     c.name = name; buildClassPicker(); saveClasses();
   }
   async function deleteClass(idx) {
-    if ((await usedClassSet()).has(idx)) { setBanner('类别 ' + idx + ' 已被标注使用，不能删除（先取消相关标注、或保存后再删）。', 'warn'); return; }
+    if ((await usedClassSet()).has(idx)) { setBanner('classInUse', { idx }, 'warn'); return; }
     classes = classes.filter(c => c.index !== idx);
     ensureActiveClass(); buildClassMgr(); buildClassPicker();
     if (cur) refreshCanvasSelection();
@@ -167,20 +169,20 @@
   }
   function buildClassMgr() {
     const box = $('classMgr'); box.innerHTML = '';
-    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">还没有类别，输入名字点“添加”。</div>'; return; }
+    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">' + I18n.t('noClassesYetMgr') + '</div>'; return; }
     classes.forEach(c => {
       const row = document.createElement('div'); row.className = 'cls-mgr-row';
       const idx = document.createElement('span'); idx.className = 'cls-idx'; idx.textContent = c.index;
       const inp = document.createElement('input'); inp.type = 'text'; inp.value = c.name; inp.className = 'cls-name-inp';
-      inp.onchange = () => renameClass(c.index, inp.value.trim() || ('类别 ' + c.index));
-      const del = document.createElement('button'); del.className = 'btn sm'; del.textContent = '删除';
+      inp.onchange = () => renameClass(c.index, inp.value.trim() || I18n.t('classFallbackName', { idx: c.index }));
+      const del = document.createElement('button'); del.className = 'btn sm'; del.textContent = I18n.t('btnDelete');
       del.onclick = () => deleteClass(c.index);
       row.appendChild(idx); row.appendChild(inp); row.appendChild(del); box.appendChild(row);
     });
   }
   function buildClassPicker() {
     const box = $('classPicker'); box.innerHTML = '';
-    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">在左栏“分类管理”添加类别后，这里选择当前标注类别与颜色。</div>'; return; }
+    if (!classes.length) { box.innerHTML = '<div class="muted" style="font-size:12px">' + I18n.t('noClassesYetPicker') + '</div>'; return; }
     const active = State.getActiveClass();
     classes.forEach(c => {
       const row = document.createElement('div'); row.className = 'cls-row' + (c.index === active ? ' active' : '');
@@ -197,14 +199,14 @@
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
     b.disabled = !cur || State.markCount(cur.caseId, cur.unitId) > 0;
-    b.textContent = copyPickMode ? '取消复制' : '从其他帧复制…';
+    b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
     if (!cur || State.markCount(cur.caseId, cur.unitId) > 0) return;
     copyPickMode = true;
     $('frameList').classList.add('picking');
     document.body.classList.add('copy-picking');
-    setBanner('点击左侧要复制标注的帧（Esc 取消）。');
+    setBanner('copyPickHint');
     updateCopyBtn();
   }
   function exitCopyPick() {
@@ -212,7 +214,7 @@
     copyPickMode = false;
     $('frameList').classList.remove('picking');
     document.body.classList.remove('copy-picking');
-    setBanner('');
+    setBanner(null);
     updateCopyBtn();
   }
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
@@ -225,7 +227,7 @@
     // gather source clicks (segments + background points) — each carries the class chosen when it was clicked
     const clicks = State.selectedSegs(srcCaseId, srcUnit.id).map(s => ({ xy: s.xy, cls: s.cls }))
       .concat(State.pointItems(srcCaseId, srcUnit.id));
-    if (!clicks.length) { setBanner('“' + srcUnit.id + '” 没有可复制的标注。', 'warn'); return; }
+    if (!clicks.length) { setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return; }
     // re-resolve EACH coordinate against the current frame's label: segment there -> class mark; background -> red dot.
     // clicks with no class are dropped.
     const segMap = new Map(), ptSeen = new Set(), pts = [];
@@ -241,13 +243,14 @@
     for (const p of pts) State.addPoint(cur.caseId, cur.unitId, p.xy, p.cls);
     State.markDirty(cur.caseId, cur.unitId);
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
-    setBanner('已从 “' + srcUnit.id + '” 复制并重新解析：' + segMap.size + ' 段 · ' + pts.length + ' 点' + (dropped ? '（' + dropped + ' 个无类别已跳过）' : '') + '。', 'ok');
+    const droppedTxt = dropped ? I18n.t('copyDoneDropped', { n: dropped }) : '';
+    setBanner('copyDone', { id: srcUnit.id, segs: segMap.size, pts: pts.length, dropped: droppedTxt }, 'ok');
   }
 
   function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur) return;
-    if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
+    if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     const c = cur.caseId, u = cur.unitId, unit = curUnit();
     State.setNote(c, u, $('note').value);
     try {
@@ -255,18 +258,18 @@
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
       await FS.writeText(unit.handle, 'note.txt', $('note').value);
       State.markClean(c, u); updateDirtyUI();
-      setSaveStatus('笔记已保存 ' + hhmm());
-    } catch (e) { setSaveStatus('笔记保存失败', true); }
+      setSaveStatus('noteSaved', { time: hhmm() });
+    } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
   }
   function toggleRPanel() { document.body.classList.toggle('rpanel-collapsed'); onResize(); }
 
   function refreshMeta() {
     const c = curCase(), u = curUnit();
     $('curLabel').textContent = c.id + ' / ' + u.id + '  (' + u.kind + ')';
-    $('unitIndicator').textContent = '单元 ' + (ui + 1) + '/' + curCase().units.length + ' · 病例 ' + (ci + 1) + '/' + cases.length;
+    $('unitIndicator').textContent = I18n.t('unitIndicatorFmt', { ui: ui + 1, uc: curCase().units.length, ci: ci + 1, cc: cases.length });
     const ids = State.selectedIds(c.id, u.id);
-    $('chips').innerHTML = ids.length ? ids.map(i => '<span class="chip">' + i + '</span>').join('') : '<span class="muted">（无）</span>';
-    $('progress').textContent = '本单元已标 ' + ids.length + ' 段 · ' + State.pointCount(c.id, u.id) + ' 点';
+    $('chips').innerHTML = ids.length ? ids.map(i => '<span class="chip">' + i + '</span>').join('') : '<span class="muted">' + I18n.t('none') + '</span>';
+    $('progress').textContent = I18n.t('progressFmt', { segs: ids.length, pts: State.pointCount(c.id, u.id) });
   }
 
   function buildCaseOptions() {
@@ -285,8 +288,8 @@
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
     if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
-      try { setSaveStatus('保存中…'); await writeUnit(c.id, u); setSaveStatus('已保存 ' + hhmm()); updateDirtyUI(); }
-      catch (e) { setSaveStatus('保存失败', true); }
+      try { setSaveStatus('saving'); await writeUnit(c.id, u); setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); }
+      catch (e) { setSaveStatus('saveFailed', null, true); }
     }
   }
   function buildFrameList() {
@@ -298,7 +301,7 @@
       const name = document.createElement('span'); name.className = 'frm-name'; name.textContent = u.id;
       const badge = document.createElement('span'); badge.className = 'frm-b';
       const on = State.isStarred(c.id, u.id);
-      const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = '星标该帧';
+      const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t('starThisFrame');
       star.onclick = (e) => { e.stopPropagation(); toggleStar(uidx); };
       el.appendChild(name); el.appendChild(badge); el.appendChild(star);
       el.onclick = () => { if (copyPickMode) pickCopySource(uidx); else showUnit(ci, uidx); };
@@ -363,8 +366,8 @@
     lastCX = ev.clientX; lastCY = ev.clientY; overCanvas = true;
     const [x, y] = view.eventToImage(ev), seg = view.segAt(x, y);
     $('cursor').textContent = view.inBounds(x, y)
-      ? ('光标 seg ' + seg + (seg ? ' · ' + view.segSize(seg) + 'px' : '') + ' · (' + x + ', ' + y + ')')
-      : '光标在图外';
+      ? (I18n.t('cursorSeg', { seg }) + (seg ? ' · ' + view.segSize(seg) + 'px' : '') + ' · (' + x + ', ' + y + ')')
+      : I18n.t('cursorOutside');
     if (!inspect && isInspectMod(ev)) enterInspect();
     if (inspect) scheduleLoupe();                           // update loupe; hover still tracks below
     if (State.getTool() === 'brush') {                      // brush cursor ring replaces segment hover
@@ -425,7 +428,7 @@
       wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '');
       const cv = document.createElement('canvas');
       const cap = document.createElement('div'); cap.className = 'cap';
-      cap.textContent = units[i].id + (units[i].kind === 'minip' ? '（投影）' : '');
+      cap.textContent = units[i].id + (units[i].kind === 'minip' ? I18n.t('projectionSuffix') : '');
       wrap.appendChild(cv); wrap.appendChild(cap); strip.appendChild(wrap);
       tileEls.set(i, { wrap, canvas: cv });
     }
@@ -437,7 +440,7 @@
     const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked;
     const snap = view.getGray(), W = snap.W, H = snap.H;
     const win = view.getWindow(), lut = Loupe.buildLut(win.center, win.width);
-    $('loupeCoord').textContent = view.inBounds(x, y) ? ('(' + x + ', ' + y + ')') : '光标在图外';
+    $('loupeCoord').textContent = view.inBounds(x, y) ? ('(' + x + ', ' + y + ')') : I18n.t('cursorOutside');
 
     let S = Math.max(3, Math.round(92 / zoom)); if (S % 2 === 0) S++;
     const lo = Math.max(0, ui - R), hi = Math.min(n - 1, ui + R);
@@ -487,7 +490,7 @@
     if (ev.button !== 0 || !cur) return;
     if (State.getTool() === 'brush' && !spaceHeld) {        // brush mode: left-drag paints (space+drag still pans)
       const b = State.getBrush();
-      if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('先在右侧“标注分类”选择一个类别再涂抹。', 'warn'); return; }
+      if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
       painting = true; suppressClick = true;
       view.strokeStart(x, y, b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
@@ -533,10 +536,10 @@
   }
 
   async function save() {
-    if (!rootHandle) { setBanner('先打开数据文件夹。', 'warn'); return; }
+    if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
     try {
-      if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('没有写入权限,无法保存。', 'warn'); return; }
+      if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; }
       const map = new Map();
       cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
       let n = 0;
@@ -551,25 +554,31 @@
         n++;
       }
       updateDirtyUI();
-      setBanner('已保存 ' + n + ' 个单元的 annotation.json 到各自文件夹。', 'ok');
-      setSaveStatus('已保存 ' + hhmm());
-    } catch (e) { setBanner('保存失败:' + e.message, 'warn'); }
+      setBanner('savedAllFmt', { n }, 'ok');
+      setSaveStatus('saved', { time: hhmm() });
+    } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); }
   }
 
-  // ---- debounced auto-write-to-disk (toggle in 设置; default on) ----
+  // ---- debounced auto-write-to-disk (toggle in Settings; default on) ----
   function hhmm() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
-  function setSaveStatus(msg, warn) { const el = $('saveStatus'); if (!el) return; el.textContent = msg || ''; el.classList.toggle('warn-text', !!warn); }
+  let lastSaveStatus = null;   // { key, vars, warn } | null — replayed on language switch
+  function setSaveStatus(key, vars, warn) {
+    const el = $('saveStatus'); if (!el) return;
+    lastSaveStatus = key ? { key, vars, warn: !!warn } : null;
+    el.textContent = key ? I18n.t(key, vars) : '';
+    el.classList.toggle('warn-text', !!warn);
+  }
   function updateDirtyUI() {
     const el = $('dirtyState'); if (!el) return;
-    if (cur && State.isDirty(cur.caseId, cur.unitId)) { el.textContent = '●未保存'; el.className = 'ro warn-text'; }
-    else { el.textContent = cur ? '已同步' : ''; el.className = 'ro'; }
+    if (cur && State.isDirty(cur.caseId, cur.unitId)) { el.textContent = I18n.t('unsavedDot'); el.className = 'ro warn-text'; }
+    else { el.textContent = cur ? I18n.t('synced') : ''; el.className = 'ro'; }
   }
   function scheduleAutoSave() {
     if (!$('autoSave').checked || !rootHandle || !cur) return;
     pendingSave = { c: cur.caseId, u: cur.unitId, unit: curUnit() };   // capture the unit now, in case we navigate
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(runAutoSave, 1000);
-    setSaveStatus('待保存…');
+    setSaveStatus('pendingSave');
   }
   function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note) and mark it clean
@@ -583,8 +592,8 @@
     saveTimer = null;
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
-    try { setSaveStatus('保存中…'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSaveStatus('已保存 ' + hhmm()); }
-    catch (e) { setSaveStatus('自动保存失败', true); }
+    try { setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSaveStatus('saved', { time: hhmm() }); }
+    catch (e) { setSaveStatus('autoSaveFailed', null, true); }
   }
 
   function undo() {
@@ -610,7 +619,22 @@
   function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } }
   function toggleRail() { document.body.classList.toggle('rail-collapsed'); onResize(); }
 
+  // ---- language switcher: re-render every live piece of UI text after a switch ----
+  function onLangChange() {
+    if (cur) refreshMeta();
+    else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
+    updateCopyBtn(); updateDirtyUI();
+    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker();
+    if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
+    if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
+  }
+
   function init() {
+    I18n.applyStatic();
+    $('langEN').onclick = () => I18n.setLang('en');
+    $('langZH').onclick = () => I18n.setLang('zh');
+    document.addEventListener('langchange', onLangChange);
+
     view = window.CanvasView.create($('view'));
     State.load();
     view.setPaintColorFn(segRgb);
@@ -635,7 +659,7 @@
     $('autoSave').onchange = e => {
       State.setAutoSave(e.target.checked);
       if (e.target.checked) scheduleAutoSave();
-      else { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } setSaveStatus(''); }
+      else { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } setSaveStatus(null); }
     };
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
     $('maskOpacity').oninput = e => { view.setMaskOpacity(e.target.value / 100); view.render(); };
@@ -715,7 +739,7 @@
     view.setOpacity($('opacity').value / 100);
     view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {
-      setBanner('此浏览器不支持自动写盘(File System Access API)。请用 Chrome 或 Edge 打开本页。', 'warn');
+      setBanner('errUnsupportedBrowser', null, 'warn');
       $('btnOpen').disabled = true; $('btnSave').disabled = true;
     }
     view.layout(); view.render(); updateZoomReadout();

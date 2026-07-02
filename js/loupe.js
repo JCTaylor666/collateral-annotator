@@ -64,7 +64,7 @@
       ctx.fillStyle = '#2b2f36'; ctx.fillRect(0, 0, DW, DH);
       ctx.fillStyle = '#9aa4b2'; ctx.font = Math.round(11 * dpr) + 'px sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillText(st === 'mismatch' ? '尺寸不符' : st === 'error' ? '×' : '加载中…', DW / 2, DH / 2);
+      ctx.fillText(st === 'mismatch' ? window.I18n.t('loupeMismatch') : st === 'error' ? '×' : window.I18n.t('loupeLoading'), DW / 2, DH / 2);
       return;
     }
     const gray = g.gray, W = g.W, H = g.H, OUT = 58;

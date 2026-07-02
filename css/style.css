@@ -31,6 +31,7 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .chips{display:flex;gap:4px}
 .strip .chips{max-width:220px;overflow-x:auto}
 .chip{display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:5px;background:var(--accent-bg);color:var(--accent);font-size:11px}
+.lang-switch{display:flex;gap:4px;flex:none}
 
 /* main split: left rail + central stage */
 .body{flex:1;display:grid;grid-template-columns:288px 1fr 264px;min-height:0}

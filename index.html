@@ -1,25 +1,29 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>血管分段侧支标注器</title>
-<link rel="stylesheet" href="./css/style.css?v=18">
+<title>Vessel Collateral Annotator</title>
+<link rel="stylesheet" href="./css/style.css?v=19">
 </head>
 <body>
 <header class="strip">
-  <button id="railToggle" class="icon-btn" title="折叠/展开侧栏（\\）">☰</button>
-  <strong class="brand">侧支标注器</strong>
+  <button id="railToggle" class="icon-btn" data-i18n-title="railToggleTitle" title="Collapse/expand sidebar (\\)">☰</button>
+  <strong class="brand" data-i18n="brand">Collateral Annotator</strong>
   <span class="strip-sep">·</span>
-  <span id="curLabel" class="strip-id">未载入</span>
+  <span id="curLabel" class="strip-id" data-i18n="notLoaded">Not loaded</span>
   <span id="dirtyState" class="ro"></span>
   <span class="strip-spacer"></span>
-  <span id="chips" class="chips"><span class="muted">（无）</span></span>
+  <span id="chips" class="chips"><span class="muted" data-i18n="none">None</span></span>
   <span id="progress" class="ro">—</span>
   <span id="saveStatus" class="ro"></span>
   <span id="zoomv" class="ro accent">1.0×</span>
   <span id="cursor" class="ro"></span>
-  <button id="rpanelToggle" class="icon-btn" title="折叠/展开右侧标注面板">⊟</button>
+  <button id="rpanelToggle" class="icon-btn" data-i18n-title="rpanelToggleTitle" title="Collapse/expand annotation panel">⊟</button>
+  <div class="lang-switch" id="langSwitch">
+    <button id="langEN" class="btn sm" data-lang-btn="en">EN</button>
+    <button id="langZH" class="btn sm" data-lang-btn="zh">中文</button>
+  </div>
 </header>
 
 <div id="banner" class="banner hidden"></div>
@@ -27,81 +31,81 @@
 <div class="body">
   <nav id="rail" class="rail">
     <div class="rail-files">
-      <button id="btnOpen" class="btn wide">打开数据文件夹</button>
-      <button id="btnSave" class="btn wide">保存到文件夹</button>
+      <button id="btnOpen" class="btn wide" data-i18n="btnOpen">Open data folder</button>
+      <button id="btnSave" class="btn wide" data-i18n="btnSave">Save to folder</button>
     </div>
 
     <div>
-      <div class="seclbl">导航 <span id="unitIndicator" class="muted">—</span></div>
+      <div class="seclbl"><span data-i18n="navLabel">Navigation</span> <span id="unitIndicator" class="muted">—</span></div>
       <select id="caseSelect" class="sel-full"></select>
       <div class="stepper">
-        <button id="prevCase" class="btn sm" title="上一病例">«</button>
-        <button id="prevUnit" class="btn sm grow">‹ 上一</button>
-        <button id="nextUnit" class="btn sm grow">下一 ›</button>
-        <button id="nextCase" class="btn sm" title="下一病例">»</button>
+        <button id="prevCase" class="btn sm" data-i18n-title="prevCaseTitle" title="Previous case">«</button>
+        <button id="prevUnit" class="btn sm grow" data-i18n="prevUnit">‹ Prev</button>
+        <button id="nextUnit" class="btn sm grow" data-i18n="nextUnit">Next ›</button>
+        <button id="nextCase" class="btn sm" data-i18n-title="nextCaseTitle" title="Next case">»</button>
       </div>
       <div id="frameList" class="frame-list"></div>
     </div>
 
     <div>
-      <div class="seclbl">影像对比度</div>
-      <div class="ctl-row"><label>窗中心</label><input id="winC" type="range" min="0" max="255" value="128"><span id="winCv" class="val">128</span></div>
-      <div class="ctl-row"><label>窗宽</label><input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></div>
-      <div class="btn-row"><button id="btnAuto" class="btn sm grow">自动</button><button id="btnWinReset" class="btn sm grow">复位窗</button></div>
+      <div class="seclbl" data-i18n="contrastLabel">Contrast</div>
+      <div class="ctl-row"><label data-i18n="winCenterLabel">Center</label><input id="winC" type="range" min="0" max="255" value="128"><span id="winCv" class="val">128</span></div>
+      <div class="ctl-row"><label data-i18n="winWidthLabel">Width</label><input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></div>
+      <div class="btn-row"><button id="btnAuto" class="btn sm grow" data-i18n="btnAuto">Auto</button><button id="btnWinReset" class="btn sm grow" data-i18n="btnWinReset">Reset window</button></div>
     </div>
 
     <details class="grp" open>
-      <summary><span class="chev">▶</span>叠加层</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpOverlay">Overlay</span></summary>
       <div class="grp-body">
-        <div class="ctl-row"><label>高亮透明度</label><input id="opacity" type="range" min="0" max="100" value="55"></div>
-        <div class="ctl-row"><label>血管mask</label><input id="maskOpacity" type="range" min="0" max="100" value="45"></div>
+        <div class="ctl-row"><label data-i18n="opacityLabel">Highlight opacity</label><input id="opacity" type="range" min="0" max="100" value="55"></div>
+        <div class="ctl-row"><label data-i18n="maskOpacityLabel">Vessel mask</label><input id="maskOpacity" type="range" min="0" max="100" value="45"></div>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>检视放大镜</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpLoupe">Inspect loupe</span></summary>
       <div class="grp-body">
-        <div class="ctl-row"><label>放大率</label><input id="loupeZoom" type="range" min="2" max="16" step="1" value="6"><span id="loupeZoomv" class="val">6</span></div>
-        <div class="ctl-row"><label>前后帧数</label><input id="loupeR" type="range" min="1" max="6" step="1" value="3"><span id="loupeRv" class="val">3</span></div>
-        <label class="check-row"><input type="checkbox" id="loupeMean"> 3×3均值</label>
-        <div class="ro muted">按住 Cmd/Ctrl 检视（松开关闭，检视时仍可点击标注）</div>
+        <div class="ctl-row"><label data-i18n="loupeZoomLabel">Zoom</label><input id="loupeZoom" type="range" min="2" max="16" step="1" value="6"><span id="loupeZoomv" class="val">6</span></div>
+        <div class="ctl-row"><label data-i18n="loupeRLabel">Neighbor frames</label><input id="loupeR" type="range" min="1" max="6" step="1" value="3"><span id="loupeRv" class="val">3</span></div>
+        <label class="check-row"><input type="checkbox" id="loupeMean"> <span data-i18n="loupeMeanLabel">3×3 mean</span></label>
+        <div class="ro muted" data-i18n="loupeHoldHintShort">Hold Cmd/Ctrl to inspect (release to close; click-to-annotate still works while inspecting)</div>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>视图</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpView">View</span></summary>
       <div class="grp-body">
-        <div class="btn-row"><button id="btnFit" class="btn sm grow" title="复位缩放/平移">复位视图</button></div>
+        <div class="btn-row"><button id="btnFit" class="btn sm grow" data-i18n-title="btnFitTitle" title="Reset zoom/pan" data-i18n="btnFit">Reset view</button></div>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>编辑</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpEdit">Edit</span></summary>
       <div class="grp-body">
-        <div class="btn-row"><button id="btnUndo" class="btn sm grow">撤销</button><button id="btnClear" class="btn sm grow">清空本单元</button></div>
+        <div class="btn-row"><button id="btnUndo" class="btn sm grow" data-i18n="btnUndo">Undo</button><button id="btnClear" class="btn sm grow" data-i18n="btnClear">Clear this unit</button></div>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>分类管理</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpClasses">Class management</span></summary>
       <div class="grp-body">
-        <div class="add-class"><input id="className" type="text" placeholder="类别名称"><button id="btnAddClass" class="btn sm">添加</button></div>
+        <div class="add-class"><input id="className" type="text" data-i18n-placeholder="classNamePlaceholder" placeholder="Class name"><button id="btnAddClass" class="btn sm" data-i18n="btnAddClass">Add</button></div>
         <div id="classMgr" class="cls-mgr"></div>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>设置</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpSettings">Settings</span></summary>
       <div class="grp-body">
-        <div class="ctl-row"><label>坐标顺序</label><select id="coordOrder"><option value="xy">x,y</option><option value="yx">y,x</option></select></div>
-        <label class="check-row"><input type="checkbox" id="autoSave" checked> 自动保存（改动后自动写盘）</label>
+        <div class="ctl-row"><label data-i18n="coordOrderLabel">Coordinate order</label><select id="coordOrder"><option value="xy">x,y</option><option value="yx">y,x</option></select></div>
+        <label class="check-row"><input type="checkbox" id="autoSave" checked> <span data-i18n="autoSaveLabel">Auto-save (write to disk on change)</span></label>
       </div>
     </details>
 
     <details class="grp">
-      <summary><span class="chev">▶</span>帮助 / 图例</summary>
+      <summary><span class="chev">▶</span><span data-i18n="grpHelp">Help / Legend</span></summary>
       <div class="grp-body">
-        <div class="hint muted">点击血管段即标为侧支（再点取消）。点击处会留红点记录坐标；点背景（无血管）也会留红点，在红点附近再点即删除。缩放：滚轮/捏合；平移：左键拖动/双指。颜色：血管mask=亮蓝，选中=绿，悬停=橙，红点=点击坐标。</div>
+        <div class="hint muted" data-i18n="helpText">Click a vessel segment to mark it as collateral (click again to remove). Every click leaves a red dot marking its coordinate; clicking background (no vessel) also leaves a red dot — click near an existing red dot to delete it. Zoom: wheel/pinch; pan: left-drag/two-finger. Colors: vessel mask = bright blue, selected = green, hover = orange, red dot = click location.</div>
       </div>
     </details>
   </nav>
@@ -110,31 +114,31 @@
 
   <aside id="rpanel" class="rpanel">
     <div class="rp-sec">
-      <button id="btnCopyFrom" class="btn wide" disabled>从其他帧复制…</button>
+      <button id="btnCopyFrom" class="btn wide" data-i18n="btnCopyFrom" disabled>Copy from another frame…</button>
     </div>
     <div class="rp-sec">
-      <div class="seclbl">标注工具</div>
+      <div class="seclbl" data-i18n="toolsLabel">Annotation tool</div>
       <div class="tool-switch">
-        <button id="toolClick" class="btn sm grow active">点选</button>
-        <button id="toolBrush" class="btn sm grow">笔刷</button>
+        <button id="toolClick" class="btn sm grow active" data-i18n="toolClick">Click</button>
+        <button id="toolBrush" class="btn sm grow" data-i18n="toolBrush">Brush</button>
       </div>
       <div id="brushOpts" class="brush-opts">
         <div class="tool-switch">
-          <button id="brushAdd" class="btn sm grow active">涂抹</button>
-          <button id="brushErase" class="btn sm grow">擦除</button>
+          <button id="brushAdd" class="btn sm grow active" data-i18n="brushAdd">Paint</button>
+          <button id="brushErase" class="btn sm grow" data-i18n="brushErase">Erase</button>
         </div>
-        <div class="ctl-row"><label>半径</label><input id="brushRadius" type="range" min="1" max="40" value="6"><span id="brushRv" class="val">6</span></div>
-        <label class="check-row"><input type="checkbox" id="brushOnmask"> 仅前景（限血管mask内）</label>
-        <div class="hint muted">左键拖动=涂抹（用当前所选类别的颜色）；平移用滚轮/双指，或按住空格+左拖。</div>
+        <div class="ctl-row"><label data-i18n="brushRadiusLabel">Radius</label><input id="brushRadius" type="range" min="1" max="40" value="6"><span id="brushRv" class="val">6</span></div>
+        <label class="check-row"><input type="checkbox" id="brushOnmask"> <span data-i18n="brushOnmaskLabel">Foreground only (within vessel mask)</span></label>
+        <div class="hint muted" data-i18n="brushHint">Left-drag = paint (uses the active class’s color); pan with wheel/two-finger, or hold Space + left-drag.</div>
       </div>
     </div>
     <div class="rp-sec">
-      <div class="seclbl">标注分类（点击选为当前类别，左侧色块选颜色）</div>
+      <div class="seclbl" data-i18n="classesLabel">Annotation class (click to activate; swatch on the left picks its color)</div>
       <div id="classPicker" class="cls-picker"></div>
     </div>
     <div class="rp-sec rp-note">
-      <div class="seclbl">笔记 <button id="btnSaveNote" class="btn sm">保存笔记</button></div>
-      <textarea id="note" class="note-area" placeholder="本帧笔记，保存到该帧文件夹的 note.txt"></textarea>
+      <div class="seclbl"><span data-i18n="noteLabel">Notes</span> <button id="btnSaveNote" class="btn sm" data-i18n="btnSaveNote">Save notes</button></div>
+      <textarea id="note" class="note-area" data-i18n-placeholder="notePlaceholder" placeholder="Notes for this frame, saved to note.txt in the frame folder"></textarea>
     </div>
   </aside>
 </div>
@@ -143,28 +147,29 @@
   <div class="loupe-head">
     <span id="loupeCoord" class="loupe-coord">—</span>
   </div>
-  <div class="loupe-sub muted">按住 Cmd/Ctrl 看细节 · 松开关闭 · 检视时仍可点击标注</div>
+  <div class="loupe-sub muted" data-i18n="loupeHoldHintLong">Hold Cmd/Ctrl for detail · release to close · click-to-annotate still works while inspecting</div>
   <div id="loupeStrip" class="loupe-strip"></div>
-  <div class="loupe-sub muted">跨帧原始灰度（虚线右为 minip 投影）</div>
+  <div class="loupe-sub muted" data-i18n="loupeCrossFrameHint">Cross-frame raw grayscale (right of dashed line = minip projection)</div>
   <canvas id="loupeCurve" class="loupe-curve"></canvas>
 </div>
 
 <div id="confirmClear" class="modal-overlay hidden">
   <div class="modal">
-    <p class="modal-warn">真的要清理么？<br>清理以后本 frame 全部标记都将消失。</p>
+    <p class="modal-warn" data-i18n-html="clearConfirmHtml">Really clear?<br>Clearing removes all annotations for this frame.</p>
     <div class="modal-actions">
-      <button id="doClear" class="btn btn-danger">继续清理</button>
-      <button id="cancelClear" class="btn btn-cancel">取消</button>
+      <button id="doClear" class="btn btn-danger" data-i18n="btnClearContinue">Continue clearing</button>
+      <button id="cancelClear" class="btn btn-cancel" data-i18n="btnCancel">Cancel</button>
     </div>
   </div>
 </div>
 
-<script src="./js/npy.js?v=18"></script>
-<script src="./js/fs.js?v=18"></script>
-<script src="./js/loader.js?v=18"></script>
-<script src="./js/canvas.js?v=18"></script>
-<script src="./js/state.js?v=18"></script>
-<script src="./js/loupe.js?v=18"></script>
-<script src="./js/app.js?v=18"></script>
+<script src="./js/i18n.js?v=19"></script>
+<script src="./js/npy.js?v=19"></script>
+<script src="./js/fs.js?v=19"></script>
+<script src="./js/loader.js?v=19"></script>
+<script src="./js/canvas.js?v=19"></script>
+<script src="./js/state.js?v=19"></script>
+<script src="./js/loupe.js?v=19"></script>
+<script src="./js/app.js?v=19"></script>
 </body>
 </html>

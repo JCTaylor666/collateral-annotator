@@ -86,7 +86,7 @@
       const fh = await rootHandle.getFileHandle('classes.json');
       const o = JSON.parse(await (await fh.getFile()).text());
       if (o && Array.isArray(o.classes))
-        return o.classes.filter(c => Number.isFinite(c.index)).map(c => ({ index: c.index, name: String(c.name || ('类别 ' + c.index)) }));
+        return o.classes.filter(c => Number.isFinite(c.index)).map(c => ({ index: c.index, name: String(c.name || window.I18n.t('classFallbackName', { idx: c.index })) }));
     } catch (e) { /* no classes.json */ }
     return [];
   }
