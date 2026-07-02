@@ -9,6 +9,9 @@
   let notes = {};    // caseUnit -> note text (mirrors note.txt on disk)
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
+  let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
+  let tool = 'click';                                  // 'click' | 'brush' (UI mode)
+  let brush = { mode: 'add', radius: 6, onmask: false };
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false };
   let autoSave = true;
@@ -19,12 +22,14 @@
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, dirty, starred, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
+  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
-        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; dirty = o.dirty || {}; starred = o.starred || {};
+        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
+        if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
+        if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
@@ -55,7 +60,7 @@
   // selected segments with their class (for per-class coloring)
   const selectedSegs = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
   // all class indices currently assigned to any segment across every unit in memory
-  const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } return [...set]; };
+  const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } usedClassesInPaint().forEach(c => set.add(c)); return [...set]; };
   // background points now carry a class (the active class at click time). Old data may be a bare [x,y].
   const ptXY = p => Array.isArray(p) ? p : (p && p.xy) || [-1, -1];
   const ptCls = p => (Array.isArray(p) || !p || p.cls == null) ? null : p.cls;
@@ -84,20 +89,23 @@
   }
   function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
   function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, item }); persist(); }
+  function pushPaintUndo(c, u, changes) { undoStack.push({ kind: 'paint', c, u, changes }); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
     if (e.kind === 'point') {
       const a = pts(e.c, e.u);
       if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
+    } else if (e.kind === 'paint') {
+      /* paint undo needs the view's dense array — the caller (app) applies e.changes then re-encodes */
     } else {
       const s = sel(e.c, e.u);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
     }
     persist(); return e;
   }
-  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; delete paintR[key(c, u)]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
   // wipe a unit's in-memory annotation so it can be re-seeded from disk (used for clean units on load)
-  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete starred[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete starred[k]; delete paintR[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
   function markDirty(c, u) { dirty[key(c, u)] = true; persist(); }
@@ -106,6 +114,52 @@
   const isStarred = (c, u) => !!starred[key(c, u)];
   function setStarred(c, u, on) { if (on) starred[key(c, u)] = true; else delete starred[key(c, u)]; persist(); }
   const caseStarred = (c, unitIds) => unitIds.some(uid => !!starred[key(c, uid)]);
+
+  const getTool = () => tool;
+  function setTool(t) { tool = (t === 'brush') ? 'brush' : 'click'; persist(); }
+  const getBrush = () => ({ mode: brush.mode, radius: brush.radius, onmask: brush.onmask });
+  function setBrush(b) { brush = { mode: b.mode === 'erase' ? 'erase' : 'add', radius: clamp(b.radius, 1, 40), onmask: !!b.onmask }; persist(); }
+
+  // ---- brush paint layer: dense Uint16Array(W*H) <-> compact row-run-length (stored/serialized) ----
+  // RLE run = [row, col, length]: row=y (0=top), col=x (0=left) run start, length=consecutive same-class px toward +x.
+  function rleEncode(dense, W, H) {
+    const classes = {};
+    for (let y = 0; y < H; y++) {
+      const base = y * W;
+      for (let x = 0; x < W;) {
+        const v = dense[base + x];
+        if (!v) { x++; continue; }
+        let len = 1; while (x + len < W && dense[base + x + len] === v) len++;
+        (classes[v] || (classes[v] = [])).push([y, x, len]);
+        x += len;
+      }
+    }
+    return { encoding: 'rle_rows_v1', axes: 'run=[row,col,length]; row=y image row (0=top); col=x image column (0=left) of run start; length=consecutive same-class pixels toward +x. NOT flipped by coord_order.', width: W, height: H, classes };
+  }
+  function rleDecode(rle, W, H) {
+    const dense = new Uint16Array(W * H);
+    if (!rle || !rle.classes) return dense;
+    for (const k in rle.classes) {
+      const cls = +k; if (!cls) continue;
+      const runs = rle.classes[k]; if (!Array.isArray(runs)) continue;
+      for (const run of runs) {
+        if (!Array.isArray(run) || run.length < 3) continue;
+        const y = run[0], x = run[1], len = run[2];
+        if (!(y >= 0 && y < H && x >= 0)) continue;
+        const base = y * W, end = Math.min(W, x + len);
+        for (let xx = Math.max(0, x); xx < end; xx++) dense[base + xx] = cls;
+      }
+    }
+    return dense;
+  }
+  const hasPaint = (c, u) => { const r = paintR[key(c, u)]; return !!(r && r.classes && Object.keys(r.classes).length); };
+  const paintDense = (c, u, W, H) => rleDecode(paintR[key(c, u)], W, H);
+  function setPaintDense(c, u, dense, W, H) {
+    const rle = rleEncode(dense, W, H);
+    if (Object.keys(rle.classes).length) paintR[key(c, u)] = rle; else delete paintR[key(c, u)];
+    persist();
+  }
+  const usedClassesInPaint = () => { const s = new Set(); for (const kk in paintR) { const cl = paintR[kk] && paintR[kk].classes; for (const c in (cl || {})) { const n = +c; if (n) s.add(n); } } return [...s]; };
 
   function markVisited(c, u) { visited[key(c, u)] = true; persist(); }
   const isVisited = (c, u) => !!visited[key(c, u)];
@@ -131,6 +185,7 @@
       }
     }
     if (ann.starred === true) starred[key(c, u)] = true;
+    if (ann.paint && ann.paint.classes && typeof ann.paint.classes === 'object') paintR[key(c, u)] = ann.paint;
     persist();
   }
 
@@ -143,16 +198,18 @@
       return o;
     });
     const pointsOut = pts(c, u).map(p => { const o = { click: enc(ptXY(p)) }; const cl = ptCls(p); if (cl != null) o.class = cl; return o; });
-    const out = { schema_version: 4, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
+    const out = { schema_version: 5, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
     if (starred[key(c, u)]) out.starred = true;
+    if (paintR[key(c, u)]) out.paint = paintR[key(c, u)];
     return out;
   }
 
-  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(starred)])];
+  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(starred), ...Object.keys(paintR)])];
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
+    getTool, setTool, getBrush, setBrush, hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
 })(typeof window !== 'undefined' ? window : globalThis);

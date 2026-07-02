@@ -20,21 +20,25 @@
     let dots = [];   // recorded click coords [x,y] to mark with red dots
     let gray = null, center = 128, width = 255;
     let segPix = null;
+    let paint = null, paintColorFn = null, brushCur = null;   // paint: Uint16Array(W*H) class-per-pixel (0=unpainted)
+    let strokeChanges = null, dbx0 = 1e9, dby0 = 1e9, dbx1 = -1, dby1 = -1, sLastX = 0, sLastY = 0;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
     const maskCv = document.createElement('canvas'), maskCtx = maskCv.getContext('2d');
+    const paintCv = document.createElement('canvas'), paintCtx = paintCv.getContext('2d', { willReadFrequently: true });
     const baseCv = document.createElement('canvas'), baseCtx = baseCv.getContext('2d', { willReadFrequently: true });
 
     function setUnit(image, w, h, lab, maskArr) {
       if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
-      selCv.width = hovCv.width = maskCv.width = baseCv.width = W;
-      selCv.height = hovCv.height = maskCv.height = baseCv.height = H;
+      selCv.width = hovCv.width = maskCv.width = paintCv.width = baseCv.width = W;
+      selCv.height = hovCv.height = maskCv.height = paintCv.height = baseCv.height = H;
+      paint = new Uint16Array(W * H);
       baseCtx.drawImage(image, 0, 0, W, H);
       const raw = baseCtx.getImageData(0, 0, W, H).data;
       gray = new Uint8Array(W * H);
       for (let i = 0; i < gray.length; i++) gray[i] = raw[i * 4];
-      buildSegPix(); buildSelLayer(); buildMaskLayer(); buildBase(); hovCtx.clearRect(0, 0, W, H);
+      buildSegPix(); buildSelLayer(); buildMaskLayer(); buildBase(); buildPaintLayer(); hovCtx.clearRect(0, 0, W, H);
     }
     function buildLut(C, Wd) {
       const lo = C - Wd / 2, lut = new Uint8Array(256);
@@ -55,7 +59,7 @@
       for (let i = 0; i < label.length; i++) { const v = label[i]; if (v) { const a = segPix.get(v); a[cur.get(v)] = i; cur.set(v, cur.get(v) + 1); } }
     }
     function segPixels(seg) { return (segPix && segPix.get(seg)) || EMPTY; }
-    function paint(cx, pixels, rgb) {
+    function fillPixels(cx, pixels, rgb) {
       const id = cx.createImageData(W, H), d = id.data;
       for (let k = 0; k < pixels.length; k++) { const p = pixels[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; }
       cx.putImageData(id, 0, 0);
@@ -66,7 +70,7 @@
       for (const [seg, rgb] of sel) { const px = segPixels(seg); for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; } }
       selCtx.putImageData(id, 0, 0);
     }
-    function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) paint(hovCtx, segPixels(hov), HOV_RGB); }
+    function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) fillPixels(hovCtx, segPixels(hov), HOV_RGB); }
     function buildMaskLayer() {
       maskCtx.clearRect(0, 0, W, H);
       if (!maskData) return;
@@ -74,6 +78,70 @@
       for (let i = 0; i < maskData.length; i++) { if (maskData[i]) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
       maskCtx.putImageData(id, 0, 0);
     }
+
+    // ---- brush paint layer ----
+    function buildPaintLayer() {
+      paintCtx.clearRect(0, 0, W, H);
+      if (!paint || !paintColorFn) return;
+      const id = paintCtx.createImageData(W, H), d = id.data;
+      for (let i = 0; i < paint.length; i++) {
+        const cls = paint[i]; if (!cls) continue;
+        const rgb = paintColorFn(cls), p = i * 4;
+        d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255;
+      }
+      paintCtx.putImageData(id, 0, 0);
+    }
+    function repaintDirty() {   // incremental: only redraw the frame's dirty bbox
+      if (dbx1 < 0 || !paintColorFn) return;
+      const bw = dbx1 - dbx0 + 1, bh = dby1 - dby0 + 1;
+      const id = paintCtx.getImageData(dbx0, dby0, bw, bh), d = id.data;
+      for (let yy = 0; yy < bh; yy++) for (let xx = 0; xx < bw; xx++) {
+        const i = (dby0 + yy) * W + (dbx0 + xx), p = (yy * bw + xx) * 4, cls = paint[i];
+        if (cls) { const rgb = paintColorFn(cls); d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; }
+        else { d[p] = d[p + 1] = d[p + 2] = d[p + 3] = 0; }
+      }
+      paintCtx.putImageData(id, dbx0, dby0);
+      dbx0 = 1e9; dby0 = 1e9; dbx1 = -1; dby1 = -1;
+    }
+    function paintDab(cx, cy, r, cls, mode, onmask) {
+      const r2 = r * r, erase = (mode === 'erase');
+      const y0 = Math.max(0, cy - r), y1 = Math.min(H - 1, cy + r), x0 = Math.max(0, cx - r), x1 = Math.min(W - 1, cx + r);
+      for (let y = y0; y <= y1; y++) {
+        const dy = y - cy, base = y * W;
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - cx; if (dx * dx + dy * dy > r2) continue;
+          const i = base + x, lab = label[i];
+          if (lab && sel.has(lab)) continue;                          // never paint on a selected segment
+          if (!erase && onmask && maskData && !maskData[i]) continue; // add: foreground-only when onmask
+          const nv = erase ? 0 : cls;
+          if (paint[i] === nv) continue;
+          if (strokeChanges && !strokeChanges.has(i)) strokeChanges.set(i, paint[i]);
+          paint[i] = nv;
+          if (x < dbx0) dbx0 = x; if (x > dbx1) dbx1 = x; if (y < dby0) dby0 = y; if (y > dby1) dby1 = y;
+        }
+      }
+    }
+    function strokeStart(x, y, r, cls, mode, onmask) {
+      strokeChanges = new Map(); dbx0 = 1e9; dby0 = 1e9; dbx1 = -1; dby1 = -1;
+      sLastX = x; sLastY = y; paintDab(x, y, r, cls, mode, onmask); repaintDirty();
+    }
+    function strokeMove(x, y, r, cls, mode, onmask) {
+      const dist = Math.hypot(x - sLastX, y - sLastY), step = Math.max(1, Math.floor(r / 2)), n = Math.max(1, Math.ceil(dist / step));
+      for (let k = 1; k <= n; k++) { const t = k / n; paintDab(Math.round(sLastX + (x - sLastX) * t), Math.round(sLastY + (y - sLastY) * t), r, cls, mode, onmask); }
+      sLastX = x; sLastY = y; repaintDirty();
+    }
+    function strokeEnd() { const changes = strokeChanges ? [...strokeChanges.entries()] : []; strokeChanges = null; return { changes }; }
+    function applyPaintUndo(changes) { for (const [i, old] of changes) paint[i] = old; buildPaintLayer(); }
+    function clearPaintInSegment(seg) {   // wipe paint under a segment (used when that segment gets selected)
+      const px = segPixels(seg), changes = [];
+      for (let k = 0; k < px.length; k++) { const i = px[k]; if (paint[i]) { changes.push([i, paint[i]]); paint[i] = 0; } }
+      if (changes.length) buildPaintLayer();
+      return changes;
+    }
+    function setPaint(dense) { paint = (dense instanceof Uint16Array && dense.length === W * H) ? dense : new Uint16Array(W * H); buildPaintLayer(); }
+    function getPaint() { return paint; }
+    function setPaintColorFn(fn) { paintColorFn = fn; }
+    function setBrushCursor(x, y, r, show) { brushCur = show ? { x, y, r } : null; }
 
     function setSelected(s) { sel = (s instanceof Map) ? s : new Map(); if (W) buildSelLayer(); }
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
@@ -130,11 +198,22 @@
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(baseCv, offX, offY, W * scale, H * scale);
       if (maskData && maskOpacity > 0) { ctx.globalAlpha = maskOpacity; ctx.drawImage(maskCv, offX, offY, W * scale, H * scale); }
+      if (paint && opacity > 0) { ctx.globalAlpha = opacity; ctx.drawImage(paintCv, offX, offY, W * scale, H * scale); }   // paint below selection
       ctx.globalAlpha = opacity; ctx.drawImage(selCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = Math.min(1, opacity + 0.25); ctx.drawImage(hovCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = 1;
       drawRuler(cssW, cssH);
       drawDots();
+      drawBrushCursor();
+    }
+    function drawBrushCursor() {
+      if (!brushCur) return;
+      const sx = offX + (brushCur.x + 0.5) * scale, sy = offY + (brushCur.y + 0.5) * scale, sr = Math.max(2, brushCur.r * scale);
+      ctx.save();
+      ctx.beginPath(); ctx.arc(sx, sy, sr, 0, 6.29);
+      ctx.strokeStyle = 'rgba(0,0,0,0.55)'; ctx.lineWidth = 3; ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.95)'; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.restore();
     }
     function drawDots() {
       if (!dots.length) return;
@@ -183,6 +262,8 @@
     return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, imageToScreen,
+             setPaint, getPaint, setPaintColorFn, setBrushCursor,
+             strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,
              get W() { return W; }, get H() { return H; } };
   }
 

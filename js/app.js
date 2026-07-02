@@ -25,6 +25,7 @@
   let dragging = false, dragMoved = false, suppressClick = false;
   let dragSX = 0, dragSY = 0, dragLX = 0, dragLY = 0;
   const DRAG_THRESH = 4;
+  let painting = false, spaceHeld = false, brushRAF = false;   // brush tool state
 
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
@@ -74,6 +75,7 @@
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setSelected(selColorMap());
+    view.setPaint(State.paintDense(c.id, u.id, data.W, data.H));   // load brush paint layer
     refreshDots();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
@@ -121,6 +123,8 @@
         const { annotation } = await Loader.loadAnnotation(u);
         if (annotation && Array.isArray(annotation.collaterals))
           for (const it of annotation.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
+        if (annotation && annotation.paint && annotation.paint.classes)
+          for (const k in annotation.paint.classes) { const n = +k; if (n) used.add(n); }
       } catch (e) { }
     }
     return used;
@@ -181,7 +185,7 @@
     classes.forEach(c => {
       const row = document.createElement('div'); row.className = 'cls-row' + (c.index === active ? ' active' : '');
       const color = document.createElement('input'); color.type = 'color'; color.value = classColor(c.index); color.className = 'cls-color';
-      color.oninput = e => { State.setClassColor(c.index, e.target.value); if (cur) refreshCanvasSelection(); };
+      color.oninput = e => { State.setClassColor(c.index, e.target.value); if (cur) { view.setPaint(view.getPaint()); refreshCanvasSelection(); } };
       color.onclick = e => e.stopPropagation();
       const name = document.createElement('span'); name.className = 'cls-name'; name.textContent = c.index + ' · ' + c.name;
       row.appendChild(color); row.appendChild(name);
@@ -331,12 +335,21 @@
     return idx;
   }
   function onClick(ev) {
-    if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag, not an annotate
+    if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
+    if (State.getTool() === 'brush') return;                // brush mode: clicks paint, not select
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev);
     if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
     const seg = view.segAt(x, y);
     if (seg) {
+      // paint ⟂ selection: if this click will SELECT the segment, wipe any paint under it first
+      if (State.hasPaint(cur.caseId, cur.unitId)) {
+        const now = State.selectedSegs(cur.caseId, cur.unitId).find(s => s.seg === seg);
+        if (!now || now.cls !== State.getActiveClass()) {
+          const changes = view.clearPaintInSegment(seg);
+          if (changes.length) { State.pushPaintUndo(cur.caseId, cur.unitId, changes); State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H); }
+        }
+      }
       State.applyClass(cur.caseId, cur.unitId, seg, [x, y], State.getActiveClass());
     } else {                                                // background: toggle a red dot (remove nearby, else add)
       const idx = nearestBgPoint(ev);
@@ -354,9 +367,15 @@
       : '光标在图外';
     if (!inspect && isInspectMod(ev)) enterInspect();
     if (inspect) scheduleLoupe();                           // update loupe; hover still tracks below
+    if (State.getTool() === 'brush') {                      // brush cursor ring replaces segment hover
+      view.setBrushCursor(x, y, State.getBrush().radius, !spaceHeld);
+      view.setHovered(0);
+      if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
+      return;
+    }
     if (view.setHovered(seg) && !hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
   }
-  function onLeave() { overCanvas = false; $('cursor').textContent = ''; if (view.setHovered(0)) view.render(); }
+  function onLeave() { overCanvas = false; $('cursor').textContent = ''; view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
 
   // ---- inspect (Cmd/Ctrl cross-frame loupe) ----
   const Loupe = window.Loupe;
@@ -466,10 +485,26 @@
   }
   function onDragStart(ev) {
     if (ev.button !== 0 || !cur) return;
+    if (State.getTool() === 'brush' && !spaceHeld) {        // brush mode: left-drag paints (space+drag still pans)
+      const b = State.getBrush();
+      if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('先在右侧“标注分类”选择一个类别再涂抹。', 'warn'); return; }
+      const [x, y] = view.eventToImage(ev);
+      painting = true; suppressClick = true;
+      view.strokeStart(x, y, b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
+      view.setBrushCursor(x, y, b.radius, true); view.render();
+      return;
+    }
     dragging = true; dragMoved = false; suppressClick = false;
     dragSX = dragLX = ev.clientX; dragSY = dragLY = ev.clientY;
   }
   function onDragMove(ev) {
+    if (painting) {
+      const b = State.getBrush(), p = view.eventToImage(ev);
+      view.strokeMove(p[0], p[1], b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
+      view.setBrushCursor(p[0], p[1], b.radius, true);
+      if (!brushRAF) { brushRAF = true; requestAnimationFrame(() => { brushRAF = false; view.render(); }); }
+      return;
+    }
     if (!dragging) return;
     if (!dragMoved && Math.hypot(ev.clientX - dragSX, ev.clientY - dragSY) > DRAG_THRESH) {
       dragMoved = true; $('view').style.cursor = 'grabbing';
@@ -480,6 +515,18 @@
     afterViewChange();
   }
   function onDragEnd() {
+    if (painting) {
+      painting = false;
+      const rec = view.strokeEnd();
+      if (rec.changes.length) {
+        State.pushPaintUndo(cur.caseId, cur.unitId, rec.changes);
+        State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+        State.markDirty(cur.caseId, cur.unitId);
+        refreshMeta(); highlightNav(); updateDirtyUI(); scheduleAutoSave();
+      }
+      view.render();
+      return;
+    }
     if (!dragging) return;
     dragging = false; $('view').style.cursor = '';
     if (dragMoved) suppressClick = true;                    // swallow the click that follows a real drag
@@ -540,7 +587,15 @@
     catch (e) { setSaveStatus('自动保存失败', true); }
   }
 
-  function undo() { if (!cur) return; State.undo(); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
+  function undo() {
+    if (!cur) return;
+    const e = State.undo();
+    if (e && e.kind === 'paint' && e.c === cur.caseId && e.u === cur.unitId) {
+      view.applyPaintUndo(e.changes);                       // paint undo needs the view's dense array
+      State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+    }
+    State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+  }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
   function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
@@ -558,6 +613,7 @@
   function init() {
     view = window.CanvasView.create($('view'));
     State.load();
+    view.setPaintColorFn(segRgb);
     $('coordOrder').value = State.getCoordOrder();
     const w0 = State.getWindow();
     $('winC').value = w0.center; $('winW').value = w0.width;
@@ -606,6 +662,25 @@
     $('className').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addClass(); } });
     $('note').oninput = onNoteInput;
     $('btnSaveNote').onclick = saveNote;
+    function syncToolUI() {
+      const brush = State.getTool() === 'brush';
+      $('toolClick').classList.toggle('active', !brush);
+      $('toolBrush').classList.toggle('active', brush);
+      document.body.classList.toggle('brush-mode', brush);
+      const b = State.getBrush();
+      $('brushAdd').classList.toggle('active', b.mode !== 'erase');
+      $('brushErase').classList.toggle('active', b.mode === 'erase');
+      $('brushRadius').value = b.radius; $('brushRv').textContent = b.radius;
+      $('brushOnmask').checked = b.onmask;
+      if (view) { view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
+    }
+    $('toolClick').onclick = () => { State.setTool('click'); syncToolUI(); };
+    $('toolBrush').onclick = () => { State.setTool('brush'); syncToolUI(); };
+    $('brushAdd').onclick = () => { const b = State.getBrush(); State.setBrush({ mode: 'add', radius: b.radius, onmask: b.onmask }); syncToolUI(); };
+    $('brushErase').onclick = () => { const b = State.getBrush(); State.setBrush({ mode: 'erase', radius: b.radius, onmask: b.onmask }); syncToolUI(); };
+    $('brushRadius').oninput = e => { const b = State.getBrush(); State.setBrush({ mode: b.mode, radius: +e.target.value, onmask: b.onmask }); $('brushRv').textContent = e.target.value; };
+    $('brushOnmask').onchange = e => { const b = State.getBrush(); State.setBrush({ mode: b.mode, radius: b.radius, onmask: e.target.checked }); };
+    syncToolUI();
     buildClassMgr(); buildClassPicker();
     $('prevUnit').onclick = () => stepUnit(-1);
     $('nextUnit').onclick = () => stepUnit(1);
@@ -627,13 +702,14 @@
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
+      if (e.key === ' ' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') { spaceHeld = true; if (State.getTool() === 'brush') e.preventDefault(); }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
       else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
     });
-    window.addEventListener('keyup', e => { if (!e.metaKey && !e.ctrlKey) exitInspect(); });
+    window.addEventListener('keyup', e => { if (e.key === ' ') spaceHeld = false; if (!e.metaKey && !e.ctrlKey) exitInspect(); });
     window.addEventListener('blur', exitInspect);
     document.addEventListener('visibilitychange', () => { if (document.hidden) exitInspect(); });
     view.setOpacity($('opacity').value / 100);
