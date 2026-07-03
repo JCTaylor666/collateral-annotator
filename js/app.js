@@ -74,10 +74,12 @@
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
       setBanner(null);
-      await showUnit(0, 0);   // may set a per-unit corrupt/mask warning
-      // higher-priority open-time warnings take precedence over the per-unit one
-      if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
-      else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
+      const okUnit = await showUnit(0, 0);   // may set a per-unit corrupt/mask warning
+      // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
+      if (okUnit) {
+        if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+        else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
+      }
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
   }
 
@@ -112,6 +114,7 @@
 
   async function showUnit(nci, nui) {
     commitActiveStroke();     // never let a live stroke bleed onto the frame we're switching to
+    exitCopyPick();           // leaving a frame cancels an in-progress copy-from-frame pick
     flushAutoSave();          // persist the outgoing unit before we move off it
     const gen = ++navGen;     // overlapping (slow-disk) loads: only the newest navigation may apply
     const prevCi = ci, prevUi = ui;
@@ -120,12 +123,12 @@
     let data;
     try { data = await loadCur(); }
     catch (e) {
-      if (gen !== navGen) return;               // a newer navigation superseded this one — stay silent
+      if (gen !== navGen) return false;          // a newer navigation superseded this one — stay silent
       ci = prevCi; ui = prevUi;                  // keep nav state matching the still-displayed unit
       setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
-      return;
+      return false;
     }
-    if (gen !== navGen) return;                  // superseded while loading: drop this stale result entirely
+    if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
@@ -140,6 +143,7 @@
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
+    return true;
   }
 
   function refreshDots() {
@@ -219,7 +223,8 @@
     c.name = name; buildClassPicker(); saveClasses();
   }
   async function deleteClass(idx) {
-    if ((await usedClassSet()).has(idx)) { setBanner('classInUse', { idx }, 'warn'); return; }
+    const used = await usedClassSet();                                   // slow: re-reads every unit from disk
+    if (used.has(idx) || State.usedClasses().includes(idx)) { setBanner('classInUse', { idx }, 'warn'); return; }   // re-check in-memory too, in case the class was assigned during the disk scan
     classes = classes.filter(c => c.index !== idx);
     ensureActiveClass(); buildClassMgr(); buildClassPicker();
     if (cur) refreshCanvasSelection();
@@ -279,8 +284,8 @@
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
   function pickCopySource(uidx) {
     const src = curCase().units[uidx];
-    if (src && uidx !== ui) doCopyFrom(curCase().id, src);
-    exitCopyPick();
+    exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
+    if (src && uidx !== ui && cur && State.markCount(cur.caseId, cur.unitId) === 0) doCopyFrom(curCase().id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
     // gather source clicks (segments + background points) — each carries the class chosen when it was clicked
@@ -447,6 +452,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
+    if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // brush mode: clicks paint, not select
     if (!cur) return;                                       // inspect no longer blocks annotation
@@ -620,6 +626,7 @@
   }
   function onDragMove(ev) {
     if (painting) {
+      if (!(ev.buttons & 1)) { onDragEnd(); return; }   // left button was released off-window (lost mouseup): end the stroke, don't keep painting under a released button
       const b = State.getBrush(), p = view.eventToImage(ev);
       view.strokeMove(p[0], p[1], b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
       view.setBrushCursor(p[0], p[1], b.radius, true);
@@ -635,7 +642,8 @@
     dragLX = ev.clientX; dragLY = ev.clientY;
     afterViewChange();
   }
-  function onDragEnd() {
+  function onDragEnd(ev) {
+    if (ev && ev.button !== 0) return;   // a right/middle-button release must not commit/end a left-button stroke or pan
     if (painting) {
       painting = false;
       const rec = view.strokeEnd();
@@ -846,7 +854,7 @@
       $('brushErase').classList.toggle('active', b.mode === 'erase');
       $('brushRadius').value = b.radius; $('brushRv').textContent = b.radius;
       $('brushOnmask').checked = b.onmask;
-      if (view) { view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
+      if (view) { view.setBrushActive(brush); view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
     }
     $('toolClick').onclick = () => { State.setTool('click'); syncToolUI(); };
     $('toolBrush').onclick = () => { State.setTool('brush'); syncToolUI(); };
@@ -865,7 +873,7 @@
     cv.addEventListener('mousemove', onMove);
     cv.addEventListener('mouseleave', onLeave);
     cv.addEventListener('mouseenter', ev => { overCanvas = true; lastCX = ev.clientX; lastCY = ev.clientY; });
-    cv.addEventListener('contextmenu', ev => { if (inspect || isInspectMod(ev)) ev.preventDefault(); });
+    cv.addEventListener('contextmenu', ev => { if (inspect || isInspectMod(ev) || State.getTool() === 'brush') ev.preventDefault(); });
     cv.addEventListener('wheel', onWheel, { passive: false });
     cv.addEventListener('mousedown', onDragStart);
     window.addEventListener('mousemove', onDragMove);
@@ -876,17 +884,27 @@
       if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
+      // while the clear-confirm modal is open, swallow every other hotkey so navigation/undo can't
+      // silently change which frame "Continue clearing" will wipe
+      if (!$('confirmClear').classList.contains('hidden')) return;
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
       if (e.key === ' ' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') { spaceHeld = true; if (State.getTool() === 'brush') e.preventDefault(); }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undo(); }
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!painting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record)
     });
     window.addEventListener('keyup', e => { if (e.key === ' ') spaceHeld = false; if (!e.metaKey && !e.ctrlKey) exitInspect(); });
-    window.addEventListener('blur', exitInspect);
-    document.addEventListener('visibilitychange', () => { if (document.hidden) exitInspect(); });
+    // losing the window can swallow the mouseup/keyup: commit any live stroke and clear transient input
+    // state so the brush can't come back "stuck" painting with no button held.
+    function resetTransientInput() {
+      if (painting) onDragEnd();
+      dragging = false; spaceHeld = false; $('view').style.cursor = '';
+      exitInspect();
+    }
+    window.addEventListener('blur', resetTransientInput);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) resetTransientInput(); });
     view.setOpacity($('opacity').value / 100);
     view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {

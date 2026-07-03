@@ -16,6 +16,7 @@
     // re-fits on next layout (set when image dims change). User pan/zoom mutate scale/off.
     let scale = 1, offX = 0, offY = 0, fitScale = 1, needFit = true;
     let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color)
+    let brushActive = false;   // when the brush tool is active, floor the paint-layer alpha so strokes are never invisible
     let maskData = null, maskOpacity = 0.45;
     let dots = [];   // recorded click coords [x,y] to mark with red dots
     let noteMks = [], noteMkHi = 0;   // note markers [{id, xy}] + highlighted id (chip hover)
@@ -148,6 +149,7 @@
     function setSelected(s) { sel = (s instanceof Map) ? s : new Map(); if (W) buildSelLayer(); }
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
     function setOpacity(o) { opacity = o; }
+    function setBrushActive(b) { brushActive = !!b; }
     function setMaskOpacity(o) { maskOpacity = o; }
     function setWindow(C, Wd) { center = C; width = Wd; if (gray) buildBase(); }
     function getWindow() { return { center, width }; }
@@ -200,7 +202,8 @@
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(baseCv, offX, offY, W * scale, H * scale);
       if (maskData && maskOpacity > 0) { ctx.globalAlpha = maskOpacity; ctx.drawImage(maskCv, offX, offY, W * scale, H * scale); }
-      if (paint && opacity > 0) { ctx.globalAlpha = opacity; ctx.drawImage(paintCv, offX, offY, W * scale, H * scale); }   // paint below selection
+      const pAlpha = brushActive ? Math.max(opacity, 0.35) : opacity;   // never let brush strokes be invisible while painting
+      if (paint && pAlpha > 0) { ctx.globalAlpha = pAlpha; ctx.drawImage(paintCv, offX, offY, W * scale, H * scale); }   // paint below selection
       ctx.globalAlpha = opacity; ctx.drawImage(selCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = Math.min(1, opacity + 0.25); ctx.drawImage(hovCv, offX, offY, W * scale, H * scale);
       ctx.globalAlpha = 1;
@@ -279,7 +282,7 @@
     // store it — setUnit reallocates gray on every unit switch.
     function getGray() { return { gray, W, H }; }
 
-    return { setUnit, setSelected, setHovered, setOpacity, setMaskOpacity, setWindow, getWindow, autoWindow,
+    return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,

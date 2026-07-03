@@ -169,7 +169,7 @@
     }
     persist(); return e;
   }
-  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; delete paintR[key(c, u)]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; delete paintR[key(c, u)]; delete starred[key(c, u)]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
   // wipe a unit's in-memory annotation so it can be re-seeded from disk (used for clean units on load)
   function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete paintR[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
 

@@ -7,7 +7,8 @@
 
   const grayCache = new Map();   // key -> { W, H, gray }
   const inflight = new Map();    // key -> Promise
-  const failed = new Set();      // key
+  const failed = new Map();      // key -> failure timestamp (retryable after a cooldown, not permanent)
+  const RETRY_MS = 5000;
   let epoch = 0;                 // dataset generation; bumped on reset()
   const readyCbs = [];
 
@@ -18,7 +19,11 @@
   // Lazily ensure a unit's gray is cached. Fire-and-forget from event handlers —
   // never await this on a mousemove. Late results from a stale dataset are dropped.
   function ensure(key, unit) {
-    if (grayCache.has(key) || failed.has(key)) return inflight.get(key) || Promise.resolve();
+    if (grayCache.has(key)) return inflight.get(key) || Promise.resolve();
+    if (failed.has(key)) {
+      if (Date.now() - failed.get(key) < RETRY_MS) return Promise.resolve();   // still cooling down after a transient read failure
+      failed.delete(key);                                                       // cooldown elapsed — allow one retry (e.g. cloud sync recovered)
+    }
     if (inflight.has(key)) return inflight.get(key);
     const myEpoch = epoch;
     const p = root.Loader.loadGray(unit).then(g => {
@@ -28,7 +33,7 @@
       fireReady();
     }).catch(() => {
       inflight.delete(key);
-      if (myEpoch === epoch) failed.add(key);
+      if (myEpoch === epoch) failed.set(key, Date.now());
     });
     inflight.set(key, p);
     return p;
