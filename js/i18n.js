@@ -11,7 +11,7 @@
     en: {
       pageTitle: 'Vessel Collateral Annotator',
       railToggleTitle: 'Collapse/expand sidebar (\\)',
-      brand: 'Collateral Annotator',
+      brand: 'Vessel Annotator',
       notLoaded: 'Not loaded',
       rpanelToggleTitle: 'Collapse/expand annotation panel',
 
@@ -143,7 +143,7 @@
     zh: {
       pageTitle: '血管分段侧支标注器',
       railToggleTitle: '折叠/展开侧栏（\\）',
-      brand: '侧支标注器',
+      brand: '血管标注器',
       notLoaded: '未载入',
       rpanelToggleTitle: '折叠/展开右侧标注面板',
 
