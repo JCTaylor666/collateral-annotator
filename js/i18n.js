@@ -126,7 +126,9 @@
       pendingSave: 'Pending save…',
       autoSaveFailed: 'Auto-save failed',
       errUnsupportedBrowser: "This browser doesn't support writing to disk (File System Access API). Please open this page in Chrome or Edge.",
-      classFallbackName: 'Class {idx}'
+      classFallbackName: 'Class {idx}',
+      errQuotaFull: 'Browser local backup is full — unsaved changes are no longer being kept across reloads. Save to the folder now.',
+      datasetSwitched: 'New dataset opened; unsaved in-memory changes from the previous dataset were discarded.'
     },
     zh: {
       pageTitle: '血管分段侧支标注器',
@@ -246,7 +248,9 @@
       pendingSave: '待保存…',
       autoSaveFailed: '自动保存失败',
       errUnsupportedBrowser: '此浏览器不支持自动写盘(File System Access API)。请用 Chrome 或 Edge 打开本页。',
-      classFallbackName: '类别 {idx}'
+      classFallbackName: '类别 {idx}',
+      errQuotaFull: '浏览器本地备份已满 —— 未保存的改动不再能在刷新后保留。请立即保存到文件夹。',
+      datasetSwitched: '已打开新数据集；上一个数据集里未保存的内存改动已丢弃。'
     }
   };
 

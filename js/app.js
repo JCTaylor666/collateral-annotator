@@ -40,18 +40,36 @@
     b.className = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
   }
 
+  // A stable per-dataset id lives in a hidden .annotator_dataset.json at the folder root, so
+  // localStorage state can be tied to the dataset it came from (never bleed across folders that
+  // reuse case_N/frame_M names). Read it; create it on first open. Best-effort: if it can't be
+  // written (no permission yet), fall back to a folder-name id for this session.
+  async function ensureDatasetId(root) {
+    const FNAME = '.annotator_dataset.json';
+    try {
+      const fh = await root.getFileHandle(FNAME);
+      const o = JSON.parse(await (await fh.getFile()).text());
+      if (o && typeof o.id === 'string' && o.id) return o.id;
+    } catch (e) { /* absent or unreadable — create below */ }
+    const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
+    try { await FS.writeText(root, FNAME, JSON.stringify({ id, created: new Date().toISOString() }, null, 2)); return id; }
+    catch (e) { return 'name:' + (root.name || 'unknown'); }
+  }
+
   async function openFolder() {
     try {
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
       classes = await Loader.loadClasses(rootHandle);
+      const sw = State.switchDataset(await ensureDatasetId(rootHandle));   // wipe any carryover from a different dataset
       setBanner('scanningExisting');
       await scanDataset();
       ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
-      await showUnit(0, 0); setBanner(null);
+      await showUnit(0, 0);
+      setBanner(sw.switched && sw.hadDirty ? 'datasetSwitched' : null, null, 'warn');
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
   }
 
@@ -745,6 +763,7 @@
 
     view = window.CanvasView.create($('view'));
     State.load();
+    State.setPersistFailHandler(() => setBanner('errQuotaFull', null, 'warn'));   // localStorage full: tell the user before silent data loss
     view.setPaintColorFn(segRgb);
     $('coordOrder').value = State.getCoordOrder();
     const w0 = State.getWindow();

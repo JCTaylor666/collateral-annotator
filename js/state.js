@@ -18,12 +18,18 @@
   let autoSave = true;
   let classColors = {};     // classIndex -> hex (UI only, not in annotation.json)
   let activeClass = null;   // active class index for new clicks (null = unclassified)
+  let datasetId = null;     // id of the dataset the per-unit state above belongs to (guards cross-folder leakage)
+  let onPersistFail = null, quotaWarned = false;   // localStorage-full handler + one-shot latch
 
   const key = (c, u) => c + '/' + u;
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
-  function persist() { try { localStorage.setItem(LSKEY, JSON.stringify({ selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); } catch (e) { } }
+  function persist() {
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    catch (e) { if (e && (e.name === 'QuotaExceededError' || e.code === 22) && !quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
+  }
+  function setPersistFailHandler(fn) { onPersistFail = fn; }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
@@ -38,8 +44,21 @@
         if (typeof o.autoSave === 'boolean') autoSave = o.autoSave;
         if (o.classColors && typeof o.classColors === 'object') classColors = o.classColors;
         if (Number.isFinite(o.activeClass)) activeClass = o.activeClass;
+        if (typeof o.datasetId === 'string') datasetId = o.datasetId;
       }
     } catch (e) { }
+  }
+  const getDatasetId = () => datasetId;
+  // Point per-unit state at a dataset. If it currently belongs to a DIFFERENT dataset, wipe it
+  // first so one folder's unsaved (dirty) annotations can never render on / be written into another
+  // folder that reuses the same case_N/frame_M names. Global prefs (window, loupe, colors…) are kept.
+  function switchDataset(newId) {
+    if (datasetId === newId) return { switched: false, hadDirty: false };
+    const hadDirty = Object.keys(dirty).length > 0;
+    selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
+    dirty = {}; starred = {}; paintR = {}; undoStack.length = 0;
+    datasetId = newId; persist();
+    return { switched: true, hadDirty };
   }
 
   const getCoordOrder = () => coordOrder;
@@ -257,5 +276,6 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
-    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key };
+    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key,
+    getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);
