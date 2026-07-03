@@ -70,23 +70,25 @@
   const getAutoSave = () => autoSave;
   function setAutoSave(b) { autoSave = !!b; persist(); }
 
-  const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});
+  const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});   // create-on-read: writers only
   const pts = (c, u) => points[key(c, u)] || (points[key(c, u)] = []);
+  const selR = (c, u) => selections[key(c, u)] || {};                             // non-creating: readers, so merely displaying a frame doesn't fabricate empty entries that later get saved as empty annotation.json
+  const ptsR = (c, u) => points[key(c, u)] || [];
   const hasLocal = (c, u) => (key(c, u) in selections) || (key(c, u) in points);
-  const selectedIds = (c, u) => Object.keys(sel(c, u)).map(Number).sort((a, b) => a - b);
-  const count = (c, u) => Object.keys(sel(c, u)).length;
+  const selectedIds = (c, u) => Object.keys(selR(c, u)).map(Number).sort((a, b) => a - b);
+  const count = (c, u) => Object.keys(selR(c, u)).length;
   // click coords of selected segments (for red dots); skip any without a real coord
-  const selectedClicks = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => segXY(s[k])).filter(xy => xy && xy[0] >= 0 && xy[1] >= 0); };
+  const selectedClicks = (c, u) => { const s = selR(c, u); return Object.keys(s).map(k => segXY(s[k])).filter(xy => xy && xy[0] >= 0 && xy[1] >= 0); };
   // selected segments with their class (for per-class coloring)
-  const selectedSegs = (c, u) => { const s = sel(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
+  const selectedSegs = (c, u) => { const s = selR(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
   // all class indices currently assigned to any segment across every unit in memory
   const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } usedClassesInPaint().forEach(c => set.add(c)); return [...set]; };
   // background points now carry a class (the active class at click time). Old data may be a bare [x,y].
   const ptXY = p => Array.isArray(p) ? p : (p && p.xy) || [-1, -1];
   const ptCls = p => (Array.isArray(p) || !p || p.cls == null) ? null : p.cls;
-  const pointList = (c, u) => pts(c, u).map(p => { const xy = ptXY(p); return [xy[0], xy[1]]; });   // coords, for red dots
-  const pointItems = (c, u) => pts(c, u).map(p => ({ xy: ptXY(p), cls: ptCls(p) }));                // coords + class, for copy/json
-  const pointCount = (c, u) => pts(c, u).length;
+  const pointList = (c, u) => ptsR(c, u).map(p => { const xy = ptXY(p); return [xy[0], xy[1]]; });   // coords, for red dots
+  const pointItems = (c, u) => ptsR(c, u).map(p => ({ xy: ptXY(p), cls: ptCls(p) }));                // coords + class, for copy/json
+  const pointCount = (c, u) => ptsR(c, u).length;
   const markCount = (c, u) => count(c, u) + pointCount(c, u);
 
   const getActiveClass = () => activeClass;
@@ -217,7 +219,15 @@
     return dense;
   }
   const hasPaint = (c, u) => { const r = paintR[key(c, u)]; return !!(r && r.classes && Object.keys(r.classes).length); };
-  const paintDense = (c, u, W, H) => rleDecode(paintR[key(c, u)], W, H);
+  // decode paint for display. If the stored RLE was recorded at other dimensions (frame re-exported at a
+  // new size, or annotation.json copied between differently-sized units), don't decode it into the current
+  // frame's coordinate grid — that would display paint at wrong locations. Return empty; the stored RLE is
+  // left untouched (buildAnnotation writes it verbatim) so a load+save can't destroy it.
+  const paintDense = (c, u, W, H) => {
+    const r = paintR[key(c, u)];
+    if (r && (r.encoding !== 'rle_rows_v1' || (r.width && r.width !== W) || (r.height && r.height !== H))) return new Uint16Array(W * H);
+    return rleDecode(r, W, H);
+  };
   function setPaintDense(c, u, dense, W, H) {
     const rle = rleEncode(dense, W, H);
     if (Object.keys(rle.classes).length) paintR[key(c, u)] = rle; else delete paintR[key(c, u)];
@@ -236,6 +246,7 @@
     if (Array.isArray(ann.collaterals)) {
       const s = sel(c, u);
       for (const item of ann.collaterals) {
+        if (!item || typeof item !== 'object') continue;   // a null/garbage element must not abort the whole import (and the folder open)
         const id = Number(item.id); if (!Number.isFinite(id)) continue;
         const xy = (Array.isArray(item.click) && item.click.length === 2) ? conv(item.click) : [-1, -1];
         s[String(id)] = { xy, cls: Number.isFinite(item.class) ? item.class : null };
@@ -269,6 +280,17 @@
   }
 
   const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(paintR)])];
+  // does this unit hold anything actually worth writing to disk? (used to skip empty, merely-viewed frames)
+  function unitHasContent(c, u) {
+    const k = key(c, u);
+    if (selections[k] && Object.keys(selections[k]).length) return true;
+    if (points[k] && points[k].length) return true;
+    if (paintR[k] && paintR[k].classes && Object.keys(paintR[k].classes).length) return true;
+    if (starred[k]) return true;
+    if (notes[k] && notes[k].length) return true;
+    if (noteMarkers[k] && noteMarkers[k].length) return true;
+    return false;
+  }
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
@@ -276,6 +298,6 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
-    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, key,
+    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);

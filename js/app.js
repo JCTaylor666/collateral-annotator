@@ -10,6 +10,9 @@
   const cache = new Map();
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
+  let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
+  const corruptUnits = new Set();             // State.key() of units whose annotation.json is present but unparseable
+  const corruptBackedUp = new Set();          // …of those, the ones already copied to annotation.json.corrupt
   let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
   const PALETTE = ['#e5484d', '#1d9e75', '#3b7dd8', '#e5a50a', '#7c3aed', '#d6409f', '#0f9b8e', '#c2410c'];
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
@@ -61,15 +64,20 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
-      classes = await Loader.loadClasses(rootHandle);
+      const cls = await Loader.loadClasses(rootHandle);
+      classes = cls.list; classesFileCorrupt = !cls.ok;
+      corruptUnits.clear(); corruptBackedUp.clear();
       const sw = State.switchDataset(await ensureDatasetId(rootHandle));   // wipe any carryover from a different dataset
       setBanner('scanningExisting');
       await scanDataset();
       ensureActiveClass();
       cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       buildClassMgr(); buildClassPicker();
-      await showUnit(0, 0);
-      setBanner(sw.switched && sw.hadDirty ? 'datasetSwitched' : null, null, 'warn');
+      setBanner(null);
+      await showUnit(0, 0);   // may set a per-unit corrupt/mask warning
+      // higher-priority open-time warnings take precedence over the per-unit one
+      if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+      else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
   }
 
@@ -77,7 +85,8 @@
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cache.get(k);
     if (!data) { data = await Loader.loadUnit(u); cache.set(k, data); }
-    else { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.note = fresh.note; }
+    else { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; }
+    if (data.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);
     // disk is the source of truth: reconcile CLEAN units from disk each load; keep unsaved (dirty) units as-is
     if (!State.isDirty(c.id, u.id)) {
       State.resetUnit(c.id, u.id);
@@ -128,6 +137,8 @@
     refreshMeta(); buildFrameList();
     $('note').value = State.getNote(c.id, u.id);
     updateDirtyUI(); updateCopyBtn();
+    if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
+    else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
   }
 
@@ -181,19 +192,21 @@
   async function scanDataset() {
     const used = new Set(State.usedClasses());
     for (const c of cases) for (const u of c.units) {
-      let ann = null, note = null;
-      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; } catch (e) { }
+      let ann = null, note = null, annCorrupt = false;
+      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; } catch (e) { }
+      if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
       if (!State.isDirty(c.id, u.id)) {
         State.resetUnit(c.id, u.id);
-        if (ann) State.importAnnotation(c.id, u.id, ann);
-        if (note) State.importNoteJson(c.id, u.id, note);
+        try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the whole scan
       }
-      if (ann && Array.isArray(ann.collaterals)) for (const it of ann.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
+      if (ann && Array.isArray(ann.collaterals)) for (const it of ann.collaterals) if (it && Number.isFinite(it.class)) used.add(it.class);
     }
     const have = new Set(classes.map(c => c.index));
     let added = 0;
     for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
-    if (added) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
+    // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
+    if (added && !classesFileCorrupt) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
+    else if (added) classes.sort((a, b) => a.index - b.index);
   }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
@@ -643,25 +656,21 @@
   async function save() {
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
-    try {
-      if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; }
-      const map = new Map();
-      cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
-      let n = 0;
-      for (const k of State.unitsWithData()) {
-        const ref = map.get(k); if (!ref) continue;
-        let data = cache.get(k);
-        if (!data) { data = await Loader.loadUnit(ref.u); cache.set(k, data); }
-        const ann = State.buildAnnotation(ref.c.id, ref.u.id, data.W, data.H);
-        await FS.writeText(ref.u.handle, 'annotation.json', JSON.stringify(ann, null, 2));
-        if (State.hasNoteData(ref.c.id, ref.u.id)) await FS.writeText(ref.u.handle, 'note.json', JSON.stringify(State.buildNote(ref.c.id, ref.u.id), null, 2));
-        State.markClean(ref.c.id, ref.u.id);
-        n++;
-      }
-      updateDirtyUI();
-      setBanner('savedAllFmt', { n }, 'ok');
-      setSaveStatus('saved', { time: hhmm() });
-    } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); }
+    try { if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; } }
+    catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+    const map = new Map();
+    cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
+    let n = 0, failed = 0;
+    for (const k of State.unitsWithData()) {
+      const ref = map.get(k); if (!ref) continue;
+      // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
+      if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
+      try { await writeUnit(ref.c.id, ref.u); n++; }
+      catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
+    }
+    updateDirtyUI();
+    if (failed) setBanner('savedPartial', { n, failed }, 'warn'); else setBanner('savedAllFmt', { n }, 'ok');
+    setSaveStatus('saved', { time: hhmm() });
   }
 
   // ---- debounced auto-write-to-disk (toggle in Settings; default on) ----
@@ -686,11 +695,21 @@
     setSaveStatus('pendingSave');
   }
   function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
+  async function backupCorruptOnce(k, unit) {   // copy an unparseable annotation.json to .corrupt exactly once before we overwrite it
+    if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return;
+    corruptBackedUp.add(k);
+    try {
+      const fh = await unit.handle.getFileHandle('annotation.json');
+      await FS.writeText(unit.handle, 'annotation.json.corrupt', await (await fh.getFile()).text());
+    } catch (e) { /* best effort — never block the real write */ }
+  }
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
     const k = State.key(caseId, unit.id);
     let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
+    await backupCorruptOnce(k, unit);
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+    corruptUnits.delete(k);   // the file on disk is valid JSON again
     State.markClean(caseId, unit.id);
   }
   async function runAutoSave() {

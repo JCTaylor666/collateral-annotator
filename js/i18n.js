@@ -128,7 +128,11 @@
       errUnsupportedBrowser: "This browser doesn't support writing to disk (File System Access API). Please open this page in Chrome or Edge.",
       classFallbackName: 'Class {idx}',
       errQuotaFull: 'Browser local backup is full — unsaved changes are no longer being kept across reloads. Save to the folder now.',
-      datasetSwitched: 'New dataset opened; unsaved in-memory changes from the previous dataset were discarded.'
+      datasetSwitched: 'New dataset opened; unsaved in-memory changes from the previous dataset were discarded.',
+      annCorrupt: '{id}: annotation.json is unreadable and was left as-is (it will be backed up to annotation.json.corrupt before any save). This frame shows no marks until the file is fixed.',
+      classesCorrupt: 'classes.json is unreadable and was left untouched (class names not regenerated). Fix the file to restore your class names.',
+      maskBad: '{id}: mask.npy is present but unreadable — the vessel-mask overlay and the brush “foreground only” limit are off for this frame.',
+      savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.'
     },
     zh: {
       pageTitle: '血管分段侧支标注器',
@@ -250,7 +254,11 @@
       errUnsupportedBrowser: '此浏览器不支持自动写盘(File System Access API)。请用 Chrome 或 Edge 打开本页。',
       classFallbackName: '类别 {idx}',
       errQuotaFull: '浏览器本地备份已满 —— 未保存的改动不再能在刷新后保留。请立即保存到文件夹。',
-      datasetSwitched: '已打开新数据集；上一个数据集里未保存的内存改动已丢弃。'
+      datasetSwitched: '已打开新数据集；上一个数据集里未保存的内存改动已丢弃。',
+      annCorrupt: '{id}：annotation.json 无法解析，已原样保留（保存前会先备份为 annotation.json.corrupt）。修好文件前本帧不显示标注。',
+      classesCorrupt: 'classes.json 无法解析，已原样保留（未重新生成类别名）。修好文件即可恢复你的类别名称。',
+      maskBad: '{id}：mask.npy 存在但无法解析 —— 本帧的血管 mask 叠加层和笔刷“仅前景”限制已关闭。',
+      savedPartial: '已保存 {n} 个单元；{failed} 个失败（文件损坏或缺失）—— 这些未被改动。'
     }
   };
 

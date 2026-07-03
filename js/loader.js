@@ -35,6 +35,7 @@
     const parsed = root.NPY.parseNpy(labBuf);
     if (parsed.shape.length !== 2) throw new Error(unit.id + ': label.npy is not 2-D');
     const [H, W] = parsed.shape;
+    if (parsed.data.length !== W * H) throw new Error(unit.id + ': label.npy is truncated (' + parsed.data.length + ' values, expected ' + (W * H) + ')');
 
     const pngFile = await pngH.getFile();
     const url = URL.createObjectURL(pngFile);
@@ -50,45 +51,59 @@
       throw new Error(`${unit.id}: image ${img.naturalWidth}x${img.naturalHeight} != label ${W}x${H} (W=shape[1],H=shape[0])`);
     }
 
-    let mask = null;
+    // mask.npy is optional; but distinguish absent (fine) from present-but-broken (warn + no onmask constraint)
+    let mask = null, maskBad = false;
     try {
       const mH = await unit.handle.getFileHandle('mask.npy');
-      const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
-      if (mp.shape.length === 2 && mp.shape[0] === H && mp.shape[1] === W) mask = mp.data;
-    } catch (e) { /* no mask.npy */ }
+      try {
+        const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
+        if (mp.shape.length === 2 && mp.shape[0] === H && mp.shape[1] === W && mp.data.length === W * H) mask = mp.data;
+        else maskBad = true;
+      } catch (pe) { maskBad = true; }
+    } catch (e) { /* mask.npy absent — fine */ }
 
-    let annotation = null;
-    try {
-      const annH = await unit.handle.getFileHandle('annotation.json');
-      annotation = JSON.parse(await (await annH.getFile()).text());
-    } catch (e) { /* not annotated yet */ }
+    const a = await readAnnotation(unit);
+    const n = await readNote(unit);
+    return { W, H, img, url, label: parsed.data, mask, maskBad, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
+  }
 
-    let note = null;   // parsed note.json object { text, markers, ... } or null (old note.txt is ignored)
-    try {
-      const nH = await unit.handle.getFileHandle('note.json');
-      note = JSON.parse(await (await nH.getFile()).text());
-    } catch (e) { /* no note yet */ }
-
-    return { W, H, img, url, label: parsed.data, mask, annotation, note };
+  // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
+  // present-but-unparseable (annotation:null, corrupt:true) so a bad file is never mistaken
+  // for "unannotated" and silently overwritten.
+  async function readAnnotation(unit) {
+    let fh;
+    try { fh = await unit.handle.getFileHandle('annotation.json'); }
+    catch (e) { return { annotation: null, corrupt: false }; }   // absent
+    try { return { annotation: JSON.parse(await (await fh.getFile()).text()), corrupt: false }; }
+    catch (e) { return { annotation: null, corrupt: true }; }    // present but broken
+  }
+  async function readNote(unit) {
+    try { const h = await unit.handle.getFileHandle('note.json'); return { note: JSON.parse(await (await h.getFile()).text()) }; }
+    catch (e) { return { note: null }; }
   }
 
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode
   async function loadAnnotation(unit) {
-    let annotation = null, note = null;
-    try { const h = await unit.handle.getFileHandle('annotation.json'); annotation = JSON.parse(await (await h.getFile()).text()); } catch (e) { }
-    try { const h = await unit.handle.getFileHandle('note.json'); note = JSON.parse(await (await h.getFile()).text()); } catch (e) { }
-    return { annotation, note };
+    const a = await readAnnotation(unit), n = await readNote(unit);
+    return { annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
   }
 
-  // read the dataset-level class definitions from classes.json at the root (or [] if none)
+  // read the dataset-level class definitions from classes.json at the root.
+  // { list, ok }: ok=false means the file EXISTS but is unparseable/wrong-shaped — callers must
+  // NOT auto-regenerate it (that would replace the user's class names with placeholders).
   async function loadClasses(rootHandle) {
+    let fh;
+    try { fh = await rootHandle.getFileHandle('classes.json'); }
+    catch (e) { return { list: [], ok: true }; }   // absent — a fresh dataset, fine to create later
     try {
-      const fh = await rootHandle.getFileHandle('classes.json');
       const o = JSON.parse(await (await fh.getFile()).text());
-      if (o && Array.isArray(o.classes))
-        return o.classes.filter(c => Number.isFinite(c.index)).map(c => ({ index: c.index, name: String(c.name || window.I18n.t('classFallbackName', { idx: c.index })) }));
-    } catch (e) { /* no classes.json */ }
-    return [];
+      if (!o || !Array.isArray(o.classes)) return { list: [], ok: false };
+      const list = o.classes
+        .map(c => ({ index: Number(c.index), name: c.name }))          // coerce string indices ("1") written by other tools
+        .filter(c => Number.isFinite(c.index))
+        .map(c => ({ index: c.index, name: String(c.name || window.I18n.t('classFallbackName', { idx: c.index })) }));
+      return { list, ok: true };
+    } catch (e) { return { list: [], ok: false }; }   // present but broken
   }
 
   // Lightweight read for the inspect loupe: only frames.png -> grayscale (R channel).
