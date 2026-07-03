@@ -2,25 +2,33 @@
 (function (root) {
   'use strict';
 
-  const CASE_RE = /^case_\d+$/;
-  const FRAME_RE = /^frame_(\d+)$/;
   let grayCanvas = null; // reused offscreen canvas for loadGray
+
+  // A case/frame folder is any name that carries a number: pure digits, a trailing `_<digits>`,
+  // or a leading `<digits>_`. The rest of the name doesn't matter — the number drives ordering.
+  // (Matches e.g. case_0001, frame_3, 0001_patient, minip is handled separately.)
+  function folderNum(name) {
+    const m = name.match(/^(\d+)$/) || name.match(/_(\d+)$/) || name.match(/^(\d+)_/);
+    return m ? parseInt(m[1], 10) : null;
+  }
 
   async function discover(rootHandle) {
     const cases = [];
     for await (const [name, handle] of rootHandle.entries()) {
-      if (handle.kind !== 'directory' || name.startsWith('.') || !CASE_RE.test(name)) continue;
+      if (handle.kind !== 'directory' || name.startsWith('.')) continue;
+      const cnum = folderNum(name);
+      if (cnum === null) continue;                            // not a numbered case folder — ignore
       const units = [];
       for await (const [uname, uhandle] of handle.entries()) {
         if (uhandle.kind !== 'directory' || uname.startsWith('.')) continue;
-        const fm = uname.match(FRAME_RE);
         const isMinip = uname === 'minip';
-        if (!fm && !isMinip) continue;
+        const unum = folderNum(uname);
+        if (!isMinip && unum === null) continue;              // not a numbered frame folder (nor minip) — ignore
         units.push({ id: uname, kind: isMinip ? 'minip' : 'frame',
-                     order: isMinip ? Infinity : parseInt(fm[1], 10), handle: uhandle });
+                     order: isMinip ? Infinity : unum, handle: uhandle });
       }
       units.sort((a, b) => a.order - b.order);
-      if (units.length) cases.push({ id: name, num: parseInt(name.slice(5), 10), handle, units });
+      if (units.length) cases.push({ id: name, num: cnum, handle, units });
     }
     cases.sort((a, b) => a.num - b.num);
     return cases;

@@ -9,7 +9,7 @@
 <p class="doc-p">The folder you pick with “Open data folder” is the dataset root. <b>Inputs</b> (image + segmentation) come from your preprocessing pipeline; <b>outputs</b> are written by this tool. Every frame folder is self-contained.</p>
 <pre class="doc-tree">&lt;data root&gt;/                    ← picked with “Open data folder”
 ├─ classes.json                 ← output · class definitions (whole dataset)
-├─ case_0001/                   ← one case · name must be case_&lt;digits&gt;
+├─ case_0001/                   ← one case · any name carrying a number (e.g. case_0001, 12_patient)
 │  ├─ frame_0/                  ← one frame · name must be frame_&lt;digits&gt;
 │  │  ├─ frames.png             ← input · DSA frame image (grayscale PNG)
 │  │  ├─ label.npy              ← input · segment-id map (this frame's segmentation)
@@ -20,8 +20,8 @@
 │  └─ minip/                    ← minimum-intensity projection · same files, listed last
 └─ case_0002/ …</pre>
 <div class="doc-sec"><h4>Discovery rules</h4><ul>
-<li>Only folders named <code>case_&lt;digits&gt;</code> are treated as cases; inside them only <code>frame_&lt;digits&gt;</code> and <code>minip</code> are loaded as units.</li>
-<li>Frames sort numerically (frame_2 before frame_10); <code>minip</code> is always last; cases sort by their number. Hidden folders and anything else are ignored.</li>
+<li>A folder is a case (and, inside it, a frame) if its name carries a number — pure digits, a trailing <code>_&lt;digits&gt;</code>, or a leading <code>&lt;digits&gt;_</code>. The rest of the name is free (e.g. <code>case_0001</code>, <code>frame_3</code>, <code>12_patient</code>, <code>0_scan</code>). A unit folder named exactly <code>minip</code> is also loaded.</li>
+<li>Frames sort by that number (frame_2 before frame_10); <code>minip</code> is always last; cases sort by their number. Hidden folders (starting with <code>.</code>), folders with no number, and files are ignored.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>frames.png</code> — input, required</h4><ul>
 <li>The DSA frame as a grayscale PNG. The tool reads the <b>red channel</b> as the raw gray value (0–255) for contrast windowing and the inspect loupe.</li>
@@ -86,7 +86,7 @@
 <p class="doc-p">用“打开数据文件夹”选中的文件夹就是数据根目录。<b>输入</b>（图像 + 分割）由你的预处理流水线生成；<b>输出</b>由本工具写入。每个帧文件夹都是自包含的。</p>
 <pre class="doc-tree">&lt;数据根目录&gt;/                 ← “打开数据文件夹”选的就是它
 ├─ classes.json                 ← 输出 · 类别定义（全数据集共用）
-├─ case_0001/                   ← 一个病例 · 名字必须是 case_&lt;数字&gt;
+├─ case_0001/                   ← 一个病例 · 名字带数字即可(如 case_0001、12_patient)
 │  ├─ frame_0/                  ← 一帧 · 名字必须是 frame_&lt;数字&gt;
 │  │  ├─ frames.png             ← 输入 · DSA 帧图像（灰度 PNG）
 │  │  ├─ label.npy              ← 输入 · 血管段 id 图（本帧自己的分割）
@@ -97,8 +97,8 @@
 │  └─ minip/                    ← 最小强度投影 · 文件相同，排在最后
 └─ case_0002/ …</pre>
 <div class="doc-sec"><h4>扫描规则</h4><ul>
-<li>只有名为 <code>case_&lt;数字&gt;</code> 的文件夹被当作病例；其中只加载 <code>frame_&lt;数字&gt;</code> 和 <code>minip</code>。</li>
-<li>帧按数字排序（frame_2 在 frame_10 前）；<code>minip</code> 永远排最后；病例按编号排序。隐藏文件夹和其它名字一律忽略。</li>
+<li>只要文件夹名<b>带数字</b>就算病例(以及病例里的帧)——纯数字、结尾 <code>_&lt;数字&gt;</code>、或开头 <code>&lt;数字&gt;_</code> 都行,前后缀随意(如 <code>case_0001</code>、<code>frame_3</code>、<code>12_patient</code>、<code>0_scan</code>)。名为 <code>minip</code> 的单元也会加载。</li>
+<li>帧按该数字排序(frame_2 在 frame_10 前);<code>minip</code> 永远排最后;病例按编号排序。隐藏文件夹(以 <code>.</code> 开头)、不带数字的文件夹、以及文件一律忽略。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>frames.png</code> — 输入，必需</h4><ul>
 <li>DSA 帧图像，灰度 PNG。工具读取其<b>红色通道</b>作为原始灰度值（0–255），用于窗宽窗位和检视放大镜。</li>
