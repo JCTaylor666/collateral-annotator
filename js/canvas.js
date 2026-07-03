@@ -25,6 +25,7 @@
     let paint = null, paintColorFn = null, brushCur = null;   // paint: Uint16Array(W*H) class-per-pixel (0=unpainted)
     let snapPt = null;   // {x,y} magnetic-snap preview point (where a click would register on the nearest vessel)
     let colorMode = false, colorImg = null;   // view a colour image as-is (perfusion map): no grayscale/windowing
+    let perfLegend = 0;   // >0 (= frame count) shows the arrival-time colour legend bottom-right
     let strokeChanges = null, dbx0 = 1e9, dby0 = 1e9, dbx1 = -1, dby1 = -1, sLastX = 0, sLastY = 0;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
@@ -216,7 +217,32 @@
       drawSnapPreview();
       drawMarkers();
       drawBrushCursor();
+      drawPerfLegend(cssW, cssH);
     }
+    // arrival-time colour legend (bottom-right) for the perfusion map: jet bar + frame-index ticks
+    function drawPerfLegend(cssW, cssH) {
+      const T = perfLegend; if (!(T > 0) || !window.Perfusion) return;
+      const barW = 132, barH = 10, cap = 13, ticks = 13, pad = 12, innerPad = 8;
+      const boxW = barW + innerPad * 2, boxH = cap + barH + ticks + innerPad;
+      const bx = cssW - boxW - pad, by = cssH - boxH - pad;
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.62)'; ctx.fillRect(bx, by, boxW, boxH);
+      ctx.fillStyle = '#fff'; ctx.font = '10px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      ctx.fillText(window.I18n.t('perfLegendCap'), bx + innerPad, by + 4);
+      const gx = bx + innerPad, gy = by + 4 + cap;
+      for (let i = 0; i < barW; i++) {
+        const c = window.Perfusion.jet(barW > 1 ? i / (barW - 1) : 0);
+        ctx.fillStyle = 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')'; ctx.fillRect(gx + i, gy, 1, barH);
+      }
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1; ctx.strokeRect(gx + 0.5, gy + 0.5, barW - 1, barH - 1);
+      ctx.fillStyle = '#e5e7eb'; ctx.font = '9px sans-serif'; ctx.textBaseline = 'top';
+      const ty = gy + barH + 2;
+      ctx.textAlign = 'left'; ctx.fillText('0', gx, ty);
+      ctx.textAlign = 'center'; ctx.fillText(String(Math.floor((T - 1) / 2)), gx + barW / 2, ty);
+      ctx.textAlign = 'right'; ctx.fillText(String(T - 1), gx + barW, ty);
+      ctx.restore();
+    }
+    function setPerfLegend(frames) { perfLegend = frames > 0 ? frames : 0; }
     function drawSnapPreview() {   // hollow ring: shows where a click would drop the segment's point (magnetic snap)
       if (!snapPt) return;
       const sx = offX + (snapPt.x + 0.5) * scale, sy = offY + (snapPt.y + 0.5) * scale;
@@ -334,7 +360,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, setPerfLegend, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

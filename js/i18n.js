@@ -43,6 +43,7 @@
       pinPerfusionLabel: 'Pin perfusion in loupe',
       exportPerfusion: 'Export perfusion map',
       perfCap: 'perfusion',
+      perfLegendCap: 'arrival frame (early → late)',
       perfFailed: 'Could not compute the perfusion map for this case (needs ≥2 same-size frames).',
       loupeHoldHintShort: 'Hold Cmd/Ctrl to inspect (release to close; click-to-annotate still works while inspecting)',
 
@@ -180,6 +181,7 @@
       pinPerfusionLabel: '放大镜固定显示灌注图',
       exportPerfusion: '导出灌注图',
       perfCap: '灌注',
+      perfLegendCap: '到达帧(早 → 晚)',
       perfFailed: '无法为该病例计算灌注图(需要至少 2 张同尺寸的帧)。',
       loupeHoldHintShort: '按住 Cmd/Ctrl 检视（松开关闭，检视时仍可点击标注）',
 

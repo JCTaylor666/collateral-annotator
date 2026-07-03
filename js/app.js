@@ -204,6 +204,7 @@
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
+    view.setPerfLegend(0);
     view.setSelected(selColorMap());
     view.setPaint(State.paintDense(c.id, u.id, data.W, data.H));   // load brush paint layer
     refreshDots();
@@ -226,6 +227,7 @@
     const W = perf.W, H = perf.H;
     cur = { W, H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
     view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
+    view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
     view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
     view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
     exitMarkerArm();
