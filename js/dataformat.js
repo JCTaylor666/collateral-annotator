@@ -10,7 +10,7 @@
 <pre class="doc-tree">&lt;data root&gt;/                    ← picked with “Open data folder”
 ├─ classes.json                 ← output · class definitions (whole dataset)
 ├─ case_0001/                   ← one case · any name carrying a number (e.g. case_0001, 12_patient)
-│  ├─ frame_0/                  ← one frame · name must be frame_&lt;digits&gt;
+│  ├─ frame_0/                  ← one frame · any name carrying a number (e.g. frame_0, 3_dsa)
 │  │  ├─ frames.png             ← input · DSA frame image (grayscale PNG)
 │  │  ├─ label.npy              ← input · segment-id map (this frame's segmentation)
 │  │  ├─ mask.npy               ← input · 0/1 vessel mask (optional)
@@ -87,7 +87,7 @@
 <pre class="doc-tree">&lt;数据根目录&gt;/                 ← “打开数据文件夹”选的就是它
 ├─ classes.json                 ← 输出 · 类别定义（全数据集共用）
 ├─ case_0001/                   ← 一个病例 · 名字带数字即可(如 case_0001、12_patient)
-│  ├─ frame_0/                  ← 一帧 · 名字必须是 frame_&lt;数字&gt;
+│  ├─ frame_0/                  ← 一帧 · 名字带数字即可(如 frame_0、3_dsa)
 │  │  ├─ frames.png             ← 输入 · DSA 帧图像（灰度 PNG）
 │  │  ├─ label.npy              ← 输入 · 血管段 id 图（本帧自己的分割）
 │  │  ├─ mask.npy               ← 输入 · 0/1 血管 mask（可选）
