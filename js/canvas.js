@@ -26,6 +26,7 @@
     let snapPt = null;   // {x,y} magnetic-snap preview point (where a click would register on the nearest vessel)
     let colorMode = false, colorImg = null;   // view a colour image as-is (perfusion map): no grayscale/windowing
     let perfLegend = 0;   // >0 (= frame count) shows the arrival-time colour legend bottom-right
+    let placeholder = null;   // {title, subtitle, hint, rows:[{label,val,ok}]} — grey diagnostic panel for a shape-mismatch frame
     let strokeChanges = null, dbx0 = 1e9, dby0 = 1e9, dbx1 = -1, dby1 = -1, sLastX = 0, sLastY = 0;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
@@ -34,6 +35,7 @@
     const baseCv = document.createElement('canvas'), baseCtx = baseCv.getContext('2d', { willReadFrequently: true });
 
     function setUnit(image, w, h, lab, maskArr, isColor) {
+      placeholder = null;                        // a real image clears any diagnostic placeholder
       if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
       colorMode = !!isColor; colorImg = isColor ? image : null;   // perfusion: show the colour image as-is
@@ -203,6 +205,7 @@
     function render() {
       const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
       ctx.clearRect(0, 0, cssW, cssH);
+      if (placeholder) { drawPlaceholder(cssW, cssH); return; }   // shape-mismatch frame: grey diagnostic panel only
       if (!img) return;
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(baseCv, offX, offY, W * scale, H * scale);
@@ -243,6 +246,41 @@
       ctx.restore();
     }
     function setPerfLegend(frames) { perfLegend = frames > 0 ? frames : 0; }
+    // A frame whose image/label/mask sizes disagree isn't rendered normally; show a grey panel that
+    // names the frame and lists the three shapes (✓ = matches the label grid, ✗ = differs).
+    function setPlaceholder(info) {
+      placeholder = info || null;
+      img = null; colorMode = false; colorImg = null; perfLegend = 0;
+      W = 0; H = 0; needFit = true;   // forget stale dims; the next real unit re-fits
+    }
+    function drawPlaceholder(cssW, cssH) {
+      const p = placeholder; if (!p) return;
+      ctx.fillStyle = '#2f3237'; ctx.fillRect(0, 0, cssW, cssH);
+      const cx = cssW / 2, rows = p.rows || [];
+      const lineH = 26, headH = 30, subH = 22, gap = 10, hintGap = 12;
+      const blockH = headH + subH + gap + rows.length * lineH + hintGap + 16;
+      let y = Math.max(16, (cssH - blockH) / 2);
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#e8eaed'; ctx.font = '600 20px sans-serif';
+      ctx.fillText(p.title || '', cx, y); y += headH;
+      ctx.fillStyle = '#f0b400'; ctx.font = '12px sans-serif';
+      ctx.fillText(p.subtitle || '', cx, y); y += subH + gap;
+      const boxW = Math.min(cssW - 40, 440), lx = cx - boxW / 2, rx = cx + boxW / 2;
+      ctx.font = '13px ui-monospace, SFMono-Regular, Menlo, monospace';
+      for (const r of rows) {
+        ctx.textAlign = 'left';
+        ctx.fillStyle = r.ok ? '#5bd18b' : '#ff6b6b';
+        ctx.fillText(r.ok ? '✓' : '✗', lx, y);
+        ctx.fillStyle = '#cfd3d8'; ctx.fillText(r.label, lx + 22, y);
+        ctx.textAlign = 'right';
+        ctx.fillStyle = r.ok ? '#cfd3d8' : '#ff9a9a'; ctx.fillText(r.val, rx, y);
+        y += lineH;
+      }
+      y += hintGap;
+      ctx.textAlign = 'center'; ctx.fillStyle = '#9aa0a6'; ctx.font = '11px sans-serif';
+      ctx.fillText(p.hint || '', cx, y);
+    }
     function drawSnapPreview() {   // hollow ring: shows where a click would drop the segment's point (magnetic snap)
       if (!snapPt) return;
       const sx = offX + (snapPt.x + 0.5) * scale, sy = offY + (snapPt.y + 0.5) * scale;
@@ -360,7 +398,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, setPerfLegend, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

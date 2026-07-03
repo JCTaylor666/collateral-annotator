@@ -95,7 +95,8 @@
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cache.get(k);
     if (!data) { data = await Loader.loadUnit(u); cache.set(k, data); }
-    else { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; }
+    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; }
+    if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (data.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);
     // disk is the source of truth: reconcile CLEAN units from disk each load; keep unsaved (dirty) units as-is
     if (!State.isDirty(c.id, u.id)) {
@@ -201,6 +202,7 @@
       return false;
     }
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
+    if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
@@ -236,6 +238,42 @@
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
+    return true;
+  }
+
+  // A frame whose frames.png / label.npy / mask.npy sizes don't all agree: don't hard-fail — show a
+  // grey placeholder panel listing the three shapes so the mismatch is obvious. View-only, never saved.
+  function showMismatchUnit(c, u, data) {
+    State.markVisited(c.id, u.id);
+    u.mismatch = true;                                        // let save()/star skip it even before it's re-opened
+    cur = { W: data.W || 0, H: data.H || 0, caseId: c.id, unitId: u.id, unit: u, mismatch: true };
+    const fmt = s => Array.isArray(s) ? s.join(' × ') : String(s);
+    const keyOf = s => Array.isArray(s) ? s.join('x') : null;
+    // Mark each file against the MAJORITY shape (so the real odd-one-out gets the ✗, even when it's
+    // the label). No majority (all three differ / only two present & unequal) -> everything is ✗.
+    const parts = [
+      { label: I18n.t('smImage'), shape: data.imgShape, present: true, bad: false },
+      { label: I18n.t('smLabel'), shape: data.labelShape, present: true, bad: false },
+      { label: I18n.t('smMask'), shape: data.maskShape, present: data.maskPresent, bad: data.maskUnreadable },
+    ];
+    const counts = new Map();
+    for (const p of parts) { const k = p.present && !p.bad && keyOf(p.shape); if (k) counts.set(k, (counts.get(k) || 0) + 1); }
+    let mode = null, best = 0;
+    for (const [k, n] of counts) if (n > best) { best = n; mode = k; }
+    const rows = parts.map(p => ({
+      label: p.label,
+      val: !p.present ? I18n.t('smNone') : p.bad ? I18n.t('smUnreadable') : fmt(p.shape),
+      ok: best >= 2 && p.present && !p.bad && keyOf(p.shape) === mode,
+    }));
+    view.setPlaceholder({ title: u.id, subtitle: I18n.t('shapeMismatchTitle'), hint: I18n.t('shapeMismatchHint'), rows });
+    view.setPerfLegend(0);
+    view.setSnapPreview(0, 0, false); view.setHovered(0);
+    exitMarkerArm();
+    view.layout(); view.render(); updateZoomReadout();
+    refreshMeta(); buildFrameList();
+    $('note').value = ''; $('note').disabled = true;
+    updateDirtyUI(); updateCopyBtn();
+    setBanner('shapeMismatchBanner', { id: u.id }, 'warn');
     return true;
   }
 
@@ -360,7 +398,7 @@
   // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
-    b.disabled = !cur || cur.virtual || State.markCount(cur.caseId, cur.unitId) > 0;
+    b.disabled = !cur || cur.virtual || cur.mismatch || State.markCount(cur.caseId, cur.unitId) > 0;
     b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
@@ -438,7 +476,7 @@
     }
   }
   function enterMarkerArm() {
-    if (!cur || cur.virtual || markerArm) return;   // perfusion unit is view-only
+    if (!cur || cur.virtual || cur.mismatch || markerArm) return;   // perfusion / shape-mismatch units are view-only
     exitCopyPick();                                         // the two click-capturing modes are mutually exclusive
     markerArm = true;
     document.body.classList.add('marker-arming');
@@ -459,7 +497,7 @@
     refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
   }
 
-  function onNoteInput() { if (!cur || cur.virtual) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -474,7 +512,7 @@
     }, 'image/png');
   }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
-    if (!cur) return;
+    if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     const c = cur.caseId, u = cur.unitId, unit = curUnit();
     State.setNote(c, u, $('note').value);
@@ -509,6 +547,7 @@
   async function toggleStar(uidx) {
     const c = curCase(); if (!c) return;
     const u = c.units[uidx];
+    if (u.virtual || u.mismatch) return;   // view-only units can't be starred (no file to persist it to)
     State.setStarred(c.id, u.id, !State.isStarred(c.id, u.id));
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
@@ -567,7 +606,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
-    if (cur && cur.virtual) return;                         // perfusion unit is view-only
+    if (cur && (cur.virtual || cur.mismatch)) return;       // perfusion / shape-mismatch units are view-only
     if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // paint mode: clicks paint, not select
@@ -755,7 +794,7 @@
   }
   function onDragStart(ev) {
     if (ev.button !== 0 || !cur) return;
-    const viewOnly = cur.virtual;   // perfusion unit: only pan, never paint/select
+    const viewOnly = cur.virtual || cur.mismatch;   // perfusion / shape-mismatch: only pan, never paint/select
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
     if (!viewOnly && !markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
@@ -841,7 +880,7 @@
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
     let n = 0, failed = 0;
     for (const k of State.unitsWithData()) {
-      const ref = map.get(k); if (!ref || ref.u.virtual) continue;   // perfusion unit is computed, never written
+      const ref = map.get(k); if (!ref || ref.u.virtual || ref.u.mismatch) continue;   // perfusion / shape-mismatch units are never written
       // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
       if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
       try { await writeUnit(ref.c.id, ref.u); n++; }
@@ -885,6 +924,7 @@
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
     const k = State.key(caseId, unit.id);
     let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
+    if (data.shapeMismatch) { State.markClean(caseId, unit.id); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
     await backupCorruptOnce(k, unit);
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));

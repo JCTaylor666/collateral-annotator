@@ -53,26 +53,42 @@
       im.onerror = () => reject(new Error(unit.id + ': failed to load frames.png'));
       im.src = url;
     });
-    // transpose / mismatch guard (square data would hide an x/y swap otherwise)
-    if (img.naturalWidth !== W || img.naturalHeight !== H) {
-      URL.revokeObjectURL(url);
-      throw new Error(`${unit.id}: image ${img.naturalWidth}x${img.naturalHeight} != label ${W}x${H} (W=shape[1],H=shape[0])`);
-    }
+    const imgW = img.naturalWidth, imgH = img.naturalHeight;
 
-    // mask.npy is optional; but distinguish absent (fine) from present-but-broken (warn + no onmask constraint)
-    let mask = null, maskBad = false;
+    // mask.npy is optional. Read its shape (if present) so we can apply it as the overlay when it
+    // matches, and report it in the mismatch panel otherwise. Distinguish absent / present-good /
+    // present-wrong-shape / present-unreadable.
+    let mask = null, maskShape = null, maskPresent = false, maskUnreadable = false;
     try {
       const mH = await unit.handle.getFileHandle('mask.npy');
+      maskPresent = true;
       try {
         const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
+        maskShape = mp.shape.slice();
         if (mp.shape.length === 2 && mp.shape[0] === H && mp.shape[1] === W && mp.data.length === W * H) mask = mp.data;
-        else maskBad = true;
-      } catch (pe) { maskBad = true; }
+      } catch (pe) { maskUnreadable = true; }
     } catch (e) { /* mask.npy absent — fine */ }
+
+    // Shape contract: frames.png, label.npy, and mask.npy (IF present) must all be the same H×W.
+    // If any disagree, don't hard-fail the whole frame — return a placeholder descriptor so the UI can
+    // show a grey panel listing the three shapes for diagnosis (view-only, never annotated or saved).
+    const imgOk = (imgW === W && imgH === H);
+    const maskOk = !maskPresent || mask !== null;             // absent, or present AND exactly matching
+    if (!imgOk || !maskOk) {
+      URL.revokeObjectURL(url);                               // can't align the image to the label grid; drop it
+      return {
+        shapeMismatch: true,
+        W, H,                                                 // nominal (label) grid — used only as the placeholder's cur size
+        imgShape: [imgW, imgH],                               // W × H
+        labelShape: [W, H],                                   // W × H
+        maskPresent, maskUnreadable,
+        maskShape: (maskShape && maskShape.length === 2) ? [maskShape[1], maskShape[0]] : maskShape,  // -> W × H when 2-D
+      };
+    }
 
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
-    return { W, H, img, url, label: parsed.data, mask, maskBad, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
+    return { W, H, img, url, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
