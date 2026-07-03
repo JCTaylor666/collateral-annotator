@@ -16,6 +16,8 @@
   let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
   const PALETTE = ['#e5484d', '#1d9e75', '#3b7dd8', '#e5a50a', '#7c3aed', '#d6409f', '#0f9b8e', '#c2410c'];
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
+  const SNAP_SCREEN_R = 14;                   // magnetic-snap reach (screen px) for single-click select
+  let snapTarget = null;                      // {seg,x,y} nearest segment under the cursor (magnetic snap preview)
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -288,6 +290,10 @@
       color.onclick = e => e.stopPropagation();
       const name = document.createElement('span'); name.className = 'cls-name'; name.textContent = c.index + ' · ' + c.name;
       row.appendChild(color); row.appendChild(name);
+      if (c.index >= 1 && c.index <= 9) {   // keyboard shortcut: press this index to activate the class
+        const key = document.createElement('span'); key.className = 'cls-key'; key.textContent = c.index; key.title = 'Hotkey ' + c.index;
+        row.appendChild(key);
+      }
       row.onclick = () => { State.setActiveClass(c.index); buildClassPicker(); };
       box.appendChild(row);
     });
@@ -493,8 +499,9 @@
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev);
     if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
-    const seg = view.segAt(x, y);
-    if (seg) {
+    const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);  // magnetic snap: grab the nearest vessel even if the click is just off it
+    if (snap) {
+      const seg = snap.seg;
       // paint ⟂ selection: if this click will SELECT the segment, wipe any paint under it first
       if (State.hasPaint(cur.caseId, cur.unitId)) {
         const now = State.selectedSegs(cur.caseId, cur.unitId).find(s => s.seg === seg);
@@ -503,8 +510,8 @@
           if (changes.length) { State.pushPaintUndo(cur.caseId, cur.unitId, changes); State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H); }
         }
       }
-      State.applyClass(cur.caseId, cur.unitId, seg, [x, y], State.getActiveClass());
-    } else {                                                // background: toggle a red dot (remove nearby, else add)
+      State.applyClass(cur.caseId, cur.unitId, seg, [snap.x, snap.y], State.getActiveClass());   // point recorded ON the vessel, not in the empty pixel that was clicked
+    } else {                                                // no vessel within reach: toggle a background red dot (remove nearby, else add)
       const idx = nearestBgPoint(ev);
       if (idx >= 0) State.removePoint(cur.caseId, cur.unitId, idx);
       else State.addPoint(cur.caseId, cur.unitId, [x, y], State.getActiveClass());   // record active class on the point
@@ -524,13 +531,18 @@
                 : (State.getClickMode() === 'brush' ? State.getSelBrush().radius : 0);
     if (ringR) {                                            // brush cursor ring (paint OR brush-select) replaces segment hover
       view.setBrushCursor(x, y, ringR, !spaceHeld);
-      view.setHovered(0);
+      view.setHovered(0); view.setSnapPreview(0, 0, false); snapTarget = null;
       if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
       return;
     }
-    if (view.setHovered(seg) && !hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
+    // single-click select: magnetic snap — highlight the nearest vessel and preview where the point will land
+    const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);
+    snapTarget = snap;
+    view.setHovered(snap ? snap.seg : 0);
+    view.setSnapPreview(snap ? snap.x : 0, snap ? snap.y : 0, !!snap);
+    if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
   }
-  function onLeave() { overCanvas = false; $('cursor').textContent = ''; view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
+  function onLeave() { overCanvas = false; $('cursor').textContent = ''; view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.setSnapPreview(0, 0, false); snapTarget = null; view.render(); }
 
   // ---- inspect (Cmd/Ctrl cross-frame loupe) ----
   const Loupe = window.Loupe;
@@ -925,7 +937,7 @@
       $('selAdd').classList.toggle('active', sb.mode !== 'erase');
       $('selErase').classList.toggle('active', sb.mode === 'erase');
       $('selRadius').value = sb.radius; $('selRv').textContent = sb.radius;
-      if (view) { view.setBrushActive(brush); view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
+      if (view) { view.setBrushActive(brush); view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.setSnapPreview(0, 0, false); view.render(); }
     }
     $('toolClick').onclick = () => { State.setTool('click'); syncToolUI(); };
     $('toolBrush').onclick = () => { State.setTool('brush'); syncToolUI(); };
@@ -965,11 +977,18 @@
       if (!$('confirmClear').classList.contains('hidden')) return;
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
       if (e.key === ' ' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') { spaceHeld = true; if (State.getTool() === 'brush') e.preventDefault(); }
-      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;   // don't hijack typing (notes, class names)
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
       else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!painting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record)
+      else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key >= '1' && e.key <= '9') { const n = +e.key; if (classes.some(c => c.index === n)) { State.setActiveClass(n); buildClassPicker(); } }   // number = activate class with that index
+        else { const k = e.key.toLowerCase();                                                                                                             // C/B/P = single-select / brush-select / paint
+          if (k === 'c') { State.setTool('click'); State.setClickMode('single'); syncToolUI(); }
+          else if (k === 'b') { State.setTool('click'); State.setClickMode('brush'); syncToolUI(); }
+          else if (k === 'p') { State.setTool('brush'); syncToolUI(); } }
+      }
     });
     window.addEventListener('keyup', e => { if (e.key === ' ') spaceHeld = false; if (!e.metaKey && !e.ctrlKey) exitInspect(); });
     // losing the window can swallow the mouseup/keyup: commit any live stroke and clear transient input

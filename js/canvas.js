@@ -23,6 +23,7 @@
     let gray = null, center = 128, width = 255;
     let segPix = null;
     let paint = null, paintColorFn = null, brushCur = null;   // paint: Uint16Array(W*H) class-per-pixel (0=unpainted)
+    let snapPt = null;   // {x,y} magnetic-snap preview point (where a click would register on the nearest vessel)
     let strokeChanges = null, dbx0 = 1e9, dby0 = 1e9, dbx1 = -1, dby1 = -1, sLastX = 0, sLastY = 0;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
@@ -209,8 +210,18 @@
       ctx.globalAlpha = 1;
       drawRuler(cssW, cssH);
       drawDots();
+      drawSnapPreview();
       drawMarkers();
       drawBrushCursor();
+    }
+    function drawSnapPreview() {   // hollow ring: shows where a click would drop the segment's point (magnetic snap)
+      if (!snapPt) return;
+      const sx = offX + (snapPt.x + 0.5) * scale, sy = offY + (snapPt.y + 0.5) * scale;
+      ctx.save();
+      ctx.beginPath(); ctx.arc(sx, sy, 5.5, 0, 6.29);
+      ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.stroke();   // white halo for visibility
+      ctx.lineWidth = 1.6; ctx.strokeStyle = '#e5484d'; ctx.stroke();               // hollow red = "a red dot will land here"
+      ctx.restore();
     }
     function drawMarkers() {   // numbered note markers: constant screen size, so readable at any zoom
       if (!noteMks.length) return;
@@ -274,6 +285,27 @@
     function inBounds(x, y) { return x >= 0 && y >= 0 && x < W && y < H; }
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
+    // Nearest non-background segment to (cx,cy) for magnetic-snap select. screenR is a SCREEN-pixel
+    // reach converted to image px via the current zoom, so the snap feels constant on screen.
+    // Returns { seg, x, y } (x,y = the segment pixel to record as the click point) or null.
+    function nearestSegNear(cx, cy, screenR) {
+      if (!inBounds(cx, cy)) return null;
+      const here = label[cy * W + cx];
+      if (here) return { seg: here, x: cx, y: cy };                 // cursor is on a segment — no snap needed
+      const maxR = Math.max(2, Math.round(screenR / scale)), r2 = maxR * maxR;
+      let best = Infinity, bx = -1, by = -1, bseg = 0;
+      const y0 = Math.max(0, cy - maxR), y1 = Math.min(H - 1, cy + maxR), x0 = Math.max(0, cx - maxR), x1 = Math.min(W - 1, cx + maxR);
+      for (let y = y0; y <= y1; y++) {
+        const dy = y - cy, base = y * W;
+        for (let x = x0; x <= x1; x++) {
+          const s = label[base + x]; if (!s) continue;
+          const dx = x - cx, d2 = dx * dx + dy * dy;
+          if (d2 < best && d2 <= r2) { best = d2; bx = x; by = y; bseg = s; }
+        }
+      }
+      return bseg ? { seg: bseg, x: bx, y: by } : null;
+    }
+    function setSnapPreview(x, y, show) { snapPt = show ? { x, y } : null; }
     // every distinct non-background segment whose pixels fall inside the brush circle at (cx,cy,r),
     // mapped to that segment's pixel NEAREST the brush centre — a representative click point that is
     // guaranteed to lie on the (thin, curved) vessel, unlike a centroid.
@@ -299,7 +331,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

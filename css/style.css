@@ -96,6 +96,8 @@ body.copy-picking .frm{cursor:copy}
 .cls-color{width:26px;height:22px;padding:0;border:1px solid var(--border);border-radius:5px;cursor:pointer;background:none;flex:none}
 .cls-name{font-size:13px;color:var(--ink)}
 .cls-row.active .cls-name{color:var(--accent);font-weight:500}
+.cls-key{margin-left:auto;min-width:18px;height:18px;padding:0 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;color:var(--muted);display:inline-flex;align-items:center;justify-content:center;font-variant-numeric:tabular-nums;background:var(--bg)}
+.cls-row.active .cls-key{border-color:var(--accent);color:var(--accent)}
 .note-area{flex:1;min-height:130px;width:100%;resize:vertical;border:1px solid var(--border);border-radius:8px;padding:8px;font:inherit;font-size:13px;color:var(--ink);background:var(--panel)}
 .note-area:focus{outline:none;border-color:var(--accent)}
 /* note markers (numbered circles placed from the note panel) */
