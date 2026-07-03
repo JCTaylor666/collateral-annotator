@@ -27,6 +27,7 @@
   const DRAG_THRESH = 4;
   let painting = false, spaceHeld = false, brushRAF = false;   // brush tool state
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
+  let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
 
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
@@ -68,14 +69,38 @@
     return data;
   }
 
+  // commit an in-progress brush stroke to the CURRENT unit before we navigate away, so its
+  // pixels/undo can never be misattributed to (or lost by) the unit we switch to.
+  function commitActiveStroke() {
+    if (!painting) return;
+    painting = false;
+    const rec = view.strokeEnd();
+    if (rec.changes.length && cur) {
+      State.pushPaintUndo(cur.caseId, cur.unitId, rec.changes);
+      State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+      State.markDirty(cur.caseId, cur.unitId);
+      scheduleAutoSave();   // queue the outgoing unit; the flushAutoSave() in showUnit writes it immediately
+    }
+  }
+
   async function showUnit(nci, nui) {
+    commitActiveStroke();     // never let a live stroke bleed onto the frame we're switching to
     flushAutoSave();          // persist the outgoing unit before we move off it
+    const gen = ++navGen;     // overlapping (slow-disk) loads: only the newest navigation may apply
+    const prevCi = ci, prevUi = ui;
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
     let data;
-    try { data = await loadCur(); } catch (e) { setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn'); return; }
+    try { data = await loadCur(); }
+    catch (e) {
+      if (gen !== navGen) return;               // a newer navigation superseded this one — stay silent
+      ci = prevCi; ui = prevUi;                  // keep nav state matching the still-displayed unit
+      setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
+      return;
+    }
+    if (gen !== navGen) return;                  // superseded while loading: drop this stale result entirely
     State.markVisited(c.id, u.id);
-    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id };
+    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setSelected(selColorMap());
     view.setPaint(State.paintDense(c.id, u.id, data.W, data.H));   // load brush paint layer
@@ -637,7 +662,7 @@
   }
   function scheduleAutoSave() {
     if (!$('autoSave').checked || !rootHandle || !cur) return;
-    pendingSave = { c: cur.caseId, u: cur.unitId, unit: curUnit() };   // capture the unit now, in case we navigate
+    pendingSave = { c: cur.caseId, u: cur.unitId, unit: cur.unit };   // (case,unit,handle) captured atomically in cur — never mix ids with a different unit's handle
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(runAutoSave, 1000);
     setSaveStatus('pendingSave');
@@ -684,7 +709,13 @@
   }
   function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
   function closeClear() { $('confirmClear').classList.add('hidden'); }
-  function clear() { if (!cur) return; State.clearUnit(cur.caseId, cur.unitId); State.markDirty(cur.caseId, cur.unitId); refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave(); }
+  function clear() {
+    if (!cur) return;
+    State.clearUnit(cur.caseId, cur.unitId);
+    view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // wipe the canvas paint layer too, else the next stroke re-encodes & re-saves the "cleared" paint
+    State.markDirty(cur.caseId, cur.unitId);
+    refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+  }
   function stepUnit(d) {
     if (!cases.length) return;
     let nu = ui + d, nc = ci;

@@ -35,6 +35,7 @@
       selCv.width = hovCv.width = maskCv.width = paintCv.width = baseCv.width = W;
       selCv.height = hovCv.height = maskCv.height = paintCv.height = baseCv.height = H;
       paint = new Uint16Array(W * H);
+      strokeChanges = null; dbx0 = 1e9; dby0 = 1e9; dbx1 = -1; dby1 = -1;   // abort any stroke carried from the previous unit
       baseCtx.drawImage(image, 0, 0, W, H);
       const raw = baseCtx.getImageData(0, 0, W, H).data;
       gray = new Uint8Array(W * H);
