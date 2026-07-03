@@ -49,7 +49,7 @@ body.rpanel-collapsed .rpanel{display:none}
 .seclbl{font-size:11px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .sel-full{width:100%}
 .stepper{display:flex;gap:5px;margin:7px 0}
-.frame-list{max-height:40vh;overflow-y:auto}
+.frame-list{max-height:158px;overflow-y:auto;overscroll-behavior:contain;border:1px solid var(--border);border-radius:8px}  /* ~5 rows (31px each) then scroll inside the box */
 .frame-list.picking{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px;background:var(--accent-bg)}
 body.copy-picking .frm{cursor:copy}
 .frm{display:flex;align-items:center;gap:6px;padding:5px 9px;border-radius:6px;color:var(--muted);cursor:pointer}
