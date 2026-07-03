@@ -28,7 +28,10 @@
   let dragging = false, dragMoved = false, suppressClick = false;
   let dragSX = 0, dragSY = 0, dragLX = 0, dragLY = 0;
   const DRAG_THRESH = 4;
-  let painting = false, spaceHeld = false, brushRAF = false;   // brush tool state
+  let painting = false, spaceHeld = false, brushRAF = false;   // pixel-paint brush state
+  // brush-select (click tool, drag to select segments) stroke state
+  let selecting = false, selRAF = false, selLastX = 0, selLastY = 0;
+  let selStrokeSegs = null, selChanges = null, selPaintChanges = null;
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
   let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
 
@@ -98,18 +101,49 @@
     return data;
   }
 
-  // commit an in-progress brush stroke to the CURRENT unit before we navigate away, so its
-  // pixels/undo can never be misattributed to (or lost by) the unit we switch to.
+  // commit an in-progress stroke (pixel-paint OR brush-select) to the CURRENT unit before we navigate
+  // away, so its pixels/selection/undo can never be misattributed to (or lost by) the unit we switch to.
   function commitActiveStroke() {
-    if (!painting) return;
-    painting = false;
-    const rec = view.strokeEnd();
-    if (rec.changes.length && cur) {
-      State.pushPaintUndo(cur.caseId, cur.unitId, rec.changes);
-      State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
-      State.markDirty(cur.caseId, cur.unitId);
-      scheduleAutoSave();   // queue the outgoing unit; the flushAutoSave() in showUnit writes it immediately
+    if (painting) {
+      painting = false;
+      const rec = view.strokeEnd();
+      if (rec.changes.length && cur) {
+        State.pushPaintUndo(cur.caseId, cur.unitId, rec.changes);
+        State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+        State.markDirty(cur.caseId, cur.unitId);
+        scheduleAutoSave();   // queue the outgoing unit; the flushAutoSave() in showUnit writes it immediately
+      }
     }
+    if (selecting) finalizeSelectStroke();
+  }
+
+  // brush-select: process one brush dab — select (or deselect) every segment under the circle, once per stroke
+  function selDab(x, y) {
+    const sb = State.getSelBrush();
+    for (const [seg, xy] of view.segsInBrush(x, y, sb.radius)) {
+      if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
+      selStrokeSegs.add(seg);
+      if (sb.mode === 'add' && State.hasPaint(cur.caseId, cur.unitId)) {   // paint ⟂ selection: wipe paint under a newly-selected segment
+        const pc = view.clearPaintInSegment(seg);
+        if (pc.length) selPaintChanges.push(...pc);
+      }
+      const ch = State.brushSeg(cur.caseId, cur.unitId, seg, xy, State.getActiveClass(), sb.mode === 'erase');
+      if (ch) selChanges.push(ch);
+    }
+  }
+  function finalizeSelectStroke() {
+    if (!selecting) return;
+    selecting = false;
+    if (selPaintChanges && selPaintChanges.length) {
+      State.pushPaintUndo(cur.caseId, cur.unitId, selPaintChanges);
+      State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+    }
+    if (selChanges && selChanges.length) State.pushSegBatchUndo(cur.caseId, cur.unitId, selChanges);
+    if ((selChanges && selChanges.length) || (selPaintChanges && selPaintChanges.length)) {
+      State.markDirty(cur.caseId, cur.unitId);
+      refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+    }
+    selStrokeSegs = null; selChanges = null; selPaintChanges = null;
   }
 
   async function showUnit(nci, nui) {
@@ -454,7 +488,8 @@
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
     if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
-    if (State.getTool() === 'brush') return;                // brush mode: clicks paint, not select
+    if (State.getTool() === 'brush') return;                // paint mode: clicks paint, not select
+    if (State.getClickMode() === 'brush') return;           // brush-select handles selection via the drag path
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev);
     if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
@@ -485,8 +520,10 @@
       : I18n.t('cursorOutside');
     if (!inspect && isInspectMod(ev)) enterInspect();
     if (inspect) scheduleLoupe();                           // update loupe; hover still tracks below
-    if (State.getTool() === 'brush') {                      // brush cursor ring replaces segment hover
-      view.setBrushCursor(x, y, State.getBrush().radius, !spaceHeld);
+    const ringR = State.getTool() === 'brush' ? State.getBrush().radius
+                : (State.getClickMode() === 'brush' ? State.getSelBrush().radius : 0);
+    if (ringR) {                                            // brush cursor ring (paint OR brush-select) replaces segment hover
+      view.setBrushCursor(x, y, ringR, !spaceHeld);
       view.setHovered(0);
       if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
       return;
@@ -612,13 +649,25 @@
     if (ev.button !== 0 || !cur) return;
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
-    if (!markerArm && State.getTool() === 'brush' && !spaceHeld) {   // brush mode: left-drag paints (space+drag still pans)
+    if (!markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
       const b = State.getBrush();
       if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
       painting = true; suppressClick = true;
       view.strokeStart(x, y, b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
       view.setBrushCursor(x, y, b.radius, true); view.render();
+      return;
+    }
+    if (!markerArm && State.getTool() === 'click' && State.getClickMode() === 'brush' && !spaceHeld) {   // brush-select: left-drag selects segments (space+drag pans)
+      const sb = State.getSelBrush();
+      if (sb.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
+      const [x, y] = view.eventToImage(ev);
+      selecting = true; suppressClick = true;
+      selStrokeSegs = new Set(); selChanges = []; selPaintChanges = [];
+      selLastX = x; selLastY = y;
+      selDab(x, y);
+      view.setBrushCursor(x, y, sb.radius, true);
+      refreshCanvasSelection();
       return;
     }
     dragging = true; dragMoved = false; suppressClick = false;
@@ -631,6 +680,18 @@
       view.strokeMove(p[0], p[1], b.radius, State.getActiveClass() || 0, b.mode, b.onmask);
       view.setBrushCursor(p[0], p[1], b.radius, true);
       if (!brushRAF) { brushRAF = true; requestAnimationFrame(() => { brushRAF = false; view.render(); }); }
+      return;
+    }
+    if (selecting) {
+      if (!(ev.buttons & 1)) { onDragEnd(); return; }   // lost mouseup: finish the selection stroke
+      const sb = State.getSelBrush(), p = view.eventToImage(ev);
+      // interpolate along the path so a fast drag doesn't skip segments between mouse samples
+      const dist = Math.hypot(p[0] - selLastX, p[1] - selLastY), step = Math.max(1, Math.floor(sb.radius));
+      const n = Math.max(1, Math.ceil(dist / step));
+      for (let k = 1; k <= n; k++) { const t = k / n; selDab(Math.round(selLastX + (p[0] - selLastX) * t), Math.round(selLastY + (p[1] - selLastY) * t)); }
+      selLastX = p[0]; selLastY = p[1];
+      view.setBrushCursor(p[0], p[1], sb.radius, true);
+      if (!selRAF) { selRAF = true; requestAnimationFrame(() => { selRAF = false; refreshCanvasSelection(); }); }
       return;
     }
     if (!dragging) return;
@@ -656,6 +717,7 @@
       view.render();
       return;
     }
+    if (selecting) { finalizeSelectStroke(); return; }
     if (!dragging) return;
     dragging = false; $('view').style.cursor = '';
     if (dragMoved) suppressClick = true;                    // swallow the click that follows a real drag
@@ -846,18 +908,32 @@
     $('btnAddMarker').onclick = () => { if (markerArm) exitMarkerArm(); else enterMarkerArm(); };
     function syncToolUI() {
       const brush = State.getTool() === 'brush';
+      const cm = State.getClickMode();
+      const selBrush = !brush && cm === 'brush';
       $('toolClick').classList.toggle('active', !brush);
       $('toolBrush').classList.toggle('active', brush);
       document.body.classList.toggle('brush-mode', brush);
+      document.body.classList.toggle('sel-brush-mode', selBrush);
+      $('clickSingle').classList.toggle('active', !brush && cm === 'single');
+      $('clickBrushSel').classList.toggle('active', selBrush);
       const b = State.getBrush();
       $('brushAdd').classList.toggle('active', b.mode !== 'erase');
       $('brushErase').classList.toggle('active', b.mode === 'erase');
       $('brushRadius').value = b.radius; $('brushRv').textContent = b.radius;
       $('brushOnmask').checked = b.onmask;
+      const sb = State.getSelBrush();
+      $('selAdd').classList.toggle('active', sb.mode !== 'erase');
+      $('selErase').classList.toggle('active', sb.mode === 'erase');
+      $('selRadius').value = sb.radius; $('selRv').textContent = sb.radius;
       if (view) { view.setBrushActive(brush); view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.render(); }
     }
     $('toolClick').onclick = () => { State.setTool('click'); syncToolUI(); };
     $('toolBrush').onclick = () => { State.setTool('brush'); syncToolUI(); };
+    $('clickSingle').onclick = () => { State.setClickMode('single'); syncToolUI(); };
+    $('clickBrushSel').onclick = () => { State.setClickMode('brush'); syncToolUI(); };
+    $('selAdd').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'add', radius: s.radius }); syncToolUI(); };
+    $('selErase').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'erase', radius: s.radius }); syncToolUI(); };
+    $('selRadius').oninput = e => { const s = State.getSelBrush(); State.setSelBrush({ mode: s.mode, radius: +e.target.value }); $('selRv').textContent = e.target.value; };
     $('brushAdd').onclick = () => { const b = State.getBrush(); State.setBrush({ mode: 'add', radius: b.radius, onmask: b.onmask }); syncToolUI(); };
     $('brushErase').onclick = () => { const b = State.getBrush(); State.setBrush({ mode: 'erase', radius: b.radius, onmask: b.onmask }); syncToolUI(); };
     $('brushRadius').oninput = e => { const b = State.getBrush(); State.setBrush({ mode: b.mode, radius: +e.target.value, onmask: b.onmask }); $('brushRv').textContent = e.target.value; };

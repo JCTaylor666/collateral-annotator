@@ -11,8 +11,10 @@
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
-  let tool = 'click';                                  // 'click' | 'brush' (UI mode)
+  let tool = 'click';                                  // 'click' | 'brush' (top-level: point-select vs pixel-paint)
   let brush = { mode: 'add', radius: 6, onmask: false };
+  let clickMode = 'single';                            // within the click tool: 'single' (one segment) | 'brush' (drag to select segments)
+  let selBrush = { mode: 'add', radius: 8 };           // the segment-select brush: mode add/erase, radius
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false, size: 92 };   // size = loupe tile edge in CSS px (bigger = wider field of view)
   let autoSave = true;
@@ -26,7 +28,7 @@
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
   function persist() {
-    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, clickMode, selBrush, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
     catch (e) { if (e && (e.name === 'QuotaExceededError' || e.code === 22) && !quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
   }
   function setPersistFailHandler(fn) { onPersistFail = fn; }
@@ -37,6 +39,8 @@
         selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
         if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
         if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
+        if (o.clickMode === 'brush' || o.clickMode === 'single') clickMode = o.clickMode;
+        if (o.selBrush && typeof o.selBrush === 'object') selBrush = { mode: o.selBrush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.selBrush.radius || 8, 1, 40) };
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
@@ -153,6 +157,22 @@
   function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
   function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, item }); persist(); }
   function pushPaintUndo(c, u, changes) { undoStack.push({ kind: 'paint', c, u, changes }); }
+  // brush-select: select (or deselect) a segment WITHOUT its own undo/persist entry — the caller
+  // batches a whole drag into one undo via pushSegBatchUndo, and persists once via markDirty.
+  // Returns { ks, prev } describing the change, or null if nothing changed (idempotent).
+  function brushSeg(c, u, seg, xy, cls, erase) {
+    const s = sel(c, u), ks = String(seg), prev = (ks in s) ? s[ks] : null;
+    if (erase) {
+      if (prev === null) return null;                       // already not selected
+      delete s[ks];
+      return { ks, prev };
+    }
+    const want = cls == null ? null : cls;
+    if (prev !== null && segCls(prev) === want) return null; // already selected with this class
+    s[ks] = { xy: [xy[0], xy[1]], cls: want };
+    return { ks, prev };
+  }
+  function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) undoStack.push({ kind: 'segbatch', c, u, changes }); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
     if (e.kind === 'point') {
@@ -163,6 +183,9 @@
       if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
     } else if (e.kind === 'paint') {
       /* paint undo needs the view's dense array — the caller (app) applies e.changes then re-encodes */
+    } else if (e.kind === 'segbatch') {
+      const s = sel(e.c, e.u);
+      for (const ch of e.changes) { if (ch.prev === null) delete s[ch.ks]; else s[ch.ks] = ch.prev; }
     } else {
       const s = sel(e.c, e.u);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
@@ -185,6 +208,10 @@
   function setTool(t) { tool = (t === 'brush') ? 'brush' : 'click'; persist(); }
   const getBrush = () => ({ mode: brush.mode, radius: brush.radius, onmask: brush.onmask });
   function setBrush(b) { brush = { mode: b.mode === 'erase' ? 'erase' : 'add', radius: clamp(b.radius, 1, 40), onmask: !!b.onmask }; persist(); }
+  const getClickMode = () => clickMode;
+  function setClickMode(m) { clickMode = (m === 'brush') ? 'brush' : 'single'; persist(); }
+  const getSelBrush = () => ({ mode: selBrush.mode, radius: selBrush.radius });
+  function setSelBrush(b) { selBrush = { mode: b.mode === 'erase' ? 'erase' : 'add', radius: clamp(b.radius, 1, 40) }; persist(); }
 
   // ---- brush paint layer: dense Uint16Array(W*H) <-> compact row-run-length (stored/serialized) ----
   // RLE run = [row, col, length]: row=y (0=top), col=x (0=left) run start, length=consecutive same-class px toward +x.
@@ -297,7 +324,8 @@
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
-    getTool, setTool, getBrush, setBrush, hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
+    getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo,
+    hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);

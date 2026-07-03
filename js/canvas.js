@@ -274,6 +274,22 @@
     function inBounds(x, y) { return x >= 0 && y >= 0 && x < W && y < H; }
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
+    // every distinct non-background segment whose pixels fall inside the brush circle at (cx,cy,r),
+    // mapped to that segment's pixel NEAREST the brush centre — a representative click point that is
+    // guaranteed to lie on the (thin, curved) vessel, unlike a centroid.
+    function segsInBrush(cx, cy, r) {
+      const out = new Map(), best = new Map(), r2 = r * r;
+      const y0 = Math.max(0, cy - r), y1 = Math.min(H - 1, cy + r), x0 = Math.max(0, cx - r), x1 = Math.min(W - 1, cx + r);
+      for (let y = y0; y <= y1; y++) {
+        const dy = y - cy, base = y * W;
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - cx, d2 = dx * dx + dy * dy; if (d2 > r2) continue;
+          const s = label[base + x]; if (!s) continue;
+          if (!best.has(s) || d2 < best.get(s)) { best.set(s, d2); out.set(s, [x, y]); }
+        }
+      }
+      return out;
+    }
     function setDots(arr) { dots = arr || []; }
     function setMarkers(arr) { noteMks = arr || []; }
     function setMarkerHighlight(id) { noteMkHi = id || 0; }
@@ -283,7 +299,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,
