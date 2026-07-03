@@ -24,6 +24,7 @@
     let segPix = null;
     let paint = null, paintColorFn = null, brushCur = null;   // paint: Uint16Array(W*H) class-per-pixel (0=unpainted)
     let snapPt = null;   // {x,y} magnetic-snap preview point (where a click would register on the nearest vessel)
+    let colorMode = false, colorImg = null;   // view a colour image as-is (perfusion map): no grayscale/windowing
     let strokeChanges = null, dbx0 = 1e9, dby0 = 1e9, dbx1 = -1, dby1 = -1, sLastX = 0, sLastY = 0;
     const selCv = document.createElement('canvas'), selCtx = selCv.getContext('2d');
     const hovCv = document.createElement('canvas'), hovCtx = hovCv.getContext('2d');
@@ -31,9 +32,10 @@
     const paintCv = document.createElement('canvas'), paintCtx = paintCv.getContext('2d', { willReadFrequently: true });
     const baseCv = document.createElement('canvas'), baseCtx = baseCv.getContext('2d', { willReadFrequently: true });
 
-    function setUnit(image, w, h, lab, maskArr) {
+    function setUnit(image, w, h, lab, maskArr, isColor) {
       if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
+      colorMode = !!isColor; colorImg = isColor ? image : null;   // perfusion: show the colour image as-is
       selCv.width = hovCv.width = maskCv.width = paintCv.width = baseCv.width = W;
       selCv.height = hovCv.height = maskCv.height = paintCv.height = baseCv.height = H;
       paint = new Uint16Array(W * H);
@@ -50,6 +52,7 @@
       return lut;
     }
     function buildBase() {
+      if (colorMode && colorImg) { baseCtx.clearRect(0, 0, W, H); baseCtx.drawImage(colorImg, 0, 0, W, H); return; }   // perfusion: draw colour as-is (no windowing)
       if (!gray) return;
       const lut = buildLut(center, width), id = baseCtx.createImageData(W, H), d = id.data;
       for (let i = 0; i < gray.length; i++) { const v = lut[gray[i]], p = i * 4; d[p] = d[p + 1] = d[p + 2] = v; d[p + 3] = 255; }

@@ -225,7 +225,7 @@
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
     const W = perf.W, H = perf.H;
     cur = { W, H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
-    view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null);   // empty label, no mask
+    view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
     view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
     view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
     exitMarkerArm();
