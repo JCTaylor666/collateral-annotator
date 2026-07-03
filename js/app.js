@@ -8,6 +8,7 @@
   let rootHandle = null, cases = [], ci = 0, ui = 0;
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
+  const perfCache = new Map();                 // caseId -> { W,H,rgba,canvas } | 'computing' | 'failed' (arrival-time perfusion map)
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
@@ -69,6 +70,8 @@
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
+      for (const c of cases) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
+      perfCache.clear();
       const cls = await Loader.loadClasses(rootHandle);
       classes = cls.list; classesFileCorrupt = !cls.ok;
       corruptUnits.clear(); corruptBackedUp.clear();
@@ -102,6 +105,37 @@
     }
     return data;
   }
+
+  // Compute (once, cached) a case's arrival-time perfusion map from its raw frame grays. No mask/labels.
+  const perfInflight = new Map();   // caseId -> Promise (so concurrent callers share one computation)
+  function ensureCasePerfusion(c) {
+    if (!c) return Promise.resolve(null);
+    const got = perfCache.get(c.id);
+    if (got && got !== 'failed') return Promise.resolve(got);
+    if (got === 'failed') return Promise.resolve(null);
+    if (perfInflight.has(c.id)) return perfInflight.get(c.id);
+    const p = (async () => {
+      try {
+        const frames = c.units.filter(u => u.kind === 'frame');
+        if (frames.length < 2) { perfCache.set(c.id, 'failed'); return null; }
+        const grays = []; let W = 0, H = 0;
+        for (const u of frames) {
+          const g = await Loader.loadGray(u);
+          if (!W) { W = g.W; H = g.H; }
+          if (g.W !== W || g.H !== H) { perfCache.set(c.id, 'failed'); return null; }   // frames must share dimensions
+          grays.push(g.gray);
+        }
+        const perf = window.Perfusion.compute(grays, W, H);
+        perfCache.set(c.id, perf || 'failed');
+        if (perf && inspect) scheduleLoupe();   // a pinned perfusion tile can now render
+        return perf || null;
+      } catch (e) { perfCache.set(c.id, 'failed'); return null; }
+      finally { perfInflight.delete(c.id); }
+    })();
+    perfInflight.set(c.id, p);
+    return p;
+  }
+  const perfState = c => { const v = perfCache.get(c && c.id); return v === 'failed' ? 'error' : (v && v !== 'failed') ? 'ok' : 'loading'; };
 
   // commit an in-progress stroke (pixel-paint OR brush-select) to the CURRENT unit before we navigate
   // away, so its pixels/selection/undo can never be misattributed to (or lost by) the unit we switch to.
@@ -156,6 +190,8 @@
     const prevCi = ci, prevUi = ui;
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
+    ensureCasePerfusion(c);   // kick off (cached) perfusion compute on entering a case, so it's ready to view / pin
+    if (u.virtual) return await showPerfusionUnit(c, u, gen, prevCi, prevUi);
     let data;
     try { data = await loadCur(); }
     catch (e) {
@@ -174,10 +210,29 @@
     exitMarkerArm(); refreshMarkers();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
-    $('note').value = State.getNote(c.id, u.id);
+    $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
+    if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
+    return true;
+  }
+
+  // the computed, view-only perfusion unit: colour image, no label/mask/annotation
+  async function showPerfusionUnit(c, u, gen, prevCi, prevUi) {
+    const perf = await ensureCasePerfusion(c);
+    if (gen !== navGen) return false;                       // superseded by a newer navigation
+    if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
+    const W = perf.W, H = perf.H;
+    cur = { W, H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
+    view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null);   // empty label, no mask
+    view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
+    view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
+    exitMarkerArm();
+    view.layout(); view.render(); updateZoomReadout();
+    refreshMeta(); buildFrameList();
+    $('note').value = ''; $('note').disabled = true;
+    updateDirtyUI(); updateCopyBtn();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
     return true;
   }
@@ -217,6 +272,7 @@
   async function usedClassSet() {
     const used = new Set(State.usedClasses());
     for (const c of cases) for (const u of c.units) {
+      if (u.virtual) continue;                                // perfusion unit has no files on disk
       try {
         const { annotation } = await Loader.loadAnnotation(u);
         if (annotation && Array.isArray(annotation.collaterals))
@@ -232,6 +288,7 @@
   async function scanDataset() {
     const used = new Set(State.usedClasses());
     for (const c of cases) for (const u of c.units) {
+      if (u.virtual) continue;                                // perfusion unit has no files on disk
       let ann = null, note = null, annCorrupt = false;
       try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; } catch (e) { }
       if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
@@ -301,7 +358,7 @@
   // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
-    b.disabled = !cur || State.markCount(cur.caseId, cur.unitId) > 0;
+    b.disabled = !cur || cur.virtual || State.markCount(cur.caseId, cur.unitId) > 0;
     b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
@@ -379,7 +436,7 @@
     }
   }
   function enterMarkerArm() {
-    if (!cur || markerArm) return;
+    if (!cur || cur.virtual || markerArm) return;   // perfusion unit is view-only
     exitCopyPick();                                         // the two click-capturing modes are mutually exclusive
     markerArm = true;
     document.body.classList.add('marker-arming');
@@ -400,7 +457,20 @@
     refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
   }
 
-  function onNoteInput() { if (!cur) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  function onNoteInput() { if (!cur || cur.virtual) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  // download the current case's perfusion map as a PNG
+  async function exportPerfusion() {
+    const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
+    const perf = await ensureCasePerfusion(c);
+    if (!perf || !perf.canvas) { setBanner('perfFailed', null, 'warn'); return; }
+    perf.canvas.toBlob(blob => {
+      if (!blob) return;
+      const url = URL.createObjectURL(blob), a = document.createElement('a');
+      a.href = url; a.download = c.id + '_perfusion.png';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, 'image/png');
+  }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur) return;
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -450,14 +520,17 @@
     if (!c) return;
     c.units.forEach((u, uidx) => {
       const el = document.createElement('div');
-      el.className = 'frm'; el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id;
+      el.className = 'frm' + (u.virtual ? ' frm-virtual' : ''); el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id;
       const name = document.createElement('span'); name.className = 'frm-name'; name.textContent = u.id;
       const badge = document.createElement('span'); badge.className = 'frm-b';
-      const on = State.isStarred(c.id, u.id);
-      const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t('starThisFrame');
-      star.onclick = (e) => { e.stopPropagation(); toggleStar(uidx); };
-      el.appendChild(name); el.appendChild(badge); el.appendChild(star);
-      el.onclick = () => { if (copyPickMode) pickCopySource(uidx); else showUnit(ci, uidx); };
+      el.appendChild(name); el.appendChild(badge);
+      if (!u.virtual) {   // perfusion is view-only: no star / no annotation badge
+        const on = State.isStarred(c.id, u.id);
+        const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t('starThisFrame');
+        star.onclick = (e) => { e.stopPropagation(); toggleStar(uidx); };
+        el.appendChild(star);
+      }
+      el.onclick = () => { if (copyPickMode) { if (!u.virtual) pickCopySource(uidx); } else showUnit(ci, uidx); };
       list.appendChild(el);
     });
     highlightNav();
@@ -492,6 +565,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
+    if (cur && cur.virtual) return;                         // perfusion unit is view-only
     if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // paint mode: clicks paint, not select
@@ -551,6 +625,7 @@
     inspect = true; stripSig = '';
     document.body.classList.add('inspecting');
     $('loupePanel').classList.remove('hidden');
+    ensureCasePerfusion(curCase());   // so a pinned perfusion tile is ready
     preloadCase(); scheduleLoupe();
   }
   function exitInspect() {
@@ -590,16 +665,17 @@
     const s = loupeSizePx();
     $('loupePanel').style.width = Math.max(320, Math.min(s * 3 + 34, Math.round(window.innerWidth * 0.55))) + 'px';
   }
-  function rebuildStrip(lo, hi, units) {
+  function rebuildStrip(idxList, units) {
     const strip = $('loupeStrip'); strip.innerHTML = ''; tileEls.clear();
     const s = loupeSizePx();
-    for (let i = lo; i <= hi; i++) {
+    for (const i of idxList) {
+      const u = units[i];
       const wrap = document.createElement('div');
-      wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '');
+      wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '') + (u.kind === 'perfusion' ? ' perf' : '');
       const cv = document.createElement('canvas');
       cv.style.width = cv.style.height = s + 'px';
       const cap = document.createElement('div'); cap.className = 'cap';
-      cap.textContent = units[i].id + (units[i].kind === 'minip' ? I18n.t('projectionSuffix') : '');
+      cap.textContent = u.kind === 'perfusion' ? I18n.t('perfCap') : (u.id + (u.kind === 'minip' ? I18n.t('projectionSuffix') : ''));
       wrap.appendChild(cv); wrap.appendChild(cap); strip.appendChild(wrap);
       tileEls.set(i, { wrap, canvas: cv });
     }
@@ -609,31 +685,49 @@
     const c = curCase(), units = c.units, n = units.length;
     const [x, y] = view.eventToImage({ clientX: lastCX, clientY: lastCY });
     const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked, size = loupeSizePx();
+    const lp = State.getLoupe();
     const snap = view.getGray(), W = snap.W, H = snap.H;
     const win = view.getWindow(), lut = Loupe.buildLut(win.center, win.width);
     $('loupeCoord').textContent = view.inBounds(x, y) ? ('(' + x + ', ' + y + ')') : I18n.t('cursorOutside');
-
     let S = Math.max(3, Math.round(size / zoom)); if (S % 2 === 0) S++;   // field of view = tile size / magnification
-    const lo = Math.max(0, ui - R), hi = Math.min(n - 1, ui + R);
-    const sig = lo + '-' + hi + '@' + ui + 'x' + size;
-    if (sig !== stripSig) { rebuildStrip(lo, hi, units); stripSig = sig; }
-    for (let i = lo; i <= hi; i++) {
+
+    // tile set = regular frames within ±R of the current frame, plus pinned minip / perfusion
+    const minipIdx = units.findIndex(u => u.kind === 'minip');
+    const perfIdx = units.findIndex(u => u.kind === 'perfusion');
+    const idxSet = new Set();
+    units.forEach((u, i) => { if (u.kind === 'frame' && i >= ui - R && i <= ui + R) idxSet.add(i); });
+    idxSet.add(ui);                                                        // always include the current unit
+    if (lp.pinMinip && minipIdx >= 0) idxSet.add(minipIdx);
+    if (lp.pinPerfusion && perfIdx >= 0) idxSet.add(perfIdx);
+    const idxList = [...idxSet].sort((a, b) => a - b);
+
+    const sig = idxList.join(',') + '@' + ui + 'x' + size;
+    if (sig !== stripSig) { rebuildStrip(idxList, units); stripSig = sig; }
+    for (const i of idxList) {
       const el = tileEls.get(i); if (!el) continue;
-      const g = grayOf(c, i);
-      let st = 'ok';
-      if (!g) st = Loupe.state(State.key(c.id, units[i].id));
-      else if (g.W !== W || g.H !== H) st = 'mismatch';
-      Loupe.drawTile(el.canvas, st === 'ok' ? g : null, x, y, S, lut, st);
+      if (units[i].kind === 'perfusion') {
+        const st = perfState(c);
+        Loupe.drawColorTile(el.canvas, st === 'ok' ? perfCache.get(c.id) : null, x, y, S, st);
+      } else {
+        const g = grayOf(c, i);
+        let st = 'ok';
+        if (!g) st = Loupe.state(State.key(c.id, units[i].id));
+        else if (g.W !== W || g.H !== H) st = 'mismatch';
+        Loupe.drawTile(el.canvas, st === 'ok' ? g : null, x, y, S, lut, st);
+      }
     }
 
-    const pts = [];
+    // cross-frame intensity curve over frames + minip only (perfusion is a timing map, not an intensity)
+    const pts = []; let curveCur = -1;
     for (let i = 0; i < n; i++) {
+      if (units[i].kind === 'perfusion') continue;
+      if (i === ui) curveCur = pts.length;
       const g = grayOf(c, i);
       let val = null;
       if (g && g.W === W && g.H === H) val = sampleVal(g, x, y, mean);
       pts.push({ val, label: units[i].id, isMinip: units[i].kind === 'minip' });
     }
-    Loupe.drawCurve($('loupeCurve'), pts, ui);
+    Loupe.drawCurve($('loupeCurve'), pts, curveCur);
   }
 
   // ---- pan / zoom (main view) ----
@@ -659,9 +753,10 @@
   }
   function onDragStart(ev) {
     if (ev.button !== 0 || !cur) return;
+    const viewOnly = cur.virtual;   // perfusion unit: only pan, never paint/select
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
-    if (!markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
+    if (!viewOnly && !markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
       const b = State.getBrush();
       if (b.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
@@ -670,7 +765,7 @@
       view.setBrushCursor(x, y, b.radius, true); view.render();
       return;
     }
-    if (!markerArm && State.getTool() === 'click' && State.getClickMode() === 'brush' && !spaceHeld) {   // brush-select: left-drag selects segments (space+drag pans)
+    if (!viewOnly && !markerArm && State.getTool() === 'click' && State.getClickMode() === 'brush' && !spaceHeld) {   // brush-select: left-drag selects segments (space+drag pans)
       const sb = State.getSelBrush();
       if (sb.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
@@ -744,7 +839,7 @@
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
     let n = 0, failed = 0;
     for (const k of State.unitsWithData()) {
-      const ref = map.get(k); if (!ref) continue;
+      const ref = map.get(k); if (!ref || ref.u.virtual) continue;   // perfusion unit is computed, never written
       // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
       if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
       try { await writeUnit(ref.c.id, ref.u); n++; }
@@ -876,6 +971,7 @@
     $('loupeR').value = l0.R; $('loupeRv').textContent = l0.R;
     $('loupeMean').checked = !!l0.mean;
     $('loupeSize').value = l0.size; $('loupeSizev').textContent = l0.size;
+    $('pinMinip').checked = l0.pinMinip !== false; $('pinPerfusion').checked = l0.pinPerfusion !== false;
     applyLoupeSize();
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
@@ -907,6 +1003,9 @@
     $('loupeZoom').oninput = e => { $('loupeZoomv').textContent = e.target.value; State.setLoupe(+e.target.value, +$('loupeR').value, $('loupeMean').checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
     $('loupeR').oninput = e => { $('loupeRv').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +e.target.value, $('loupeMean').checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
     $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
+    const syncPins = () => { State.setLoupePins($('pinMinip').checked, $('pinPerfusion').checked); stripSig = ''; if (inspect) scheduleLoupe(); };
+    $('pinMinip').onchange = syncPins; $('pinPerfusion').onchange = syncPins;
+    $('btnExportPerf').onclick = exportPerfusion;
     $('loupeSize').oninput = e => { $('loupeSizev').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, $('loupeMean').checked, +e.target.value); applyLoupeSize(); if (inspect) scheduleLoupe(); };
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
     $('caseSelect').onchange = e => showUnit(+e.target.value, 0);

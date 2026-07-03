@@ -57,6 +57,8 @@ body.copy-picking .frm{cursor:copy}
 .frm.done{color:var(--ink)}
 .frm.active{background:var(--accent-bg);color:var(--accent);font-weight:500}
 .frm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.frm-virtual .frm-name{font-style:italic}   /* computed view-only unit (perfusion) */
+.loupe-tile.perf .cap{color:#e5484d}
 .frm-b{font-size:11px;color:var(--muted)}
 .frm.active .frm-b{color:var(--accent)}
 .frm-star{color:#c9ccd2;font-size:15px;line-height:1;padding:0 1px}

@@ -84,8 +84,10 @@
         ctx.fillRect(px0, py0, px1 - px0, py1 - py0);
       }
     }
-    // crosshair on the center source pixel (the one under the cursor)
-    const ci = cx - x0, cj = cy - y0;
+    drawCrosshair(ctx, cx - x0, cy - y0, S, DW, DH, dpr);
+  }
+  // orange box + faint crosshair on the center source pixel (the one under the cursor)
+  function drawCrosshair(ctx, ci, cj, S, DW, DH, dpr) {
     const cpx0 = Math.floor(ci * DW / S), cpx1 = Math.floor((ci + 1) * DW / S);
     const cpy0 = Math.floor(cj * DH / S), cpy1 = Math.floor((cj + 1) * DH / S);
     const mx = (cpx0 + cpx1) / 2, my = (cpy0 + cpy1) / 2;
@@ -94,6 +96,35 @@
     ctx.globalAlpha = 0.3; ctx.beginPath();
     ctx.moveTo(mx, 0); ctx.lineTo(mx, DH); ctx.moveTo(0, my); ctx.lineTo(DW, my); ctx.stroke();
     ctx.globalAlpha = 1;
+  }
+  // like drawTile but for a colour source (perfusion map): cimg = { W, H, rgba:Uint8ClampedArray }.
+  function drawColorTile(canvas, cimg, cx, cy, S, st) {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 92, cssH = canvas.clientHeight || 92;
+    const DW = Math.max(1, Math.round(cssW * dpr)), DH = Math.max(1, Math.round(cssH * dpr));
+    if (canvas.width !== DW) canvas.width = DW;
+    if (canvas.height !== DH) canvas.height = DH;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, DW, DH);
+    if (st !== 'ok' || !cimg) {
+      ctx.fillStyle = '#2b2f36'; ctx.fillRect(0, 0, DW, DH);
+      ctx.fillStyle = '#9aa4b2'; ctx.font = Math.round(11 * dpr) + 'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(st === 'error' ? '×' : window.I18n.t('loupeLoading'), DW / 2, DH / 2);
+      return;
+    }
+    const rgba = cimg.rgba, W = cimg.W, H = cimg.H;
+    const half = (S - 1) / 2, x0 = Math.round(cx - half), y0 = Math.round(cy - half);
+    for (let j = 0; j < S; j++) {
+      const py0 = Math.floor(j * DH / S), py1 = Math.floor((j + 1) * DH / S), sy = y0 + j;
+      for (let i = 0; i < S; i++) {
+        const px0 = Math.floor(i * DW / S), px1 = Math.floor((i + 1) * DW / S), sx = x0 + i;
+        let r = 43, g = 47, b = 54;
+        if (sx >= 0 && sy >= 0 && sx < W && sy < H) { const p = (sy * W + sx) * 4; r = rgba[p]; g = rgba[p + 1]; b = rgba[p + 2]; }
+        ctx.fillStyle = 'rgb(' + r + ',' + g + ',' + b + ')'; ctx.fillRect(px0, py0, px1 - px0, py1 - py0);
+      }
+    }
+    drawCrosshair(ctx, cx - x0, cy - y0, S, DW, DH, dpr);
   }
 
   // points: [{ val:number|null, label:string, isMinip:bool }]. curIdx = current unit.
@@ -148,5 +179,5 @@
     points.forEach((p, i) => { if (i % step === 0 || i === curIdx) ctx.fillText(p.label.replace('frame_', 'f'), vx(i), y1 + 3); });
   }
 
-  root.Loupe = { reset, ensure, get, state, onReady, buildLut, drawTile, drawCurve };
+  root.Loupe = { reset, ensure, get, state, onReady, buildLut, drawTile, drawColorTile, drawCurve };
 })(typeof window !== 'undefined' ? window : globalThis);

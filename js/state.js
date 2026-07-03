@@ -16,7 +16,7 @@
   let clickMode = 'single';                            // within the click tool: 'single' (one segment) | 'brush' (drag to select segments)
   let selBrush = { mode: 'add', radius: 8 };           // the segment-select brush: mode add/erase, radius
   let win = { center: 128, width: 255 };
-  let loupe = { zoom: 6, R: 3, mean: false, size: 92 };   // size = loupe tile edge in CSS px (bigger = wider field of view)
+  let loupe = { zoom: 6, R: 3, mean: false, size: 92, pinMinip: true, pinPerfusion: true };   // size = loupe tile edge in CSS px; pin* = keep minip/perfusion tiles always visible
   let autoSave = true;
   let classColors = {};     // classIndex -> hex (UI only, not in annotation.json)
   let activeClass = null;   // active class index for new clicks (null = unclassified)
@@ -44,7 +44,7 @@
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
         if (o.loupe && Number.isFinite(o.loupe.zoom) && Number.isFinite(o.loupe.R))
-          loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean, size: clamp(o.loupe.size || 92, 92, 280) };
+          loupe = { zoom: clamp(o.loupe.zoom, 2, 16), R: clamp(o.loupe.R, 1, 6), mean: !!o.loupe.mean, size: clamp(o.loupe.size || 92, 92, 280), pinMinip: o.loupe.pinMinip !== false, pinPerfusion: o.loupe.pinPerfusion !== false };
         if (typeof o.autoSave === 'boolean') autoSave = o.autoSave;
         if (o.classColors && typeof o.classColors === 'object') classColors = o.classColors;
         if (Number.isFinite(o.activeClass)) activeClass = o.activeClass;
@@ -69,8 +69,9 @@
   function setCoordOrder(o) { coordOrder = (o === 'yx') ? 'yx' : 'xy'; persist(); }
   const getWindow = () => ({ center: win.center, width: win.width });
   function setWindow(C, W) { win = { center: C, width: W }; persist(); }
-  const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean, size: loupe.size || 92 });
-  function setLoupe(zoom, R, mean, size) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean, size: clamp(size || 92, 92, 280) }; persist(); }
+  const getLoupe = () => ({ zoom: loupe.zoom, R: loupe.R, mean: loupe.mean, size: loupe.size || 92, pinMinip: loupe.pinMinip !== false, pinPerfusion: loupe.pinPerfusion !== false });
+  function setLoupe(zoom, R, mean, size) { loupe = { zoom: clamp(zoom, 2, 16), R: clamp(R, 1, 6), mean: !!mean, size: clamp(size || 92, 92, 280), pinMinip: loupe.pinMinip, pinPerfusion: loupe.pinPerfusion }; persist(); }
+  function setLoupePins(minip, perfusion) { loupe.pinMinip = !!minip; loupe.pinPerfusion = !!perfusion; persist(); }
   const getAutoSave = () => autoSave;
   function setAutoSave(b) { autoSave = !!b; persist(); }
 
@@ -319,7 +320,7 @@
     return false;
   }
 
-  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
+  root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, setLoupePins, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
