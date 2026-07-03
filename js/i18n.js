@@ -9,7 +9,7 @@
 
   const DICT = {
     en: {
-      pageTitle: 'Vessel Collateral Annotator',
+      pageTitle: 'Vessel Annotator',
       railToggleTitle: 'Collapse/expand sidebar (\\)',
       brand: 'Vessel Annotator',
       notLoaded: 'Not loaded',
@@ -141,7 +141,7 @@
       savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.'
     },
     zh: {
-      pageTitle: '血管分段侧支标注器',
+      pageTitle: '血管标注器',
       railToggleTitle: '折叠/展开侧栏（\\）',
       brand: '血管标注器',
       notLoaded: '未载入',
