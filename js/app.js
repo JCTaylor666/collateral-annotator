@@ -48,6 +48,12 @@
     b.textContent = key ? I18n.t(key, vars) : '';
     b.className = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
   }
+  // Per-unit warnings (shape mismatch / corrupt annotation / broken mask) describe ONE frame — they
+  // must not linger after navigating away. Cleared at the start of every navigation; each unit that
+  // still has the condition re-sets its own banner.
+  function clearUnitBanner() {
+    if (lastBanner && (lastBanner.key === 'shapeMismatchBanner' || lastBanner.key === 'annCorrupt' || lastBanner.key === 'maskBad')) setBanner(null);
+  }
 
   // A stable per-dataset id lives in a hidden .annotator_dataset.json at the folder root, so
   // localStorage state can be tied to the dataset it came from (never bleed across folders that
@@ -191,6 +197,7 @@
     const prevCi = ci, prevUi = ui;
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
+    clearUnitBanner();        // drop any stale per-unit warning from the frame we're leaving
     ensureCasePerfusion(c);   // kick off (cached) perfusion compute on entering a case, so it's ready to view / pin
     if (u.virtual) return await showPerfusionUnit(c, u, gen, prevCi, prevUi);
     let data;
