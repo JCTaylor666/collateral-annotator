@@ -34,7 +34,7 @@
   let painting = false, spaceHeld = false, brushRAF = false;   // pixel-paint brush state
   // brush-select (click tool, drag to select segments) stroke state
   let selecting = false, selRAF = false, selLastX = 0, selLastY = 0;
-  let selStrokeSegs = null, selChanges = null, selPaintChanges = null;
+  let selStrokeSegs = null, selChanges = null, selPaintChanges = null, selPointChanges = null;
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
   let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
 
@@ -163,6 +163,10 @@
   // brush-select: process one brush dab — select (or deselect) every segment under the circle, once per stroke
   function selDab(x, y) {
     const sb = State.getSelBrush();
+    if (sb.mode === 'erase') {                              // deselect brush also sweeps up background red dots under the circle
+      const rm = State.removePointsInCircle(cur.caseId, cur.unitId, x, y, sb.radius);
+      if (rm.length) selPointChanges.push(...rm);
+    }
     for (const [seg, xy] of view.segsInBrush(x, y, sb.radius)) {
       if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
       selStrokeSegs.add(seg);
@@ -182,11 +186,12 @@
       State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
     }
     if (selChanges && selChanges.length) State.pushSegBatchUndo(cur.caseId, cur.unitId, selChanges);
-    if ((selChanges && selChanges.length) || (selPaintChanges && selPaintChanges.length)) {
+    if (selPointChanges && selPointChanges.length) State.pushPointBatchUndo(cur.caseId, cur.unitId, selPointChanges);
+    if ((selChanges && selChanges.length) || (selPaintChanges && selPaintChanges.length) || (selPointChanges && selPointChanges.length)) {
       State.markDirty(cur.caseId, cur.unitId);
       refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
     }
-    selStrokeSegs = null; selChanges = null; selPaintChanges = null;
+    selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null;
   }
 
   async function showUnit(nci, nui) {
@@ -852,7 +857,7 @@
       if (sb.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
       selecting = true; suppressClick = true;
-      selStrokeSegs = new Set(); selChanges = []; selPaintChanges = [];
+      selStrokeSegs = new Set(); selChanges = []; selPaintChanges = []; selPointChanges = [];
       selLastX = x; selLastY = y;
       selDab(x, y);
       view.setBrushCursor(x, y, sb.radius, true);

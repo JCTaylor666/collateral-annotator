@@ -176,6 +176,18 @@
     return { ks, prev };
   }
   function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) undoStack.push({ kind: 'segbatch', c, u, changes }); }
+  // brush-select ERASE also clears background red dots: remove every point inside the circle WITHOUT its
+  // own undo/persist (the whole drag is batched via pushPointBatchUndo). Returns [{index,item}] desc by index.
+  function removePointsInCircle(c, u, cx, cy, r) {
+    const a = ptsR(c, u); if (!a.length) return [];
+    const r2 = r * r, removed = [];
+    for (let i = a.length - 1; i >= 0; i--) {
+      const xy = ptXY(a[i]), dx = xy[0] - cx, dy = xy[1] - cy;
+      if (dx * dx + dy * dy <= r2) removed.push({ index: i, item: a.splice(i, 1)[0] });
+    }
+    return removed;
+  }
+  function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) undoStack.push({ kind: 'pointbatch', c, u, removed }); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
     if (e.kind === 'point') {
@@ -189,6 +201,9 @@
     } else if (e.kind === 'segbatch') {
       const s = sel(e.c, e.u);
       for (const ch of e.changes) { if (ch.prev === null) delete s[ch.ks]; else s[ch.ks] = ch.prev; }
+    } else if (e.kind === 'pointbatch') {
+      const a = pts(e.c, e.u);
+      for (let i = e.removed.length - 1; i >= 0; i--) a.splice(e.removed[i].index, 0, e.removed[i].item);   // re-insert ascending by original index
     } else {
       const s = sel(e.c, e.u);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
@@ -329,7 +344,7 @@
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
-    getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo,
+    getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getDatasetId, switchDataset, setPersistFailHandler };
