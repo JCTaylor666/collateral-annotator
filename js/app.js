@@ -403,13 +403,18 @@
     });
   }
   // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
+  // Copy-from-frame only writes into an EMPTY target — refuse if the frame already has any content
+  // (segments/points, brush paint, or numbered markers), so copied paint/selections never collide.
+  function copyTargetBusy(c, u) {
+    return State.markCount(c, u) > 0 || State.hasPaint(c, u) || State.markerList(c, u).length > 0;
+  }
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
-    b.disabled = !cur || cur.virtual || cur.mismatch || State.markCount(cur.caseId, cur.unitId) > 0;
+    b.disabled = !cur || cur.virtual || cur.mismatch || copyTargetBusy(cur.caseId, cur.unitId);
     b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
-    if (!cur || State.markCount(cur.caseId, cur.unitId) > 0) return;
+    if (!cur || copyTargetBusy(cur.caseId, cur.unitId)) return;
     exitMarkerArm();                                        // the two click-capturing modes are mutually exclusive
     copyPickMode = true;
     $('frameList').classList.add('picking');
@@ -429,13 +434,14 @@
   function pickCopySource(uidx) {
     const src = curCase().units[uidx];
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
-    if (src && uidx !== ui && cur && State.markCount(cur.caseId, cur.unitId) === 0) doCopyFrom(curCase().id, src);
+    if (src && uidx !== ui && cur && !copyTargetBusy(cur.caseId, cur.unitId)) doCopyFrom(curCase().id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
     // gather source clicks (segments + background points) — each carries the class chosen when it was clicked
     const clicks = State.selectedSegs(srcCaseId, srcUnit.id).map(s => ({ xy: s.xy, cls: s.cls }))
       .concat(State.pointItems(srcCaseId, srcUnit.id));
-    if (!clicks.length) { setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return; }
+    const srcHasPaint = State.hasPaint(srcCaseId, srcUnit.id);
+    if (!clicks.length && !srcHasPaint) { setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return; }
     // re-resolve EACH coordinate against the current frame's label: segment there -> class mark; background -> red dot.
     // clicks with no class are dropped.
     const segMap = new Map(), ptSeen = new Set(), pts = [];
@@ -449,10 +455,27 @@
     }
     for (const [seg, v] of segMap) State.applyClass(cur.caseId, cur.unitId, seg, v.xy, v.cls);
     for (const p of pts) State.addPoint(cur.caseId, cur.unitId, p.xy, p.cls);
+    // also copy the source brush-painted mask (paint layer). Paint is per-pixel — no coordinate
+    // re-resolution is possible — so it only transfers at IDENTICAL W×H; otherwise it's skipped.
+    let paintCopied = 0, paintSkipped = false;
+    if (srcHasPaint) {
+      const srcPaint = State.paintDense(srcCaseId, srcUnit.id, cur.W, cur.H);   // all-zero when the source was painted at a different size
+      const curPaint = view.getPaint(), changes = [];
+      for (let i = 0; i < srcPaint.length; i++) { const v = srcPaint[i]; if (v && curPaint[i] !== v) { changes.push([i, curPaint[i]]); curPaint[i] = v; paintCopied++; } }
+      if (paintCopied) {
+        view.setPaint(curPaint);
+        for (const seg of segMap.keys()) { const c2 = view.clearPaintInSegment(seg); if (c2.length) changes.push(...c2); }   // keep paint ⟂ selection
+        State.pushPaintUndo(cur.caseId, cur.unitId, changes);
+        State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+      } else {
+        paintSkipped = true;   // had paint but nothing landed → frames differ in size
+      }
+    }
     State.markDirty(cur.caseId, cur.unitId);
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
     const droppedTxt = dropped ? I18n.t('copyDoneDropped', { n: dropped }) : '';
-    setBanner('copyDone', { id: srcUnit.id, segs: segMap.size, pts: pts.length, dropped: droppedTxt }, 'ok');
+    const paintTxt = paintCopied ? I18n.t('copyDonePaint', { n: paintCopied }) : (paintSkipped ? I18n.t('copyPaintSkipped') : '');
+    setBanner('copyDone', { id: srcUnit.id, segs: segMap.size, pts: pts.length, dropped: droppedTxt + paintTxt }, paintSkipped ? 'warn' : 'ok');
   }
 
   // ---- note markers: place numbered circles from the note panel ----
@@ -621,7 +644,11 @@
     if (!cur) return;                                       // inspect no longer blocks annotation
     const [x, y] = view.eventToImage(ev);
     if (!view.inBounds(x, y)) return;                       // ignore clicks in the letterbox / outside image
-    const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);  // magnetic snap: grab the nearest vessel even if the click is just off it
+    // magnetic snap (opt-in): ON grabs the nearest vessel even if the click is just off it; OFF selects
+    // only the segment exactly under the click (off-vessel clicks fall through to the background-dot path).
+    let snap;
+    if (State.getMagSnap()) { snap = view.nearestSegNear(x, y, SNAP_SCREEN_R); }
+    else { const s = view.segAt(x, y); snap = s ? { seg: s, x, y } : null; }
     if (snap) {
       const seg = snap.seg;
       // paint ⟂ selection: if this click will SELECT the segment, wipe any paint under it first
@@ -657,11 +684,18 @@
       if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
       return;
     }
-    // single-click select: magnetic snap — highlight the nearest vessel and preview where the point will land
-    const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);
-    snapTarget = snap;
-    view.setHovered(snap ? snap.seg : 0);
-    view.setSnapPreview(snap ? snap.x : 0, snap ? snap.y : 0, !!snap);
+    // single-click select. With magnetic snap ON: highlight the nearest vessel and preview where the point
+    // will land (hollow ring). With snap OFF: just highlight the segment exactly under the cursor, no ring.
+    if (State.getMagSnap()) {
+      const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);
+      snapTarget = snap;
+      view.setHovered(snap ? snap.seg : 0);
+      view.setSnapPreview(snap ? snap.x : 0, snap ? snap.y : 0, !!snap);
+    } else {
+      snapTarget = null;
+      view.setHovered(seg);                                 // exact segment under cursor (0 = background)
+      view.setSnapPreview(0, 0, false);
+    }
     if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
   }
   function onLeave() { overCanvas = false; $('cursor').textContent = ''; view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.setSnapPreview(0, 0, false); snapTarget = null; view.render(); }
@@ -1085,12 +1119,14 @@
       $('selAdd').classList.toggle('active', sb.mode !== 'erase');
       $('selErase').classList.toggle('active', sb.mode === 'erase');
       $('selRadius').value = sb.radius; $('selRv').textContent = sb.radius;
+      $('magSnap').checked = State.getMagSnap();
       if (view) { view.setBrushActive(brush); view.setBrushCursor(0, 0, 0, false); view.setHovered(0); view.setSnapPreview(0, 0, false); view.render(); }
     }
     $('toolClick').onclick = () => { State.setTool('click'); syncToolUI(); };
     $('toolBrush').onclick = () => { State.setTool('brush'); syncToolUI(); };
     $('clickSingle').onclick = () => { State.setClickMode('single'); syncToolUI(); };
     $('clickBrushSel').onclick = () => { State.setClickMode('brush'); syncToolUI(); };
+    $('magSnap').onchange = e => { State.setMagSnap(e.target.checked); snapTarget = null; if (view) { view.setSnapPreview(0, 0, false); view.setHovered(0); view.render(); } };
     $('selAdd').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'add', radius: s.radius }); syncToolUI(); };
     $('selErase').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'erase', radius: s.radius }); syncToolUI(); };
     $('selRadius').oninput = e => { const s = State.getSelBrush(); State.setSelBrush({ mode: s.mode, radius: +e.target.value }); $('selRv').textContent = e.target.value; };

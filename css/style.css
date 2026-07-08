@@ -120,6 +120,8 @@ body.brush-mode .brush-opts{display:block}
 body.brush-mode .click-opts{display:none}
 .selbrush-opts{display:none;margin-top:8px}
 body.sel-brush-mode .selbrush-opts{display:block}
+.single-opts{display:block;margin-top:8px}
+body.sel-brush-mode .single-opts{display:none}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100}
 .modal-overlay.hidden{display:none}
 .modal{background:var(--panel);border-radius:12px;padding:26px 30px;max-width:440px;box-shadow:0 12px 44px rgba(0,0,0,.28);text-align:center}
