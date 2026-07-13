@@ -19,8 +19,9 @@
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
   const SNAP_SCREEN_R = 14;                   // magnetic-snap reach (screen px) for single-click select
   let snapTarget = null;                      // {seg,x,y} nearest segment under the cursor (magnetic snap preview)
-  let curGeom = null;                         // current unit's geometry.json ({metric,unit,segments}) or null
+  let curGeom = null;                         // current unit's geometry.json ({metric,unit,segments,filter,raw}) or null
   let geomLo = 0, geomHi = 0, geomMin = 0, geomMax = 0;   // data range [lo,hi] and current filter window [min,max]
+  let geomSaveTimer = null, pendingGeom = null;   // debounced write-back of the reviewer's radius window into geometry.json
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -200,6 +201,7 @@
     commitActiveStroke();     // never let a live stroke bleed onto the frame we're switching to
     exitCopyPick();           // leaving a frame cancels an in-progress copy-from-frame pick
     flushAutoSave();          // persist the outgoing unit before we move off it
+    flushGeomWrite(false);    // persist the outgoing unit's radius window (if auto-save is on)
     const gen = ++navGen;     // overlapping (slow-disk) loads: only the newest navigation may apply
     const prevCi = ci, prevUi = ui;
     ci = nci; ui = nui;
@@ -356,7 +358,9 @@
     if (!has || !vals.length) { panel.classList.add('hidden'); curGeom = has ? curGeom : null; view.setVisibleSegs(null); return; }
     panel.classList.remove('hidden');
     geomLo = Math.min(...vals); geomHi = Math.max(...vals);
-    geomMin = geomLo; geomMax = geomHi;                       // reset the window to the full range on each unit
+    const clampG = v => Math.max(geomLo, Math.min(geomHi, v));
+    if (curGeom.filter) { geomMin = clampG(curGeom.filter.min); geomMax = Math.max(geomMin, clampG(curGeom.filter.max)); }  // restore the reviewer's saved window
+    else { geomMin = geomLo; geomMax = geomHi; }             // none saved yet -> full range (min..max)
     const step = Math.max((geomHi - geomLo) / 100, 0.01);
     ['geomMin', 'geomMax'].forEach(id => { const s = $(id); s.min = geomLo; s.max = geomHi; s.step = step; });
     $('geomMin').value = geomMin; $('geomMax').value = geomMax;
@@ -383,6 +387,25 @@
   function onGeomRange() {                                    // slider drag: keep min<=max, update labels, re-apply if enabled
     $('geomMinV').textContent = fmtN(geomMin); $('geomMaxV').textContent = fmtN(geomMax);
     if (State.getGeomFilter()) applyGeomFilter(); else updateGeomCount();
+  }
+  // Persist the reviewer's radius window back into this unit's geometry.json (segments/other fields kept).
+  // Called on slider release; debounced. Range is per-unit; the on/off toggle stays a global preference.
+  function scheduleGeomSave() {
+    if (!curGeom || !curGeom.raw || !cur) return;
+    curGeom.filter = { min: geomMin, max: geomMax };
+    curGeom.raw.filter = { min: geomMin, max: geomMax };     // mutate the (cached) raw object so it round-trips in-session too
+    pendingGeom = { unit: cur.unit, raw: curGeom.raw };       // remember for nav-flush / manual save
+    if ($('autoSave').checked && rootHandle) {
+      if (geomSaveTimer) clearTimeout(geomSaveTimer);
+      geomSaveTimer = setTimeout(() => flushGeomWrite(false), 600);
+    }
+  }
+  function flushGeomWrite(force) {
+    if (geomSaveTimer) { clearTimeout(geomSaveTimer); geomSaveTimer = null; }
+    const p = pendingGeom;
+    if (!p || !p.unit || !p.unit.handle || !rootHandle || (!force && !$('autoSave').checked)) return;
+    pendingGeom = null;
+    FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).catch(() => {});   // best-effort; a filter write must never block
   }
   function ensureActiveClass() {
     if (!classes.length) { State.setActiveClass(null); return; }
@@ -998,6 +1021,7 @@
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
     try { if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; } }
     catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+    flushGeomWrite(true);     // persist the current unit's radius window on an explicit save, even if auto-save is off
     const map = new Map();
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
     let n = 0, failed = 0;
@@ -1211,6 +1235,7 @@
     $('geomEnable').onchange = e => { State.setGeomFilter(e.target.checked); applyGeomFilter(); };
     $('geomMin').oninput = e => { geomMin = Math.min(+e.target.value, geomMax); e.target.value = geomMin; onGeomRange(); };
     $('geomMax').oninput = e => { geomMax = Math.max(+e.target.value, geomMin); e.target.value = geomMax; onGeomRange(); };
+    $('geomMin').onchange = $('geomMax').onchange = scheduleGeomSave;   // write the range back on release (per-unit)
     $('selAdd').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'add', radius: s.radius }); syncToolUI(); };
     $('selErase').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'erase', radius: s.radius }); syncToolUI(); };
     $('selRadius').oninput = e => { const s = State.getSelBrush(); State.setSelBrush({ mode: s.mode, radius: +e.target.value }); $('selRv').textContent = e.target.value; };

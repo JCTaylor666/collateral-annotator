@@ -116,7 +116,11 @@
     const segments = {};
     for (const k in o.segments) { const v = Number(o.segments[k]); if (Number.isFinite(v)) segments[k] = v; }
     if (!Object.keys(segments).length) return null;
-    return { metric: String(o.metric || 'value'), unit: String(o.unit || ''), segments };
+    let filter = null;                                        // the reviewer's saved radius window (written back on slider change)
+    if (o.filter && Number.isFinite(Number(o.filter.min)) && Number.isFinite(Number(o.filter.max))) {
+      filter = { min: Number(o.filter.min), max: Number(o.filter.max) };
+    }
+    return { metric: String(o.metric || 'value'), unit: String(o.unit || ''), segments, filter, raw: o };
   }
 
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode

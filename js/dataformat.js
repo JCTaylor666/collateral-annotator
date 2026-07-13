@@ -14,6 +14,7 @@
 │  │  ├─ frames.png             ← input · DSA frame image (grayscale PNG)
 │  │  ├─ label.npy              ← input · segment-id map (this frame's segmentation)
 │  │  ├─ mask.npy               ← input · 0/1 vessel mask (optional)
+│  │  ├─ geometry.json          ← input+output · per-segment radius + saved filter (optional)
 │  │  ├─ annotation.json        ← output · your annotations for this frame
 │  │  └─ note.json              ← output · frame note + numbered markers
 │  ├─ frame_1/ …
@@ -34,6 +35,15 @@
 <div class="doc-sec"><h4><code>mask.npy</code> — input, optional</h4><ul>
 <li>2-D <code>(H, W)</code> uint8 array of 0/1: the vessel mask. Rendered as the bright-blue overlay; also limits the brush when “Foreground only” is checked.</li>
 <li>If missing, or its shape mismatches label.npy, it is silently ignored (no overlay).</li>
+</ul></div>
+<div class="doc-sec"><h4><code>geometry.json</code> — input + output, optional</h4>
+<pre class="doc-tree">{ "metric": "radius", "unit": "px",
+  "segments": { "1": 2.0, "2": 4.0, "12": 16.0 },
+  "filter": { "min": 4.8, "max": 15.4 } }</pre>
+<ul>
+<li><code>segments</code> — one scalar per label segment id (your pipeline's value, e.g. vessel radius). Drives the “Segment geometry” panel: stats (count / min / max / mean / median) and the radius range filter. Segments with no entry are always shown.</li>
+<li><code>filter</code> — the reviewer's radius window; the tool writes it back (min/max only) whenever you move the sliders, so each frame reopens with its last-used range. Default at generation = full range. The filter on/off toggle is a global app preference, not stored here.</li>
+<li>Absent or unparseable → the panel and filter simply don't appear. Only <code>filter</code> is ever written; <code>segments</code> and any other fields are preserved.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>annotation.json</code> — output</h4>
 <p class="doc-p">Written into each frame folder on save / auto-save:</p>
@@ -91,6 +101,7 @@
 │  │  ├─ frames.png             ← 输入 · DSA 帧图像（灰度 PNG）
 │  │  ├─ label.npy              ← 输入 · 血管段 id 图（本帧自己的分割）
 │  │  ├─ mask.npy               ← 输入 · 0/1 血管 mask（可选）
+│  │  ├─ geometry.json          ← 输入+输出 · 每段半径 + 保存的过滤区间（可选）
 │  │  ├─ annotation.json        ← 输出 · 本帧的标注结果
 │  │  └─ note.json              ← 输出 · 本帧笔记 + 编号标记
 │  ├─ frame_1/ …
@@ -111,6 +122,15 @@
 <div class="doc-sec"><h4><code>mask.npy</code> — 输入，可选</h4><ul>
 <li>二维 <code>(H, W)</code> uint8 的 0/1 血管 mask。显示为亮蓝叠加层；勾选“仅前景”时限制笔刷范围。</li>
 <li>缺失或尺寸不匹配时静默忽略（不显示叠加层）。</li>
+</ul></div>
+<div class="doc-sec"><h4><code>geometry.json</code> — 输入 + 输出，可选</h4>
+<pre class="doc-tree">{ "metric": "radius", "unit": "px",
+  "segments": { "1": 2.0, "2": 4.0, "12": 16.0 },
+  "filter": { "min": 4.8, "max": 15.4 } }</pre>
+<ul>
+<li><code>segments</code> — 每个 label 段一个标量（你的流水线算的值，如血管半径）。驱动“分区几何”面板:统计(段数/最小/最大/均值/中位)和半径区间过滤。没给值的段始终显示。</li>
+<li><code>filter</code> — 医生用的半径区间;每次拖动滑块工具会把它(仅 min/max)写回,这样每帧重开时恢复上次用的区间。生成时默认 = 满量程。过滤的开/关是全局应用偏好,不存在这里。</li>
+<li>缺失或无法解析 → 面板与过滤都不出现。只会写回 <code>filter</code>;<code>segments</code> 及其它字段都保留。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>annotation.json</code> — 输出</h4>
 <p class="doc-p">保存 / 自动保存时写入每个帧文件夹：</p>
