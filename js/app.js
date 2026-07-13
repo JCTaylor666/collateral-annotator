@@ -1128,12 +1128,11 @@
     State.markDirty(cur.caseId, cur.unitId);
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
-  function stepUnit(d) {
+  function stepUnit(d) {                                      // frame nav (arrows + ‹Prev/Next›): stays WITHIN the case
     if (!cases.length) return;
-    let nu = ui + d, nc = ci;
-    if (nu < 0) { nc = ci - 1; if (nc < 0) return; nu = cases[nc].units.length - 1; }
-    else if (nu >= curCase().units.length) { nc = ci + 1; if (nc >= cases.length) return; nu = 0; }
-    showUnit(nc, nu);
+    const nu = ui + d;
+    if (nu < 0 || nu >= curCase().units.length) return;       // clamp at the case's first/last unit; use « / » to change case
+    showUnit(ci, nu);
   }
   function stepCase(d) { const nc = ci + d; if (nc < 0 || nc >= cases.length) return; showUnit(nc, 0); }
   function onResize() { if (view) { view.layout(); view.render(); updateZoomReadout(); } applyLoupeSize(); }
