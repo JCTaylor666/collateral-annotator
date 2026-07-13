@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vessel Annotator</title>
-<link rel="stylesheet" href="./css/style.css?v=41">
+<link rel="stylesheet" href="./css/style.css?v=42">
 <!-- GoatCounter privacy-friendly page-visit analytics (no cookies; counts page loads of this site only, never touches the user's local data files) -->
 <script data-goatcounter="https://jctaylor666.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
@@ -68,9 +68,10 @@
     <details class="grp hidden" id="geomPanel" open>
       <summary><span class="chev">▶</span><span data-i18n="geomGroup">Segment geometry</span></summary>
       <div class="grp-body">
+        <div class="ctl-row hidden" id="geomMetricRow"><label data-i18n="geomMetricLabel">Metric</label><select id="geomMetric"></select></div>
         <div id="geomStats" class="ro muted geom-stats"></div>
         <div id="geomHist" class="geom-hist"></div>
-        <label class="check-row"><input type="checkbox" id="geomEnable"> <span data-i18n="geomEnableLabel">Filter by radius</span></label>
+        <label class="check-row"><input type="checkbox" id="geomEnable"> <span data-i18n="geomEnableLabel">Enable filter</span></label>
         <div class="ctl-row"><label data-i18n="geomMinLabel">Min</label><input id="geomMin" type="range" min="0" max="1" value="0"><span id="geomMinV" class="val">0</span></div>
         <div class="ctl-row"><label data-i18n="geomMaxLabel">Max</label><input id="geomMax" type="range" min="0" max="1" value="1"><span id="geomMaxV" class="val">0</span></div>
         <div id="geomCount" class="ro muted"></div>
@@ -205,15 +206,15 @@
   </div>
 </div>
 
-<script src="./js/i18n.js?v=41"></script>
-<script src="./js/npy.js?v=41"></script>
-<script src="./js/fs.js?v=41"></script>
-<script src="./js/loader.js?v=41"></script>
-<script src="./js/canvas.js?v=41"></script>
-<script src="./js/state.js?v=41"></script>
-<script src="./js/loupe.js?v=41"></script>
-<script src="./js/perfusion.js?v=41"></script>
-<script src="./js/dataformat.js?v=41"></script>
-<script src="./js/app.js?v=41"></script>
+<script src="./js/i18n.js?v=42"></script>
+<script src="./js/npy.js?v=42"></script>
+<script src="./js/fs.js?v=42"></script>
+<script src="./js/loader.js?v=42"></script>
+<script src="./js/canvas.js?v=42"></script>
+<script src="./js/state.js?v=42"></script>
+<script src="./js/loupe.js?v=42"></script>
+<script src="./js/perfusion.js?v=42"></script>
+<script src="./js/dataformat.js?v=42"></script>
+<script src="./js/app.js?v=42"></script>
 </body>
 </html>

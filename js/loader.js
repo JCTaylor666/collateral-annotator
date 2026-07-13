@@ -106,21 +106,28 @@
     try { const h = await unit.handle.getFileHandle('note.json'); return { note: JSON.parse(await (await h.getFile()).text()) }; }
     catch (e) { return { note: null }; }
   }
-  // Optional geometry.json: per-segment scalar (e.g. vessel radius) that drives the stats + filter UI.
-  // { schema_version, metric, unit, segments: { "<segId>": <number> } }. Absent/broken -> null (feature off).
+  // Optional geometry.json: per-segment named metrics that drive the stats + filter UI.
+  // { segments: { "<segId>": { "<metric>": <number>, ... } }, filter?: {metric,min,max} }.
+  // Legacy form { metric, segments:{ "<segId>": <number> } } is still accepted (one metric).
+  // Absent/broken -> null (feature off). Normalizes to { metrics:[names], values:{name:{segId:num}}, filter, raw }.
   async function readGeometry(unit) {
     let o;
     try { const h = await unit.handle.getFileHandle('geometry.json'); o = JSON.parse(await (await h.getFile()).text()); }
     catch (e) { return null; }                                  // absent or unparseable — feature simply off
     if (!o || typeof o.segments !== 'object' || !o.segments) return null;
-    const segments = {};
-    for (const k in o.segments) { const v = Number(o.segments[k]); if (Number.isFinite(v)) segments[k] = v; }
-    if (!Object.keys(segments).length) return null;
-    let filter = null;                                        // the reviewer's saved radius window (written back on slider change)
-    if (o.filter && Number.isFinite(Number(o.filter.min)) && Number.isFinite(Number(o.filter.max))) {
-      filter = { min: Number(o.filter.min), max: Number(o.filter.max) };
+    const values = {}, metrics = [];
+    const add = (name, id, raw) => { const v = Number(raw); if (!Number.isFinite(v)) return; if (!values[name]) { values[name] = {}; metrics.push(name); } values[name][id] = v; };
+    for (const id in o.segments) {
+      const sv = o.segments[id];
+      if (sv && typeof sv === 'object') { for (const m in sv) add(m, id, sv[m]); }   // { radius:.., length:.. }
+      else add(String(o.metric || 'value'), id, sv);                                  // legacy: bare number
     }
-    return { metric: String(o.metric || 'value'), unit: String(o.unit || ''), segments, filter, raw: o };
+    if (!metrics.length) return null;
+    let filter = null;                                        // the reviewer's saved window (written back on slider change)
+    if (o.filter && Number.isFinite(Number(o.filter.min)) && Number.isFinite(Number(o.filter.max))) {
+      filter = { metric: o.filter.metric != null ? String(o.filter.metric) : null, min: Number(o.filter.min), max: Number(o.filter.max) };
+    }
+    return { metrics, values, filter, raw: o };
   }
 
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode

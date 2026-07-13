@@ -122,7 +122,7 @@ body.brush-mode .click-opts{display:none}
 body.sel-brush-mode .selbrush-opts{display:block}
 .single-opts{display:block;margin-top:8px}
 body.sel-brush-mode .single-opts{display:none}
-#geomPanel.hidden{display:none}
+#geomPanel.hidden,#geomMetricRow.hidden{display:none}
 .geom-stats{line-height:1.6;margin-bottom:6px}
 .geom-hist{display:flex;align-items:flex-end;gap:2px;height:34px;margin:2px 0 8px;padding:3px;border:1px solid var(--border);border-radius:6px}
 .geom-hist i{flex:1;background:var(--accent);min-height:1px;border-radius:1px;opacity:.85}

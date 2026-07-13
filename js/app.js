@@ -19,8 +19,8 @@
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
   const SNAP_SCREEN_R = 14;                   // magnetic-snap reach (screen px) for single-click select
   let snapTarget = null;                      // {seg,x,y} nearest segment under the cursor (magnetic snap preview)
-  let curGeom = null;                         // current unit's geometry.json ({metric,unit,segments,filter,raw}) or null
-  let geomLo = 0, geomHi = 0, geomMin = 0, geomMax = 0;   // data range [lo,hi] and current filter window [min,max]
+  let curGeom = null;                         // current unit's geometry.json ({metrics,values,filter,raw}) or null
+  let geomLo = 0, geomHi = 0, geomMin = 0, geomMax = 0, geomMetric = null;   // active metric name + its data range [lo,hi] and filter window [min,max]
   let geomSaveTimer = null, pendingGeom = null;   // debounced write-back of the reviewer's radius window into geometry.json
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
@@ -321,12 +321,12 @@
     return m;
   }
 
-  // ---- geometry (per-segment radius) stats + filter ----
+  // ---- geometry (per-segment named metrics) stats + filter ----
   const geomActive = () => !!(curGeom && State.getGeomFilter());
-  function segRadius(seg) { const v = curGeom && curGeom.segments[String(seg)]; return typeof v === 'number' ? v : null; }
-  function segVisible(seg) {                                   // filter off, or seg has no radius -> always visible
+  function segVal(seg) { const t = curGeom && geomMetric && curGeom.values[geomMetric]; const v = t && t[String(seg)]; return typeof v === 'number' ? v : null; }
+  function segVisible(seg) {                                   // filter off, or seg has no value for the active metric -> always visible
     if (!geomActive()) return true;
-    const r = segRadius(seg);
+    const r = segVal(seg);
     return r == null ? true : (r >= geomMin - 1e-9 && r <= geomMax + 1e-9);
   }
   function computeVisibleSegs() {                             // Set of segs to draw in the mask overlay (null = no filter)
@@ -352,15 +352,26 @@
   }
   function refreshGeomPanel() {                               // show/populate the panel for the current unit (or hide it)
     const panel = $('geomPanel'); if (!panel) return;
-    const has = !!(cur && !cur.virtual && !cur.mismatch && curGeom);
-    let vals = [];
-    if (has) { vals = view.labelSegs().map(segRadius).filter(v => v != null); }
-    if (!has || !vals.length) { panel.classList.add('hidden'); curGeom = has ? curGeom : null; view.setVisibleSegs(null); return; }
+    const has = !!(cur && !cur.virtual && !cur.mismatch && curGeom && curGeom.metrics && curGeom.metrics.length);
+    if (!has) { panel.classList.add('hidden'); view.setVisibleSegs(null); return; }
+    const metrics = curGeom.metrics;
+    geomMetric = (curGeom.filter && curGeom.filter.metric && metrics.indexOf(curGeom.filter.metric) >= 0) ? curGeom.filter.metric : metrics[0];
+    const sel = $('geomMetric');
+    sel.innerHTML = metrics.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+    sel.value = geomMetric;
+    $('geomMetricRow').classList.toggle('hidden', metrics.length <= 1);   // show the dropdown only when there's a choice
     panel.classList.remove('hidden');
+    setupGeomRangeForMetric(true);
+  }
+  // compute the ACTIVE metric's data range, (optionally) restore its saved window, refresh stats + filter
+  function setupGeomRangeForMetric(restore) {
+    const vals = view.labelSegs().map(segVal).filter(v => v != null);
+    if (!vals.length) { $('geomPanel').classList.add('hidden'); view.setVisibleSegs(null); return; }
     geomLo = Math.min(...vals); geomHi = Math.max(...vals);
     const clampG = v => Math.max(geomLo, Math.min(geomHi, v));
-    if (curGeom.filter) { geomMin = clampG(curGeom.filter.min); geomMax = Math.max(geomMin, clampG(curGeom.filter.max)); }  // restore the reviewer's saved window
-    else { geomMin = geomLo; geomMax = geomHi; }             // none saved yet -> full range (min..max)
+    const saved = (restore && curGeom.filter && curGeom.filter.metric === geomMetric) ? curGeom.filter : null;
+    if (saved) { geomMin = clampG(saved.min); geomMax = Math.max(geomMin, clampG(saved.max)); }   // restore this metric's saved window
+    else { geomMin = geomLo; geomMax = geomHi; }               // otherwise full range (min..max)
     const step = Math.max((geomHi - geomLo) / 100, 0.01);
     ['geomMin', 'geomMax'].forEach(id => { const s = $(id); s.min = geomLo; s.max = geomHi; s.step = step; });
     $('geomMin').value = geomMin; $('geomMax').value = geomMax;
@@ -373,8 +384,7 @@
     const n = vals.length, sorted = [...vals].sort((a, b) => a - b);
     const mean = vals.reduce((a, b) => a + b, 0) / n;
     const med = n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
-    const u = curGeom.unit ? ' ' + curGeom.unit : '';
-    $('geomStats').textContent = I18n.t('geomStatsFmt', { metric: curGeom.metric, n, min: fmtN(geomLo) + u, max: fmtN(geomHi) + u, mean: fmtN(mean) + u, med: fmtN(med) + u });
+    $('geomStats').textContent = I18n.t('geomStatsFmt', { metric: geomMetric, n, min: fmtN(geomLo), max: fmtN(geomHi), mean: fmtN(mean), med: fmtN(med) });
     buildGeomHistogram(sorted);
   }
   function buildGeomHistogram(sorted) {
@@ -392,8 +402,8 @@
   // Called on slider release; debounced. Range is per-unit; the on/off toggle stays a global preference.
   function scheduleGeomSave() {
     if (!curGeom || !curGeom.raw || !cur) return;
-    curGeom.filter = { min: geomMin, max: geomMax };
-    curGeom.raw.filter = { min: geomMin, max: geomMax };     // mutate the (cached) raw object so it round-trips in-session too
+    curGeom.filter = { metric: geomMetric, min: geomMin, max: geomMax };
+    curGeom.raw.filter = { metric: geomMetric, min: geomMin, max: geomMax };   // mutate the (cached) raw object so it round-trips in-session too
     pendingGeom = { unit: cur.unit, raw: curGeom.raw };       // remember for nav-flush / manual save
     if ($('autoSave').checked && rootHandle) {
       if (geomSaveTimer) clearTimeout(geomSaveTimer);
@@ -1236,6 +1246,7 @@
     $('geomMin').oninput = e => { geomMin = Math.min(+e.target.value, geomMax); e.target.value = geomMin; onGeomRange(); };
     $('geomMax').oninput = e => { geomMax = Math.max(+e.target.value, geomMin); e.target.value = geomMax; onGeomRange(); };
     $('geomMin').onchange = $('geomMax').onchange = scheduleGeomSave;   // write the range back on release (per-unit)
+    $('geomMetric').onchange = e => { geomMetric = e.target.value; setupGeomRangeForMetric(true); scheduleGeomSave(); };
     $('selAdd').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'add', radius: s.radius }); syncToolUI(); };
     $('selErase').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'erase', radius: s.radius }); syncToolUI(); };
     $('selRadius').oninput = e => { const s = State.getSelBrush(); State.setSelBrush({ mode: s.mode, radius: +e.target.value }); $('selRv').textContent = e.target.value; };
