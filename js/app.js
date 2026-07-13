@@ -19,6 +19,8 @@
   const UNCLASSIFIED_RGB = [39, 174, 96];     // green fallback for segments with no class
   const SNAP_SCREEN_R = 14;                   // magnetic-snap reach (screen px) for single-click select
   let snapTarget = null;                      // {seg,x,y} nearest segment under the cursor (magnetic snap preview)
+  let curGeom = null;                         // current unit's geometry.json ({metric,unit,segments}) or null
+  let geomLo = 0, geomHi = 0, geomMin = 0, geomMax = 0;   // data range [lo,hi] and current filter window [min,max]
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -217,6 +219,7 @@
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
+    curGeom = data.geometry || null;                          // per-segment radius (drives the geometry stats + filter panel)
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setPerfLegend(0);
     view.setSelected(selColorMap());
@@ -224,7 +227,7 @@
     refreshDots();
     exitMarkerArm(); refreshMarkers();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); buildFrameList();
+    refreshMeta(); buildFrameList(); refreshGeomPanel();
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
@@ -240,6 +243,7 @@
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
     const W = perf.W, H = perf.H;
     cur = { W, H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
+    curGeom = null; refreshGeomPanel();                     // perfusion unit has no geometry — hide the panel
     view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
     view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
     view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
@@ -259,6 +263,7 @@
     State.markVisited(c.id, u.id);
     u.mismatch = true;                                        // let save()/star skip it even before it's re-opened
     cur = { W: data.W || 0, H: data.H || 0, caseId: c.id, unitId: u.id, unit: u, mismatch: true };
+    curGeom = null; refreshGeomPanel();                     // shape-mismatch unit has no geometry — hide the panel
     const fmt = s => Array.isArray(s) ? s.join(' × ') : String(s);
     const keyOf = s => Array.isArray(s) ? s.join('x') : null;
     // Mark each file against the MAJORITY shape (so the real odd-one-out gets the ✗, even when it's
@@ -291,7 +296,10 @@
 
   function refreshDots() {
     if (!cur) return;
-    view.setDots(State.selectedClicks(cur.caseId, cur.unitId).concat(State.pointList(cur.caseId, cur.unitId)));
+    const segDots = geomActive()
+      ? State.selectedSegs(cur.caseId, cur.unitId).filter(it => segVisible(it.seg) && it.xy && it.xy[0] >= 0 && it.xy[1] >= 0).map(it => it.xy)
+      : State.selectedClicks(cur.caseId, cur.unitId);
+    view.setDots(segDots.concat(State.pointList(cur.caseId, cur.unitId)));
   }
   function refreshCanvasSelection() {
     view.setSelected(selColorMap());
@@ -307,8 +315,74 @@
   function selColorMap() {
     const m = new Map();
     if (!cur) return m;
-    for (const it of State.selectedSegs(cur.caseId, cur.unitId)) m.set(it.seg, segRgb(it.cls));
+    for (const it of State.selectedSegs(cur.caseId, cur.unitId)) { if (segVisible(it.seg)) m.set(it.seg, segRgb(it.cls)); }
     return m;
+  }
+
+  // ---- geometry (per-segment radius) stats + filter ----
+  const geomActive = () => !!(curGeom && State.getGeomFilter());
+  function segRadius(seg) { const v = curGeom && curGeom.segments[String(seg)]; return typeof v === 'number' ? v : null; }
+  function segVisible(seg) {                                   // filter off, or seg has no radius -> always visible
+    if (!geomActive()) return true;
+    const r = segRadius(seg);
+    return r == null ? true : (r >= geomMin - 1e-9 && r <= geomMax + 1e-9);
+  }
+  function computeVisibleSegs() {                             // Set of segs to draw in the mask overlay (null = no filter)
+    if (!geomActive() || !cur) return null;
+    const set = new Set();
+    for (const s of view.labelSegs()) if (segVisible(s)) set.add(s);
+    return set;
+  }
+  function applyGeomFilter() {                                // push the current filter into the view + refresh dependent layers
+    if (!cur || cur.virtual || cur.mismatch) { view.setVisibleSegs(null); return; }
+    view.setVisibleSegs(computeVisibleSegs());
+    view.setSelected(selColorMap());                          // drop green highlight of hidden selected segs
+    refreshDots();                                            // drop red dots of hidden segs
+    view.render();
+    updateGeomCount();
+  }
+  const fmtN = v => (Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(1));
+  function updateGeomCount() {
+    const el = $('geomCount'); if (!el || !curGeom || !cur) return;
+    const all = view.labelSegs();
+    const shown = geomActive() ? all.filter(segVisible).length : all.length;
+    el.textContent = I18n.t('geomShowingFmt', { x: shown, n: all.length });
+  }
+  function refreshGeomPanel() {                               // show/populate the panel for the current unit (or hide it)
+    const panel = $('geomPanel'); if (!panel) return;
+    const has = !!(cur && !cur.virtual && !cur.mismatch && curGeom);
+    let vals = [];
+    if (has) { vals = view.labelSegs().map(segRadius).filter(v => v != null); }
+    if (!has || !vals.length) { panel.classList.add('hidden'); curGeom = has ? curGeom : null; view.setVisibleSegs(null); return; }
+    panel.classList.remove('hidden');
+    geomLo = Math.min(...vals); geomHi = Math.max(...vals);
+    geomMin = geomLo; geomMax = geomHi;                       // reset the window to the full range on each unit
+    const step = Math.max((geomHi - geomLo) / 100, 0.01);
+    ['geomMin', 'geomMax'].forEach(id => { const s = $(id); s.min = geomLo; s.max = geomHi; s.step = step; });
+    $('geomMin').value = geomMin; $('geomMax').value = geomMax;
+    $('geomMinV').textContent = fmtN(geomMin); $('geomMaxV').textContent = fmtN(geomMax);
+    $('geomEnable').checked = State.getGeomFilter();
+    updateGeomStats(vals);
+    applyGeomFilter();
+  }
+  function updateGeomStats(vals) {
+    const n = vals.length, sorted = [...vals].sort((a, b) => a - b);
+    const mean = vals.reduce((a, b) => a + b, 0) / n;
+    const med = n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+    const u = curGeom.unit ? ' ' + curGeom.unit : '';
+    $('geomStats').textContent = I18n.t('geomStatsFmt', { metric: curGeom.metric, n, min: fmtN(geomLo) + u, max: fmtN(geomHi) + u, mean: fmtN(mean) + u, med: fmtN(med) + u });
+    buildGeomHistogram(sorted);
+  }
+  function buildGeomHistogram(sorted) {
+    const host = $('geomHist'); if (!host) return;
+    const BINS = 14, lo = geomLo, hi = geomHi, span = (hi - lo) || 1, counts = new Array(BINS).fill(0);
+    for (const v of sorted) { let b = Math.floor((v - lo) / span * BINS); if (b >= BINS) b = BINS - 1; if (b < 0) b = 0; counts[b]++; }
+    const peak = Math.max(1, ...counts);
+    host.innerHTML = counts.map(c => '<i style="height:' + Math.round(c / peak * 100) + '%"></i>').join('');
+  }
+  function onGeomRange() {                                    // slider drag: keep min<=max, update labels, re-apply if enabled
+    $('geomMinV').textContent = fmtN(geomMin); $('geomMaxV').textContent = fmtN(geomMax);
+    if (State.getGeomFilter()) applyGeomFilter(); else updateGeomCount();
   }
   function ensureActiveClass() {
     if (!classes.length) { State.setActiveClass(null); return; }
@@ -656,6 +730,7 @@
     else { const s = view.segAt(x, y); snap = s ? { seg: s, x, y } : null; }
     if (snap) {
       const seg = snap.seg;
+      if (!segVisible(seg)) return;                          // clicking a filtered-out (hidden) vessel does nothing
       // paint ⟂ selection: if this click will SELECT the segment, wipe any paint under it first
       if (State.hasPaint(cur.caseId, cur.unitId)) {
         const now = State.selectedSegs(cur.caseId, cur.unitId).find(s => s.seg === seg);
@@ -693,12 +768,13 @@
     // will land (hollow ring). With snap OFF: just highlight the segment exactly under the cursor, no ring.
     if (State.getMagSnap()) {
       const snap = view.nearestSegNear(x, y, SNAP_SCREEN_R);
-      snapTarget = snap;
-      view.setHovered(snap ? snap.seg : 0);
-      view.setSnapPreview(snap ? snap.x : 0, snap ? snap.y : 0, !!snap);
+      const vis = snap && segVisible(snap.seg);              // don't snap to / preview a filtered-out vessel
+      snapTarget = vis ? snap : null;
+      view.setHovered(vis ? snap.seg : 0);
+      view.setSnapPreview(vis ? snap.x : 0, vis ? snap.y : 0, !!vis);
     } else {
       snapTarget = null;
-      view.setHovered(seg);                                 // exact segment under cursor (0 = background)
+      view.setHovered(segVisible(seg) ? seg : 0);           // exact segment under cursor (0 = background or hidden)
       view.setSnapPreview(0, 0, false);
     }
     if (!hovRAF) { hovRAF = true; requestAnimationFrame(() => { hovRAF = false; view.render(); }); }
@@ -1132,6 +1208,9 @@
     $('clickSingle').onclick = () => { State.setClickMode('single'); syncToolUI(); };
     $('clickBrushSel').onclick = () => { State.setClickMode('brush'); syncToolUI(); };
     $('magSnap').onchange = e => { State.setMagSnap(e.target.checked); snapTarget = null; if (view) { view.setSnapPreview(0, 0, false); view.setHovered(0); view.render(); } };
+    $('geomEnable').onchange = e => { State.setGeomFilter(e.target.checked); applyGeomFilter(); };
+    $('geomMin').oninput = e => { geomMin = Math.min(+e.target.value, geomMax); e.target.value = geomMin; onGeomRange(); };
+    $('geomMax').oninput = e => { geomMax = Math.max(+e.target.value, geomMin); e.target.value = geomMax; onGeomRange(); };
     $('selAdd').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'add', radius: s.radius }); syncToolUI(); };
     $('selErase').onclick = () => { const s = State.getSelBrush(); State.setSelBrush({ mode: 'erase', radius: s.radius }); syncToolUI(); };
     $('selRadius').oninput = e => { const s = State.getSelBrush(); State.setSelBrush({ mode: s.mode, radius: +e.target.value }); $('selRv').textContent = e.target.value; };

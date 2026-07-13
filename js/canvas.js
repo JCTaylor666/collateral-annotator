@@ -18,6 +18,7 @@
     let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color)
     let brushActive = false;   // when the brush tool is active, floor the paint-layer alpha so strokes are never invisible
     let maskData = null, maskOpacity = 0.45;
+    let visibleSegs = null;   // geometry filter: a Set of segment ids to show (null = no filter, show full mask.npy)
     let dots = [];   // recorded click coords [x,y] to mark with red dots
     let noteMks = [], noteMkHi = 0;   // note markers [{id, xy}] + highlighted id (chip hover)
     let gray = null, center = 128, width = 255;
@@ -36,6 +37,7 @@
 
     function setUnit(image, w, h, lab, maskArr, isColor) {
       placeholder = null;                        // a real image clears any diagnostic placeholder
+      visibleSegs = null;                        // clear any geometry filter; app re-applies for the new unit
       if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
       colorMode = !!isColor; colorImg = isColor ? image : null;   // perfusion: show the colour image as-is
@@ -83,11 +85,18 @@
     function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) fillPixels(hovCtx, segPixels(hov), HOV_RGB); }
     function buildMaskLayer() {
       maskCtx.clearRect(0, 0, W, H);
-      if (!maskData) return;
       const id = maskCtx.createImageData(W, H), d = id.data;
+      if (visibleSegs) {                                     // geometry filter on: overlay only in-range segments (from label)
+        if (!label) return;
+        for (let i = 0; i < label.length; i++) { const s = label[i]; if (s && visibleSegs.has(s)) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
+        maskCtx.putImageData(id, 0, 0); return;
+      }
+      if (!maskData) return;
       for (let i = 0; i < maskData.length; i++) { if (maskData[i]) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
       maskCtx.putImageData(id, 0, 0);
     }
+    // geometry filter: Set of visible segment ids (mask overlay shows only these). null clears the filter.
+    function setVisibleSegs(s) { visibleSegs = (s instanceof Set) ? s : null; buildMaskLayer(); }
 
     // ---- brush paint layer ----
     function buildPaintLayer() {
@@ -352,6 +361,7 @@
     function inBounds(x, y) { return x >= 0 && y >= 0 && x < W && y < H; }
     function segAt(x, y) { return inBounds(x, y) ? label[y * W + x] : 0; }
     function segSize(seg) { return segPixels(seg).length; }
+    function labelSegs() { return segPix ? [...segPix.keys()] : []; }   // all segment ids present in the current label
     // Nearest non-background segment to (cx,cy) for magnetic-snap select. screenR is a SCREEN-pixel
     // reach converted to image px via the current zoom, so the snap feels constant on screen.
     // Returns { seg, x, y } (x,y = the segment pixel to record as the click point) or null.
@@ -398,7 +408,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

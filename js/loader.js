@@ -88,7 +88,8 @@
 
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
-    return { W, H, img, url, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
+    const geometry = await readGeometry(unit);
+    return { W, H, img, url, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
@@ -104,6 +105,18 @@
   async function readNote(unit) {
     try { const h = await unit.handle.getFileHandle('note.json'); return { note: JSON.parse(await (await h.getFile()).text()) }; }
     catch (e) { return { note: null }; }
+  }
+  // Optional geometry.json: per-segment scalar (e.g. vessel radius) that drives the stats + filter UI.
+  // { schema_version, metric, unit, segments: { "<segId>": <number> } }. Absent/broken -> null (feature off).
+  async function readGeometry(unit) {
+    let o;
+    try { const h = await unit.handle.getFileHandle('geometry.json'); o = JSON.parse(await (await h.getFile()).text()); }
+    catch (e) { return null; }                                  // absent or unparseable — feature simply off
+    if (!o || typeof o.segments !== 'object' || !o.segments) return null;
+    const segments = {};
+    for (const k in o.segments) { const v = Number(o.segments[k]); if (Number.isFinite(v)) segments[k] = v; }
+    if (!Object.keys(segments).length) return null;
+    return { metric: String(o.metric || 'value'), unit: String(o.unit || ''), segments };
   }
 
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode

@@ -122,6 +122,10 @@ body.brush-mode .click-opts{display:none}
 body.sel-brush-mode .selbrush-opts{display:block}
 .single-opts{display:block;margin-top:8px}
 body.sel-brush-mode .single-opts{display:none}
+#geomPanel.hidden{display:none}
+.geom-stats{line-height:1.6;margin-bottom:6px}
+.geom-hist{display:flex;align-items:flex-end;gap:2px;height:34px;margin:2px 0 8px;padding:3px;border:1px solid var(--border);border-radius:6px}
+.geom-hist i{flex:1;background:var(--accent);min-height:1px;border-radius:1px;opacity:.85}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:100}
 .modal-overlay.hidden{display:none}
 .modal{background:var(--panel);border-radius:12px;padding:26px 30px;max-width:440px;box-shadow:0 12px 44px rgba(0,0,0,.28);text-align:center}

@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vessel Annotator</title>
-<link rel="stylesheet" href="./css/style.css?v=39">
+<link rel="stylesheet" href="./css/style.css?v=40">
 <!-- GoatCounter privacy-friendly page-visit analytics (no cookies; counts page loads of this site only, never touches the user's local data files) -->
 <script data-goatcounter="https://jctaylor666.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
@@ -62,6 +62,18 @@
       <div class="grp-body">
         <div class="ctl-row"><label data-i18n="opacityLabel">Highlight opacity</label><input id="opacity" type="range" min="0" max="100" value="55"></div>
         <div class="ctl-row"><label data-i18n="maskOpacityLabel">Vessel mask</label><input id="maskOpacity" type="range" min="0" max="100" value="45"></div>
+      </div>
+    </details>
+
+    <details class="grp hidden" id="geomPanel" open>
+      <summary><span class="chev">▶</span><span data-i18n="geomGroup">Segment geometry</span></summary>
+      <div class="grp-body">
+        <div id="geomStats" class="ro muted geom-stats"></div>
+        <div id="geomHist" class="geom-hist"></div>
+        <label class="check-row"><input type="checkbox" id="geomEnable"> <span data-i18n="geomEnableLabel">Filter by radius</span></label>
+        <div class="ctl-row"><label data-i18n="geomMinLabel">Min</label><input id="geomMin" type="range" min="0" max="1" value="0"><span id="geomMinV" class="val">0</span></div>
+        <div class="ctl-row"><label data-i18n="geomMaxLabel">Max</label><input id="geomMax" type="range" min="0" max="1" value="1"><span id="geomMaxV" class="val">0</span></div>
+        <div id="geomCount" class="ro muted"></div>
       </div>
     </details>
 
@@ -193,15 +205,15 @@
   </div>
 </div>
 
-<script src="./js/i18n.js?v=39"></script>
-<script src="./js/npy.js?v=39"></script>
-<script src="./js/fs.js?v=39"></script>
-<script src="./js/loader.js?v=39"></script>
-<script src="./js/canvas.js?v=39"></script>
-<script src="./js/state.js?v=39"></script>
-<script src="./js/loupe.js?v=39"></script>
-<script src="./js/perfusion.js?v=39"></script>
-<script src="./js/dataformat.js?v=39"></script>
-<script src="./js/app.js?v=39"></script>
+<script src="./js/i18n.js?v=40"></script>
+<script src="./js/npy.js?v=40"></script>
+<script src="./js/fs.js?v=40"></script>
+<script src="./js/loader.js?v=40"></script>
+<script src="./js/canvas.js?v=40"></script>
+<script src="./js/state.js?v=40"></script>
+<script src="./js/loupe.js?v=40"></script>
+<script src="./js/perfusion.js?v=40"></script>
+<script src="./js/dataformat.js?v=40"></script>
+<script src="./js/app.js?v=40"></script>
 </body>
 </html>
