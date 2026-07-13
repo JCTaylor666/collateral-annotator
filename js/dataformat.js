@@ -183,12 +183,157 @@
 <li>颜色<b>不</b>存在这里 — 颜色只存在浏览器本地。此文件自动创建/更新；如果磁盘上的标注用到了这里缺失的类别，打开时会自动补一个占位名。</li>
 </ul></div>`;
 
+  // Part 2: a self-contained spec the user can copy to any AI agent with zero prior context, so that
+  // agent can generate or read this dataset. Plain text (shown via textContent + copied verbatim).
+  const PROMPT = `You are generating (or reading) an on-disk dataset for a browser tool called "Vessel Annotator", which annotates leptomeningeal-collateral vessel segments on DSA (digital subtraction angiography) frames. This message is a COMPLETE, self-contained specification. Assume NO prior context. Follow it exactly.
+
+========================================
+OVERVIEW
+========================================
+The user opens ONE root folder. Inside it are CASE folders; inside each case are UNIT folders (one per DSA frame, plus optionally one "minip" minimum-intensity-projection unit). Each unit folder is self-contained. INPUT files (image + segmentation + optional geometry) are produced by your pipeline. OUTPUT files (annotations, notes, classes) are written by the tool during review — you normally do NOT create them, but their format is given for completeness.
+
+========================================
+FOLDER STRUCTURE
+========================================
+<root>/
+  classes.json                (optional, dataset-wide; the tool creates/updates it)
+  <case folder>/              (one per case)
+    <unit folder>/            (one per frame; plus optional "minip")
+      frames.png              (INPUT, required)
+      label.npy               (INPUT, required)
+      mask.npy                (INPUT, optional)
+      geometry.json           (INPUT + OUTPUT, optional)
+      annotation.json         (tool OUTPUT)
+      note.json               (tool OUTPUT)
+
+FOLDER NAMING & ORDERING
+- A folder counts as a CASE (and, inside it, a FRAME) only if its name CONTAINS A NUMBER: pure digits ("12"), a trailing "_<digits>" ("case_0001", "frame_3"), or a leading "<digits>_" ("12_patient", "0_scan"). The rest of the name is free text.
+- Cases and frames are sorted by that number. A unit folder named exactly "minip" is always listed LAST.
+- Hidden folders (starting with "."), folders with no number, and loose files are ignored.
+
+========================================
+COORDINATE CONVENTION (CRITICAL)
+========================================
+- Origin is top-left. x = column index (0 = left). y = row index (0 = top).
+- Everything is H rows by W columns. Flat index = y*W + x. In NumPy terms shape = (H, W), so H = shape[0], W = shape[1].
+- frames.png, label.npy, and mask.npy (if present) MUST all have EXACTLY the same width W and height H. If they disagree the tool shows that frame as a non-editable placeholder.
+
+========================================
+FILE: frames.png   (INPUT, required)
+========================================
+- Grayscale PNG of the DSA frame, size W x H.
+- The tool reads the RED channel as the raw gray value 0-255; a standard 8-bit grayscale PNG is fine.
+- Python: from PIL import Image; Image.fromarray(gray_uint8_HxW, mode="L").save("frames.png")
+
+========================================
+FILE: label.npy   (INPUT, required) -- the segmentation / "partition"
+========================================
+- A NumPy .npy array. 2-D, shape (H, W), C-order (row-major), little-endian.
+- dtype: uint16 preferred (uint8 / int32 / uint32 also accepted). Fortran order is REJECTED.
+- Pixel value = SEGMENT ID. 0 = background. 1..N = one id per vessel segment; EVERY pixel of a segment carries that segment's id.
+- Segment ids are LOCAL to each frame (they start at 1 and are independent per unit): id 5 in frame_0 is unrelated to id 5 in frame_1.
+- Python: import numpy as np; np.save("label.npy", label_HxW.astype(np.uint16))
+
+========================================
+FILE: mask.npy   (INPUT, optional) -- vessel foreground mask
+========================================
+- 2-D (H, W) uint8 of 0/1 (0 = background, 1 = vessel). Same W x H as label.npy.
+- If present it MUST match the frames.png / label.npy size (see the shape contract above).
+- Rendered as a blue overlay; also limits the pixel-paint brush when "foreground only" is on.
+- Python: np.save("mask.npy", (label_HxW > 0).astype(np.uint8))
+
+========================================
+FILE: geometry.json   (INPUT + OUTPUT, optional) -- per-segment metrics + saved filter
+========================================
+- JSON. "segments" is keyed by SEGMENT ID (the SAME integer as the label.npy pixel value, written as a string; background 0 excluded). Each value is an OBJECT of named numeric metrics your pipeline computes -- any names, any count.
+- Optional "filter" records the reviewer's last-used filter window: which metric + min + max. The tool WRITES this back when the reviewer drags the sliders. You may set a default (e.g. the first metric's full range) or omit it.
+- The tool NEVER changes "segments"; it only writes "filter", and preserves any other fields.
+- Example:
+  {
+    "segments": {
+      "1": { "radius": 2.0, "length": 40 },
+      "2": { "radius": 4.0, "length": 55 }
+    },
+    "filter": { "metric": "radius", "min": 2.0, "max": 4.0 }
+  }
+- Legacy form still accepted: { "metric": "radius", "segments": { "1": 2.0, "2": 4.0 } } (a bare number per segment = one metric named by "metric").
+
+========================================
+FILE: annotation.json   (tool OUTPUT -- format for reference)
+========================================
+{
+  "schema_version": 5,
+  "case": "<case folder name>",
+  "unit": "<unit folder name>",
+  "image_size": [W, H],
+  "coord_order": "xy",              // "xy" => click = [x, y]; "yx" => click = [y, x]. Applies to collaterals[].click and points[].click, NEVER to paint.
+  "collaterals": [                  // one entry per selected vessel segment
+    { "id": 12, "click": [321, 187], "class": 2 }   // id = segment id in label.npy; "class" omitted when unclassified
+  ],
+  "points": [                       // background clicks (red dots that hit no segment)
+    { "click": [40, 500], "class": 1 }
+  ],
+  "starred": true,                  // present (true) only when the frame is starred
+  "paint": {                        // brush pixel layer; present only if painted
+    "encoding": "rle_rows_v1",
+    "axes": "run=[row,col,length]; row=y image row (0=top); col=x of run start (0=left); length=consecutive pixels toward +x",
+    "width": W, "height": H,
+    "classes": { "2": [[10,40,12],[11,39,14]] }     // class index -> list of runs [row, col, length]
+  }
+}
+
+========================================
+FILE: note.json   (tool OUTPUT)
+========================================
+{ "schema_version": 1, "coord_order": "xy",
+  "text": "free-text note",
+  "markers": [ { "id": 1, "click": [321, 187] } ] }   // numbered circle markers; id = the shown number
+
+========================================
+FILE: classes.json   (tool OUTPUT, at the dataset ROOT)
+========================================
+{ "classes": [ { "index": 1, "name": "Collateral A" } ] }
+// index = the number stored in annotations ("class" fields and paint keys). Colors are NOT stored here.
+
+========================================
+MINIMAL GENERATOR (one valid frame), Python
+========================================
+  import numpy as np, json, os
+  from PIL import Image
+  H = W = 512
+  gray  = (np.random.rand(H, W) * 255).astype(np.uint8)
+  label = np.zeros((H, W), np.uint16)
+  label[100:140, 50:400] = 1                 # segment 1
+  label[200:260, 80:380] = 2                 # segment 2
+  d = "case_0001/frame_0"; os.makedirs(d, exist_ok=True)
+  Image.fromarray(gray, "L").save(d + "/frames.png")
+  np.save(d + "/label.npy", label)                          # (H, W) uint16, C-order, little-endian
+  np.save(d + "/mask.npy", (label > 0).astype(np.uint8))
+  json.dump({"segments": {"1": {"radius": 3.0}, "2": {"radius": 5.0}},
+             "filter": {"metric": "radius", "min": 3.0, "max": 5.0}},
+            open(d + "/geometry.json", "w"), indent=2)
+
+========================================
+CHECKLIST FOR VALID INPUT DATA
+========================================
+[ ] Every frame folder has frames.png + label.npy (required). mask.npy and geometry.json are optional.
+[ ] frames.png, label.npy, and mask.npy are all EXACTLY the same W x H.
+[ ] label.npy is 2-D (H, W), C-order, little-endian, uint16 (or uint8/int32/uint32); 0 = background, 1..N = segment ids.
+[ ] geometry.json keys equal the label.npy segment ids (as strings); each value is an object of numeric metrics.
+[ ] Case and frame folder names contain a number; a unit named exactly "minip" is allowed and sorts last.
+`;
+
   const S = {
-    en: { btn: 'Data format…', title: 'On-disk data format', close: 'Close', html: EN_HTML },
-    zh: { btn: '数据组织格式…', title: '磁盘数据组织格式', close: '关闭', html: ZH_HTML },
+    en: { btn: 'Data format…', title: 'On-disk data format', close: 'Close', html: EN_HTML,
+          tabHuman: 'For humans', tabPrompt: 'Copy for an AI agent', copy: 'Copy prompt', copied: 'Copied ✓',
+          promptIntro: 'Paste this to any AI agent (no prior context needed) so it can generate or read this dataset. The spec is exhaustive and self-contained.' },
+    zh: { btn: '数据组织格式…', title: '磁盘数据组织格式', close: '关闭', html: ZH_HTML,
+          tabHuman: '给人看', tabPrompt: '复制给 AI', copy: '复制 prompt', copied: '已复制 ✓',
+          promptIntro: '把下面这段(英文完整规格)复制给任意 AI agent(无需任何背景),它就能生成或读取这套数据。' },
   };
 
   let overlay = null, bodyEl = null, titleEl = null, closeBtn = null;
+  let promptEl = null, preEl = null, copyBtn = null, tabHumanBtn = null, tabPromptBtn = null, promptIntro = null, activeTab = 'human';
   const cur = () => S[window.I18n.getLang()] || S.en;
 
   function build() {
@@ -199,13 +344,40 @@
     box.className = 'modal doc-modal';
     const head = document.createElement('div'); head.className = 'doc-head';
     titleEl = document.createElement('h3'); titleEl.className = 'doc-title';
+    const tabs = document.createElement('div'); tabs.className = 'doc-tabs';
+    tabHumanBtn = document.createElement('button'); tabHumanBtn.className = 'btn sm'; tabHumanBtn.onclick = () => setTab('human');
+    tabPromptBtn = document.createElement('button'); tabPromptBtn.className = 'btn sm'; tabPromptBtn.onclick = () => setTab('prompt');
+    tabs.appendChild(tabHumanBtn); tabs.appendChild(tabPromptBtn);
     closeBtn = document.createElement('button'); closeBtn.className = 'btn sm'; closeBtn.onclick = close;
-    head.appendChild(titleEl); head.appendChild(closeBtn);
+    head.appendChild(titleEl); head.appendChild(tabs); head.appendChild(closeBtn);
+    // part 1: human-readable
     bodyEl = document.createElement('div'); bodyEl.className = 'doc-body';
-    box.appendChild(head); box.appendChild(bodyEl);
+    // part 2: copyable agent prompt
+    promptEl = document.createElement('div'); promptEl.className = 'doc-prompt hidden';
+    promptIntro = document.createElement('p'); promptIntro.className = 'doc-p';
+    copyBtn = document.createElement('button'); copyBtn.className = 'btn sm'; copyBtn.onclick = copyPrompt;
+    const wrap = document.createElement('div'); wrap.className = 'doc-prompt-wrap';
+    preEl = document.createElement('pre'); preEl.className = 'doc-prompt-text'; preEl.textContent = PROMPT;
+    wrap.appendChild(preEl);
+    promptEl.appendChild(promptIntro); promptEl.appendChild(copyBtn); promptEl.appendChild(wrap);
+    box.appendChild(head); box.appendChild(bodyEl); box.appendChild(promptEl);
     overlay.appendChild(box);
     overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
     document.body.appendChild(overlay);
+  }
+
+  function setTab(which) {
+    activeTab = which;
+    bodyEl.classList.toggle('hidden', which !== 'human');
+    promptEl.classList.toggle('hidden', which !== 'prompt');
+    tabHumanBtn.classList.toggle('active', which === 'human');
+    tabPromptBtn.classList.toggle('active', which === 'prompt');
+  }
+  function copyPrompt() {
+    const done = () => { copyBtn.textContent = cur().copied; setTimeout(() => { copyBtn.textContent = cur().copy; }, 1500); };
+    const fallback = () => { const r = document.createRange(); r.selectNodeContents(preEl); const s = getSelection(); s.removeAllRanges(); s.addRange(r); try { document.execCommand('copy'); } catch (e) {} s.removeAllRanges(); done(); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(PROMPT).then(done, fallback);
+    else fallback();
   }
 
   function renderText() {
@@ -214,7 +386,12 @@
     if (btn) btn.textContent = t.btn;
     titleEl.textContent = t.title;
     closeBtn.textContent = t.close;
+    tabHumanBtn.textContent = t.tabHuman;
+    tabPromptBtn.textContent = t.tabPrompt;
+    copyBtn.textContent = t.copy;
+    promptIntro.textContent = t.promptIntro;
     bodyEl.innerHTML = t.html;
+    setTab(activeTab);
   }
 
   const isOpen = () => overlay && !overlay.classList.contains('hidden');

@@ -147,6 +147,12 @@ body.sel-brush-mode .single-opts{display:none}
 .doc-sec ul{margin:4px 0;padding-left:20px}
 .doc-sec li{margin:3px 0}
 .doc-body code{background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:0 4px;font-size:12px}
+.doc-tabs{display:flex;gap:6px}
+.doc-body.hidden,.doc-prompt.hidden{display:none}
+.doc-prompt{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+.doc-prompt .btn{align-self:flex-start}
+.doc-prompt-wrap{flex:1;min-height:0;overflow:auto;border:1px solid var(--border);border-radius:8px;background:var(--bg)}
+.doc-prompt-text{margin:0;padding:12px;white-space:pre-wrap;word-break:break-word;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--ink)}
 .loupe-panel{position:fixed;top:40px;right:0;width:320px;max-height:calc(100vh - 40px);overflow:auto;background:var(--panel);border-left:1px solid var(--border);box-shadow:-8px 0 24px rgba(0,0,0,.18);z-index:90;padding:10px 12px;pointer-events:none}
 .loupe-panel.hidden{display:none}
 .loupe-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:2px}
