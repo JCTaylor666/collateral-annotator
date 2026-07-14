@@ -122,7 +122,7 @@
       loupeMismatch: 'Size mismatch',
       loupeLoading: 'Loading…',
 
-      clearConfirmHtml: 'Really clear?<br>Clearing removes all annotations for this frame.',
+      clearConfirmHtml: 'Really clear?<br>This removes the CURRENT LAYER\u2019s annotations (segments, points, paint). Other layers, the note, markers and star are kept.',
       btnClearContinue: 'Continue clearing',
       btnCancel: 'Cancel',
 
@@ -139,6 +139,7 @@
       noClassesYetPicker: 'Add a class in the left sidebar’s “Class management” section, then pick the active class and its color here.',
       copyPickHint: 'Click the frame on the left to copy annotations from (Esc to cancel).',
       copyNoAnnotations: '“{id}” has no annotations to copy.',
+      copyBusyNow: 'This frame already has content — copying needs a completely empty frame.',
       copyDone: '“{id}” copied and re-resolved: {segs} segments · {pts} points{dropped}',
       copyDoneDropped: ' ({n} with no class skipped)',
       copyDonePaint: ' · {n} painted px',
@@ -288,7 +289,7 @@
       loupeMismatch: '尺寸不符',
       loupeLoading: '加载中…',
 
-      clearConfirmHtml: '真的要清理么？<br>清理以后本 frame 全部标记都将消失。',
+      clearConfirmHtml: '真的要清理么？<br>只清空<b>当前图层</b>的标注（选段、红点、涂抹）。其它图层、笔记、编号标记和星标都会保留。',
       btnClearContinue: '继续清理',
       btnCancel: '取消',
 
@@ -305,6 +306,7 @@
       noClassesYetPicker: '在左栏“分类管理”添加类别后，这里选择当前标注类别与颜色。',
       copyPickHint: '点击左侧要复制标注的帧（Esc 取消）。',
       copyNoAnnotations: '“{id}” 没有可复制的标注。',
+      copyBusyNow: '当前帧已有内容——复制需要完全空白的帧。',
       copyDone: '已从 “{id}” 复制并重新解析：{segs} 段 · {pts} 点{dropped}',
       copyDoneDropped: '（{n} 个无类别已跳过）',
       copyDonePaint: ' · {n} 个涂抹像素',

@@ -96,12 +96,18 @@
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
   // present-but-unparseable (annotation:null, corrupt:true) so a bad file is never mistaken
-  // for "unannotated" and silently overwritten.
+  // for "unannotated" and silently overwritten. A file from a NEWER schema than this build
+  // understands (schema_version > 6) is treated the same way: importing it as v5/v6 would
+  // misread it, and the corrupt path backs the original up before any overwrite.
   async function readAnnotation(unit) {
     let fh;
     try { fh = await unit.handle.getFileHandle('annotation.json'); }
     catch (e) { return { annotation: null, corrupt: false }; }   // absent
-    try { return { annotation: JSON.parse(await (await fh.getFile()).text()), corrupt: false }; }
+    try {
+      const ann = JSON.parse(await (await fh.getFile()).text());
+      if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true };
+      return { annotation: ann, corrupt: false };
+    }
     catch (e) { return { annotation: null, corrupt: true }; }    // present but broken
   }
   async function readNote(unit) {

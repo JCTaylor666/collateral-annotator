@@ -57,6 +57,7 @@
       return lut;
     }
     function buildBase() {
+      if (!W || !H) return;   // placeholder frame: no pixel grid
       if (colorMode && colorImg) { baseCtx.clearRect(0, 0, W, H); baseCtx.drawImage(colorImg, 0, 0, W, H); return; }   // perfusion: draw colour as-is (no windowing)
       if (!gray) return;
       const lut = buildLut(center, width), id = baseCtx.createImageData(W, H), d = id.data;
@@ -72,11 +73,13 @@
     }
     function segPixels(seg) { return (segPix && segPix.get(seg)) || EMPTY; }
     function fillPixels(cx, pixels, rgb) {
+      if (!W || !H) return;
       const id = cx.createImageData(W, H), d = id.data;
       for (let k = 0; k < pixels.length; k++) { const p = pixels[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; }
       cx.putImageData(id, 0, 0);
     }
     function buildSelLayer() {
+      if (!W || !H) return;
       selCtx.clearRect(0, 0, W, H);
       const id = selCtx.createImageData(W, H), d = id.data;
       for (const [seg, rgb] of sel) { const px = segPixels(seg); for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; } }
@@ -84,6 +87,7 @@
     }
     function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) fillPixels(hovCtx, segPixels(hov), HOV_RGB); }
     function buildMaskLayer() {
+      if (!W || !H) return;
       maskCtx.clearRect(0, 0, W, H);
       const id = maskCtx.createImageData(W, H), d = id.data;
       if (visibleSegs) {                                     // geometry filter on: overlay only in-range segments (from label)
@@ -100,8 +104,8 @@
 
     // ---- brush paint layer ----
     function buildPaintLayer() {
+      if (!W || !H || !paint || !paintColorFn) return;
       paintCtx.clearRect(0, 0, W, H);
-      if (!paint || !paintColorFn) return;
       const id = paintCtx.createImageData(W, H), d = id.data;
       for (let i = 0; i < paint.length; i++) {
         const cls = paint[i]; if (!cls) continue;
@@ -260,6 +264,9 @@
     function setPlaceholder(info) {
       placeholder = info || null;
       img = null; colorMode = false; colorImg = null; perfLegend = 0;
+      // drop the previous unit's pixel data too — with W=H=0, any builder fed a stale array
+      // would call createImageData(0,0) and throw (e.g. window sliders moved on the placeholder)
+      gray = null; label = null; maskData = null; paint = null; segPix = null; strokeChanges = null; hov = 0; visibleSegs = null;
       W = 0; H = 0; needFit = true;   // forget stale dims; the next real unit re-fits
     }
     function drawPlaceholder(cssW, cssH) {

@@ -41,6 +41,7 @@
   let selStrokeSegs = null, selChanges = null, selPaintChanges = null, selPointChanges = null;
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
   let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
+  let navBusy = false;     // a frame load is in flight: block new strokes (they'd straddle the old/new frame)
 
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
@@ -87,6 +88,13 @@
     flushAutoSave(); flushGeomWrite(true);   // persist any pending edits to the CURRENT dataset before we switch away
     try {
       rootHandle = await FS.pickDirectory();
+      // Committed to switching. Freeze annotation NOW: the old frame stays visible through the (slow, async)
+      // scan below, and a click landing after switchDataset() wipes State would autosave a near-empty file
+      // over the OLD dataset's annotation.json via the captured handle — and leak stray marks into the new one.
+      commitActiveStroke();
+      await flushAutoSave();                 // write any just-committed stroke to the OLD folder before the wipe
+      cur = null; exitCopyPick(); exitMarkerArm();
+      $('note').disabled = true; updateCopyBtn();
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
       for (const c of cases) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
@@ -229,6 +237,7 @@
     ensureCasePerfusion(c);   // kick off (cached) perfusion compute on entering a case, so it's ready to view / pin
     if (u.virtual) return await showPerfusionUnit(c, u, gen, prevCi, prevUi);
     let data;
+    navBusy = true;
     try { data = await loadCur(); }
     catch (e) {
       if (gen !== navGen) return false;          // a newer navigation superseded this one — stay silent
@@ -236,6 +245,7 @@
       setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
       return false;
     }
+    finally { navBusy = false; }
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
@@ -253,14 +263,18 @@
     updateDirtyUI(); updateCopyBtn();
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
-    else { const pd = State.hasPaint(c.id, u.id) && State.paintDims(c.id, u.id); if (pd && (pd.w !== data.W || pd.h !== data.H)) setBanner('paintSizeBad', { id: u.id }, 'warn'); }   // stored paint saved at a different size: hidden, and painting will replace it
+    else {   // stored paint saved at a different size (ANY layer): hidden, and painting there will replace it
+      const badPaint = State.getLayers(c.id, u.id).some(ly => { const p = State.readLayer(c.id, u.id, ly.id).paint; return p && p.width && p.height && (p.width !== data.W || p.height !== data.H); });
+      if (badPaint) setBanner('paintSizeBad', { id: u.id }, 'warn');
+    }
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
     return true;
   }
 
   // the computed, view-only perfusion unit: colour image, no label/mask/annotation
   async function showPerfusionUnit(c, u, gen, prevCi, prevUi) {
-    const perf = await ensureCasePerfusion(c);
+    navBusy = true;
+    let perf; try { perf = await ensureCasePerfusion(c); } finally { navBusy = false; }
     if (gen !== navGen) return false;                       // superseded by a newer navigation
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
     const W = perf.W, H = perf.H;
@@ -502,6 +516,18 @@
     catch (e) { setSaveStatus('classesSaveFailed', null, true); }
   }
   function randomName() { return I18n.t('unnamedPrefix') + Math.random().toString(36).slice(2, 6); }
+  // collect every class index used anywhere inside one annotation.json object — flat v5 AND layered v6
+  function collectAnnClasses(ann, used) {
+    const cls = v => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
+    const one = o => {
+      if (!o || typeof o !== 'object') return;
+      if (Array.isArray(o.collaterals)) for (const it of o.collaterals) { const n = (it && !Array.isArray(it)) ? cls(it.class) : null; if (n != null) used.add(n); }
+      if (Array.isArray(o.points)) for (const it of o.points) { const n = (it && !Array.isArray(it)) ? cls(it.class) : null; if (n != null) used.add(n); }
+      if (o.paint && o.paint.classes && typeof o.paint.classes === 'object') for (const k in o.paint.classes) { const n = +k; if (n) used.add(n); }
+    };
+    one(ann);
+    if (ann && Array.isArray(ann.layers)) for (const ly of ann.layers) one(ly);
+  }
   // every class index actually used by any annotation — in-memory (incl unsaved) + on disk across all units
   async function usedClassSet() {
     const used = new Set(State.usedClasses());
@@ -509,10 +535,7 @@
       if (u.virtual) continue;                                // perfusion unit has no files on disk
       try {
         const { annotation } = await Loader.loadAnnotation(u);
-        if (annotation && Array.isArray(annotation.collaterals))
-          for (const it of annotation.collaterals) if (Number.isFinite(it.class)) used.add(it.class);
-        if (annotation && annotation.paint && annotation.paint.classes)
-          for (const k in annotation.paint.classes) { const n = +k; if (n) used.add(n); }
+        collectAnnClasses(annotation, used);
       } catch (e) { }
     }
     return used;
@@ -530,7 +553,7 @@
         State.resetUnit(c.id, u.id);
         try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the whole scan
       }
-      if (ann && Array.isArray(ann.collaterals)) for (const it of ann.collaterals) if (it && Number.isFinite(it.class)) used.add(it.class);
+      collectAnnClasses(ann, used);   // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
     }
     const have = new Set(classes.map(c => c.index));
     let added = 0;
@@ -592,8 +615,9 @@
   // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
   // Copy-from-frame mirrors ALL of the source frame's layers, so it only writes into an EMPTY target —
   // refuse if the frame has any content across ANY layer (segments/points/paint), or any numbered marker.
+  // A star or a note does NOT block: copy never touches them.
   function copyTargetBusy(c, u) {
-    return State.unitHasContent(c, u) || State.markerList(c, u).length > 0;
+    return State.unitHasLayerContent(c, u) || State.markerList(c, u).length > 0;
   }
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
@@ -621,7 +645,9 @@
   function pickCopySource(uidx) {
     const src = curCase().units[uidx];
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
-    if (src && uidx !== ui && cur && !copyTargetBusy(cur.caseId, cur.unitId)) doCopyFrom(curCase().id, src);
+    if (!src || uidx === ui || !cur) return;
+    if (copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started (e.g. a note edit): say so, don't silently no-op
+    doCopyFrom(curCase().id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
     const tc = cur.caseId, tu = cur.unitId;                   // target = the currently displayed (empty) frame
@@ -646,9 +672,13 @@
       for (const s of data.segs.concat(data.points)) {
         const xy = s.xy, cls = s.cls;
         if (cls == null) { dropped++; continue; }
-        if (!xy || !view.inBounds(xy[0], xy[1])) continue;
+        if (!xy || !view.inBounds(xy[0], xy[1])) { dropped++; continue; }   // no/out-of-bounds coordinate: can't re-resolve
         const seg = view.segAt(xy[0], xy[1]);
-        if (seg > 0) { if (!segMap.has(seg)) segMap.set(seg, { xy, cls }); }
+        if (seg > 0) {
+          const prev = segMap.get(seg);
+          if (!prev) segMap.set(seg, { xy, cls });
+          else if (prev.cls !== cls) dropped++;               // two source marks hit the same target segment with different classes: first wins, count the loser
+        }
         else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push({ xy, cls }); } }
       }
       for (const [seg, v] of segMap) State.applyClass(tc, tu, seg, v.xy, v.cls);
@@ -1040,7 +1070,10 @@
   }
   function onDragStart(ev) {
     if (ev.button !== 0 || !cur) return;
-    const viewOnly = cur.virtual || cur.mismatch;   // perfusion / shape-mismatch: only pan, never paint/select
+    // view-only situations where a drag may pan but must never paint/select: perfusion & shape-mismatch
+    // units, a frame load in flight (the stroke would straddle two frames), and copy-source picking
+    // (painting here would make the copy target busy and the pick then fails)
+    const viewOnly = cur.virtual || cur.mismatch || navBusy || copyPickMode;
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
     if (!viewOnly && !markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
@@ -1159,7 +1192,7 @@
     saveTimer = setTimeout(runAutoSave, 1000);
     setSaveStatus('pendingSave');
   }
-  function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; runAutoSave(); } }
+  function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; return runAutoSave(); } }   // returns the write promise so callers that must not race it can await
   async function backupCorruptOnce(k, unit) {   // copy an unparseable annotation.json to .corrupt exactly once before we overwrite it
     if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return;
     corruptBackedUp.add(k);
@@ -1170,13 +1203,14 @@
   }
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
     const k = State.key(caseId, unit.id);
+    const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
     let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
-    if (data.shapeMismatch) { State.markClean(caseId, unit.id); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
+    if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
     await backupCorruptOnce(k, unit);
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
     corruptUnits.delete(k);   // the file on disk is valid JSON again
-    State.markClean(caseId, unit.id);
+    State.markClean(caseId, unit.id, seq);
   }
   async function runAutoSave() {
     saveTimer = null;
@@ -1191,8 +1225,10 @@
     const e = State.undo();
     if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
     const sameUnit = e.c === cur.caseId && e.u === cur.unitId;
-    // if the undone action was on a DIFFERENT layer of this frame, switch to it so the change is visible/editable
-    if (sameUnit && (e.layer || 0) !== State.getActiveLayer(cur.caseId, cur.unitId)) {
+    // if the undone action was on a DIFFERENT layer of this frame, switch to it so the change is visible/
+    // editable — but never for markers: they're frame-level and carry no layer, and treating their missing
+    // field as "layer 0" would hijack the reviewer's active layer
+    if (sameUnit && e.kind !== 'marker' && (e.layer || 0) !== State.getActiveLayer(cur.caseId, cur.unitId)) {
       State.setActiveLayer(cur.caseId, cur.unitId, e.layer || 0);
       view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // load that layer's paint before any paint-undo apply
       buildLayerBar();
@@ -1202,8 +1238,11 @@
       if (isCurLayer) {
         view.applyPaintUndo(e.changes);                     // current unit+layer: apply via the view's dense array
         State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
-      } else if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes, e.layer)) {
-        return;                                             // other unit/layer: apply to its stored paint; bail only if its RLE dims are gone
+      } else {
+        // other unit/layer: apply to its stored paint. A full-erase stroke deleted the RLE (and its dims),
+        // so offer the unit's cached dims as fallback — else that erase would be silently un-undoable.
+        const d = cache.get(State.key(e.c, e.u));
+        if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes, e.layer, d && d.W, d && d.H)) return;
       }
     }
     State.markDirty(e.c, e.u);                              // dirty the unit the undo actually touched
@@ -1220,10 +1259,10 @@
     refreshMarkers();
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
-  function askClear() { if (!cur) return; $('confirmClear').classList.remove('hidden'); }
+  function askClear() { if (!cur || cur.virtual || cur.mismatch) return; $('confirmClear').classList.remove('hidden'); }   // view-only units have nothing to clear (and must never be marked dirty)
   function closeClear() { $('confirmClear').classList.add('hidden'); }
   function clear() {
-    if (!cur) return;
+    if (!cur || cur.virtual || cur.mismatch) return;
     State.clearUnit(cur.caseId, cur.unitId);
     view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // wipe the canvas paint layer too, else the next stroke re-encodes & re-saves the "cleared" paint
     State.markDirty(cur.caseId, cur.unitId);
@@ -1244,7 +1283,7 @@
     if (cur) refreshMeta();
     else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
     updateCopyBtn(); updateDirtyUI();
-    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips();
+    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips(); buildLayerBar();
     if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
     if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
   }
@@ -1386,7 +1425,7 @@
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!painting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record)
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!painting && !selecting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record — paint AND select strokes)
       else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         if (e.key >= '1' && e.key <= '9') { const n = +e.key; if (classes.some(c => c.index === n)) { State.setActiveClass(n); buildClassPicker(); } }   // number = activate class with that index
         else { const k = e.key.toLowerCase();                                                                                                             // C/B/P = single-select / brush-select / paint
@@ -1400,6 +1439,7 @@
     // state so the brush can't come back "stuck" painting with no button held.
     function resetTransientInput() {
       if (painting) onDragEnd();
+      if (selecting) finalizeSelectStroke();   // a select stroke must not survive a window blur either
       dragging = false; spaceHeld = false; $('view').style.cursor = '';
       exitInspect();
     }

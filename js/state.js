@@ -89,7 +89,8 @@
   const defaultLayers = () => [{ id: 0, name: 'Layer 1' }];
   const layersOf = (c, u) => unitLayers[key(c, u)] || defaultLayers();            // non-creating read (default = single layer 0)
   const layersMut = (c, u) => unitLayers[key(c, u)] || (unitLayers[key(c, u)] = defaultLayers());
-  const activeLayerId = (c, u) => { const v = activeLayerByUnit[key(c, u)]; return Number.isFinite(v) ? v : 0; };
+  // validated: a stale preference (layer since deleted / reset) must never route writes into an invisible bucket
+  const activeLayerId = (c, u) => { const v = activeLayerByUnit[key(c, u)]; const ls = layersOf(c, u); return (Number.isFinite(v) && ls.some(l => l.id === v)) ? v : ls[0].id; };
   const lkey = (c, u, L) => L === 0 ? key(c, u) : key(c, u) + '#' + L;            // layer 0 has NO suffix (back-compat)
   const bkey = (c, u) => lkey(c, u, activeLayerId(c, u));                          // the active layer's bucket
   // layer-parameterized bucket accessors (used by undo/import/build for a SPECIFIC layer)
@@ -107,15 +108,25 @@
   const selectedClicks = (c, u) => { const s = selR(c, u); return Object.keys(s).map(k => segXY(s[k])).filter(xy => xy && xy[0] >= 0 && xy[1] >= 0); };
   // selected segments with their class (for per-class coloring)
   const selectedSegs = (c, u) => { const s = selR(c, u); return Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })); };
-  // all class indices currently assigned to any segment across every unit in memory
-  const usedClasses = () => { const set = new Set(); for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } } usedClassesInPaint().forEach(c => set.add(c)); return [...set]; };
+  // all class indices currently assigned to any segment, background point, or paint across every unit in memory
+  const usedClasses = () => {
+    const set = new Set();
+    for (const kk in selections) { const s = selections[kk]; for (const g in s) { const cl = segCls(s[g]); if (cl != null) set.add(cl); } }
+    for (const kk in points) for (const p of points[kk]) { const cl = ptCls(p); if (cl != null) set.add(cl); }
+    usedClassesInPaint().forEach(c => set.add(c));
+    return [...set];
+  };
   // background points now carry a class (the active class at click time). Old data may be a bare [x,y].
   const ptXY = p => Array.isArray(p) ? p : (p && p.xy) || [-1, -1];
   const ptCls = p => (Array.isArray(p) || !p || p.cls == null) ? null : p.cls;
   const pointList = (c, u) => ptsR(c, u).map(p => { const xy = ptXY(p); return [xy[0], xy[1]]; });   // coords, for red dots
   const pointItems = (c, u) => ptsR(c, u).map(p => ({ xy: ptXY(p), cls: ptCls(p) }));                // coords + class, for copy/json
   const pointCount = (c, u) => ptsR(c, u).length;
-  const markCount = (c, u) => count(c, u) + pointCount(c, u);
+  // total marks across ALL layers (frame-list badge — a frame annotated on any layer must not look empty)
+  const markCount = (c, u) => layersOf(c, u).reduce((n, ly) => {
+    const lk = lkey(c, u, ly.id), s = selections[lk];
+    return n + (s ? Object.keys(s).length : 0) + ((points[lk] || []).length);
+  }, 0);
 
   // ---- layer API (per-frame) ----
   const getLayers = (c, u) => layersOf(c, u).map(l => ({ id: l.id, name: l.name }));
@@ -280,13 +291,18 @@
   function resetUnit(c, u) {
     const k = key(c, u), pfx = k + '#';
     for (const store of [selections, points, paintR]) for (const kk of Object.keys(store)) if (kk === k || kk.startsWith(pfx)) delete store[kk];
-    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete activeLayerByUnit[k];
+    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k];
+    // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
+    // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
     undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist();
   }
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
-  function markDirty(c, u) { dirty[key(c, u)] = true; persist(); }
-  function markClean(c, u) { delete dirty[key(c, u)]; persist(); }
+  let dirtySeq = {};   // per-unit edit counter (session-only): lets an async writer detect edits made while it was writing
+  function markDirty(c, u) { const k = key(c, u); dirty[k] = true; dirtySeq[k] = (dirtySeq[k] || 0) + 1; persist(); }
+  const getDirtySeq = (c, u) => dirtySeq[key(c, u)] || 0;
+  // seq (optional): only clean if no new edit landed since the caller snapshotted its file content
+  function markClean(c, u, seq) { if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return; delete dirty[key(c, u)]; persist(); }
 
   const isStarred = (c, u) => !!starred[key(c, u)];
   function setStarred(c, u, on) { if (on) starred[key(c, u)] = true; else delete starred[key(c, u)]; persist(); }
@@ -355,13 +371,15 @@
   }
   // Apply a paint-undo change-list to a paint bucket that is NOT currently displayed (other unit OR other
   // layer of the current unit): decode that layer's stored RLE (dims from the RLE), apply [i,old], re-encode.
-  // Returns false if there's no stored RLE to take dims from — the caller then leaves state untouched.
-  function applyPaintUndoOffscreen(c, u, changes, layer) {
+  // When the bucket is gone (a full-erase stroke deletes it), fall back to caller-supplied dims (fw,fh) so
+  // undoing that erase can still rebuild the paint; without either, return false and leave state untouched.
+  function applyPaintUndoOffscreen(c, u, changes, layer, fw, fh) {
     const lk = lkey(c, u, layer || 0), r = paintR[lk];
-    if (!r || !r.width || !r.height) return false;
-    const dense = rleDecode(r, r.width, r.height);
+    const W = (r && r.width) || fw, H = (r && r.height) || fh;
+    if (!(W > 0 && H > 0)) return false;
+    const dense = r ? rleDecode(r, W, H) : new Uint16Array(W * H);
     for (const [i, old] of changes) if (i >= 0 && i < dense.length) dense[i] = old;
-    const rle = rleEncode(dense, r.width, r.height);
+    const rle = rleEncode(dense, W, H);
     if (Object.keys(rle.classes).length) paintR[lk] = rle; else delete paintR[lk];
     persist(); return true;
   }
@@ -373,20 +391,22 @@
   // seed ONE layer's selections/points/paint from a v5-shaped object (its own coord_order already resolved to `order`)
   function importLayerContent(c, u, L, obj, order) {
     const conv = arr => order === 'xy' ? [arr[0], arr[1]] : [arr[1], arr[0]];
+    // tolerate numeric-string class values from externally generated files ("2" → 2); null/'' stay unclassified
+    const asCls = v => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
     if (Array.isArray(obj.collaterals)) {
       const s = selLW(c, u, L);
       for (const item of obj.collaterals) {
         if (!item || typeof item !== 'object') continue;   // a null/garbage element must not abort the whole import (and the folder open)
         const id = Number(item.id); if (!Number.isFinite(id)) continue;
         const xy = (Array.isArray(item.click) && item.click.length === 2) ? conv(item.click) : [-1, -1];
-        s[String(id)] = { xy, cls: Number.isFinite(item.class) ? item.class : null };
+        s[String(id)] = { xy, cls: asCls(item.class) };
       }
     }
     if (Array.isArray(obj.points)) {
       const a = ptsLW(c, u, L);
       for (const item of obj.points) {
         const click = Array.isArray(item) ? item : (item && item.click);
-        if (Array.isArray(click) && click.length === 2) a.push({ xy: conv(click), cls: (item && Number.isFinite(item.class)) ? item.class : null });
+        if (Array.isArray(click) && click.length === 2) a.push({ xy: conv(click), cls: Array.isArray(item) ? null : asCls(item && item.class) });
       }
     }
     if (obj.paint && obj.paint.classes && typeof obj.paint.classes === 'object') paintR[lkey(c, u, L)] = obj.paint;
@@ -401,16 +421,20 @@
       for (const ly of ann.layers) {
         if (!ly || typeof ly !== 'object') continue;
         const id = Number(ly.id); if (!Number.isFinite(id)) continue;
+        if (list.some(x => x.id === id)) continue;   // duplicate layer id in a hand-edited file: keep the first, skip the rest
         list.push({ id, name: String(ly.name || ('Layer ' + (id + 1))) });
         importLayerContent(c, u, id, ly, order);
       }
       if (list.length) {
         unitLayers[key(c, u)] = list;
-        const a = Number(ann.active_layer);
-        activeLayerByUnit[key(c, u)] = (Number.isFinite(a) && list.some(x => x.id === a)) ? a : list[0].id;
+        // the reviewer's in-session layer choice (kept across resetUnit) beats the file's recorded one
+        const prev = activeLayerByUnit[key(c, u)], a = Number(ann.active_layer);
+        activeLayerByUnit[key(c, u)] = (Number.isFinite(prev) && list.some(x => x.id === prev)) ? prev
+          : (Number.isFinite(a) && list.some(x => x.id === a)) ? a : list[0].id;
       }
     } else {
       importLayerContent(c, u, 0, ann, order);   // flat v5 → layer 0 (unitLayers left absent = implicit single layer)
+      if (typeof ann.layer_name === 'string' && ann.layer_name) unitLayers[key(c, u)] = [{ id: 0, name: ann.layer_name }];   // v5 keeps a custom single-layer name here
     }
     if (ann.starred === true) starred[key(c, u)] = true;
     persist();
@@ -434,6 +458,8 @@
     if (layers.length <= 1) {                                  // one layer → flat v5 (byte-compatible with the pre-layers format)
       const ct = layerContentOut(c, u, layers[0] ? layers[0].id : 0);
       const out = { schema_version: 5, ...base, collaterals: ct.collaterals, points: ct.points };
+      // a custom single-layer name has no home in v5 — carry it in an additive field so rename survives the collapse
+      if (layers[0] && layers[0].name && layers[0].name !== 'Layer 1') out.layer_name = layers[0].name;
       if (starred[key(c, u)]) out.starred = true;
       if (ct.paint) out.paint = ct.paint;
       return out;
@@ -450,20 +476,27 @@
 
   const unitsWithData = () => {   // frame keys (strip the #layer suffix so a unit isn't listed once per layer)
     const set = new Set();
-    const addStrip = k => { const i = k.indexOf('#'); set.add(i >= 0 ? k.slice(0, i) : k); };
+    // only a TRAILING #<digits> is a layer suffix — a '#' inside the case folder name must survive
+    const addStrip = k => set.add(k.replace(/#\d+$/, ''));
     [...Object.keys(selections), ...Object.keys(points), ...Object.keys(paintR)].forEach(addStrip);
-    [...Object.keys(visited), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred)].forEach(k => set.add(k));
+    // dirty is included so a unit whose ONLY pending change is a removal (e.g. un-star) still reaches Save
+    [...Object.keys(visited), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(dirty)].forEach(k => set.add(k));
     return [...set];
   };
-  // does this unit hold anything actually worth writing to disk (across ALL layers)? (skip empty, merely-viewed frames)
-  function unitHasContent(c, u) {
-    const k = key(c, u);
+  // annotation content on ANY layer (segments / points / paint)? — frame-level star/note/markers excluded
+  function unitHasLayerContent(c, u) {
     for (const ly of layersOf(c, u)) {
       const lk = lkey(c, u, ly.id);
       if (selections[lk] && Object.keys(selections[lk]).length) return true;
       if (points[lk] && points[lk].length) return true;
       const p = paintR[lk]; if (p && p.classes && Object.keys(p.classes).length) return true;
     }
+    return false;
+  }
+  // does this unit hold anything actually worth writing to disk (across ALL layers)? (skip empty, merely-viewed frames)
+  function unitHasContent(c, u) {
+    const k = key(c, u);
+    if (unitHasLayerContent(c, u)) return true;
     if (starred[k]) return true;
     if (notes[k] && notes[k].length) return true;
     if (noteMarkers[k] && noteMarkers[k].length) return true;
@@ -474,10 +507,10 @@
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
-    isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
+    isDirty, markDirty, markClean, getDirtySeq, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
-    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
+    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);

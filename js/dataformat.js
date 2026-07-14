@@ -70,7 +70,7 @@
   }
 }</pre>
 <ul>
-<li><code>schema_version</code> — format version (currently 5; files written by older versions 1–4 still import).</li>
+<li><code>schema_version</code> — format version: <b>5</b> when the frame has a single annotation layer (the flat form above), <b>6</b> when it has two or more layers (see “Layers” below). Files written by older versions 1–4 still import.</li>
 <li><code>case</code> / <code>unit</code> — the folder names, for traceability.</li>
 <li><code>image_size</code> — <code>[W, H]</code> of the frame.</li>
 <li><code>coord_order</code> — how click coordinates are serialized (Settings → Coordinate order). <code>"xy"</code> → click = [x, y] (x = column from left, y = row from top); <code>"yx"</code> → click = [y, x]. Applies to <code>collaterals[].click</code> and <code>points[].click</code>, <b>never</b> to <code>paint</code>.</li>
@@ -78,6 +78,27 @@
 <li><code>points</code> — background clicks (red dots that hit no segment), same click/class format.</li>
 <li><code>starred</code> — present (true) only when the frame is starred.</li>
 <li><code>paint</code> — brush layer, row run-length encoded; present only if painted. <code>classes</code> maps class index → list of runs <code>[row, col, length]</code>: row = y (0 = top), col = x of the run start (0 = left), length = number of consecutive pixels toward +x. <code>width</code>/<code>height</code> record the encoding dimensions, and the <code>axes</code> field documents the run layout inside the file itself.</li>
+</ul>
+<h4>Layers (<code>schema_version</code> 6)</h4>
+<p class="doc-p">A frame can hold several independent annotation layers (the “Layers” bar in the right panel). With <b>one</b> layer the file stays flat v5, exactly as above. With <b>two or more</b> layers the per-layer content moves into a <code>layers</code> array:</p>
+<pre class="doc-tree">{
+  "schema_version": 6,
+  "case": "case_0001", "unit": "frame_0",
+  "image_size": [800, 800], "coord_order": "xy",
+  "starred": true,                ← frame-level fields stay at the top
+  "active_layer": 1,              ← id of the layer selected in the UI
+  "layers": [
+    { "id": 0, "name": "Layer 1",
+      "collaterals": [ … ],       ← same formats as v5
+      "points": [ … ],
+      "paint": { … } },           ← optional, same RLE as v5
+    { "id": 1, "name": "Veins", "collaterals": [], "points": [] }
+  ]
+}</pre>
+<ul>
+<li><code>id</code> — stable integer per layer; <code>name</code> — its display name. <code>collaterals</code> / <code>points</code> / <code>paint</code> inside each layer have exactly the v5 formats (and <code>coord_order</code> applies the same way).</li>
+<li>Frame-level data is <b>not</b> layered: <code>starred</code> stays top-level, and note.json (note text + numbered markers) is one per frame.</li>
+<li>Deleting down to one layer makes the next save collapse back to flat v5. A single-layer frame with a custom layer name keeps it in the v5 field <code>layer_name</code>.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>note.json</code> — output</h4>
 <pre class="doc-tree">{ "schema_version": 1, "coord_order": "xy",
@@ -159,7 +180,7 @@
   }
 }</pre>
 <ul>
-<li><code>schema_version</code> — 格式版本（当前为 5；旧版本 1–4 的文件仍可读入）。</li>
+<li><code>schema_version</code> — 格式版本：单图层的帧写 <b>5</b>（就是上面的扁平结构），两层及以上写 <b>6</b>（见下方“图层”）。旧版本 1–4 的文件仍可读入。</li>
 <li><code>case</code> / <code>unit</code> — 文件夹名，便于溯源。</li>
 <li><code>image_size</code> — 本帧的 <code>[W, H]</code>。</li>
 <li><code>coord_order</code> — 点击坐标的序列化顺序（设置 → 坐标顺序）。<code>"xy"</code> → click = [x, y]（x = 列，从左起；y = 行，从上起）；<code>"yx"</code> → click = [y, x]。只影响 <code>collaterals[].click</code> 和 <code>points[].click</code>，<b>永远不影响</b> <code>paint</code>。</li>
@@ -167,6 +188,27 @@
 <li><code>points</code> — 背景点击（没落在任何段上的红点），click/class 格式同上。</li>
 <li><code>starred</code> — 仅在该帧被星标时存在（true）。</li>
 <li><code>paint</code> — 笔刷图层，按行游程编码（RLE），涂过才存在。<code>classes</code> 把类别索引映射到游程列表 <code>[row, col, length]</code>：row = y（第几行，0 = 顶部），col = 游程起点的 x（第几列，0 = 左侧），length = 向 +x 方向连续的像素数。<code>width</code>/<code>height</code> 记录编码时的尺寸，<code>axes</code> 字段在文件内部自己说明了维度含义。</li>
+</ul>
+<h4>图层（<code>schema_version</code> 6）</h4>
+<p class="doc-p">一帧可以有多个相互独立的标注图层（右侧面板的“图层”栏）。只有<b>一层</b>时文件保持扁平 v5（与上面完全一致）；<b>两层及以上</b>时，逐层内容移入 <code>layers</code> 数组：</p>
+<pre class="doc-tree">{
+  "schema_version": 6,
+  "case": "case_0001", "unit": "frame_0",
+  "image_size": [800, 800], "coord_order": "xy",
+  "starred": true,                ← 帧级字段仍在顶层
+  "active_layer": 1,              ← 界面上当前选中的图层 id
+  "layers": [
+    { "id": 0, "name": "Layer 1",
+      "collaterals": [ … ],       ← 与 v5 格式完全相同
+      "points": [ … ],
+      "paint": { … } },           ← 可选，RLE 同 v5
+    { "id": 1, "name": "静脉", "collaterals": [], "points": [] }
+  ]
+}</pre>
+<ul>
+<li><code>id</code> — 每层的稳定整数编号；<code>name</code> — 显示名。每层里的 <code>collaterals</code> / <code>points</code> / <code>paint</code> 与 v5 的格式完全一致（<code>coord_order</code> 同样适用）。</li>
+<li>帧级数据<b>不分层</b>：<code>starred</code> 留在顶层；note.json（笔记 + 编号标记）每帧一份。</li>
+<li>删到只剩一层后，下次保存会折叠回扁平 v5。单层帧的自定义图层名保存在 v5 的 <code>layer_name</code> 字段里。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>note.json</code> — 输出</h4>
 <pre class="doc-tree">{ "schema_version": 1, "coord_order": "xy",
@@ -281,6 +323,27 @@ FILE: annotation.json   (tool OUTPUT -- format for reference)
     "classes": { "2": [[10,40,12],[11,39,14]] }     // class index -> list of runs [row, col, length]
   }
 }
+
+LAYERS (schema_version 6). A frame can hold MULTIPLE independent annotation layers.
+- Exactly ONE layer -> the tool writes the flat v5 form above (fully backward compatible).
+  A custom single-layer name is kept in an optional extra v5 field "layer_name": "<name>".
+- TWO OR MORE layers -> schema_version 6: the per-layer content moves into "layers":
+{
+  "schema_version": 6,
+  "case": "...", "unit": "...", "image_size": [W, H], "coord_order": "xy",
+  "starred": true,                  // frame-level fields stay at the top level
+  "active_layer": 1,                // id of the layer currently selected in the UI
+  "layers": [
+    { "id": 0, "name": "Layer 1",
+      "collaterals": [ ... ],       // EXACTLY the v5 formats, per layer
+      "points": [ ... ],
+      "paint": { ... } },           // optional, same RLE as v5
+    { "id": 1, "name": "Veins", "collaterals": [], "points": [] }
+  ]
+}
+- "id" = stable integer per layer; "name" = display name. coord_order applies inside layers the same way; paint is never flipped.
+- Frame-level data is NOT layered: "starred" stays top-level; note.json is one per frame.
+- A reader must accept BOTH forms; ids need not be contiguous, and active_layer always references an existing id.
 
 ========================================
 FILE: note.json   (tool OUTPUT)
