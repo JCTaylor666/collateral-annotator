@@ -123,6 +123,13 @@ body.sel-brush-mode .selbrush-opts{display:block}
 .single-opts{display:block;margin-top:8px}
 body.sel-brush-mode .single-opts{display:none}
 #geomPanel.hidden,#geomMetricRow.hidden{display:none}
+#layerSec.hidden{display:none}
+.layer-bar{display:flex;flex-wrap:wrap;gap:6px}
+.layer-chip{display:flex;align-items:center;gap:3px;padding:4px 5px 4px 9px;border:1px solid var(--border);border-radius:7px;background:var(--panel);cursor:pointer;font-size:12px;color:var(--muted)}
+.layer-chip.active{border-color:var(--accent);background:var(--accent-bg);color:var(--accent);font-weight:500}
+.layer-chip .lname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:130px}
+.layer-chip .lx,.layer-chip .led{padding:0 3px;border-radius:4px;font-size:11px;opacity:.65}
+.layer-chip .lx:hover,.layer-chip .led:hover{opacity:1;background:var(--bg)}
 .geom-stats{line-height:1.6;margin-bottom:6px}
 .geom-hist{display:flex;align-items:flex-end;gap:2px;height:34px;margin:2px 0 8px;padding:3px;border:1px solid var(--border);border-radius:6px}
 .geom-hist i{flex:1;background:var(--accent);min-height:1px;border-radius:1px;opacity:.85}

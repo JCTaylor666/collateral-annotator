@@ -248,7 +248,7 @@
     refreshDots();
     exitMarkerArm(); refreshMarkers();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); buildFrameList(); refreshGeomPanel();
+    refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
@@ -272,7 +272,7 @@
     view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
     exitMarkerArm();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); buildFrameList();
+    refreshMeta(); buildFrameList(); buildLayerBar();
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
@@ -310,7 +310,7 @@
     if (inspect) exitInspect();                              // a placeholder frame has no valid image for the loupe
     exitMarkerArm();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); buildFrameList();
+    refreshMeta(); buildFrameList(); buildLayerBar();
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
     setBanner('shapeMismatchBanner', { id: u.id }, 'warn');
@@ -328,6 +328,58 @@
     view.setSelected(selColorMap());
     refreshDots();
     view.render();
+  }
+
+  // ---- layers (per-frame): switch / add / rename / delete ----
+  function buildLayerBar() {
+    const bar = $('layerBar'), sec = $('layerSec'); if (!bar || !sec) return;
+    if (!cur || cur.virtual || cur.mismatch) { sec.classList.add('hidden'); bar.innerHTML = ''; return; }
+    sec.classList.remove('hidden');
+    const layers = State.getLayers(cur.caseId, cur.unitId), active = State.getActiveLayer(cur.caseId, cur.unitId);
+    bar.innerHTML = '';
+    for (const ly of layers) {
+      const chip = document.createElement('div');
+      chip.className = 'layer-chip' + (ly.id === active ? ' active' : '');
+      const name = document.createElement('span'); name.className = 'lname'; name.textContent = ly.name; name.title = I18n.t('layerSwitchTitle');
+      name.onclick = () => switchLayer(ly.id);
+      const ed = document.createElement('span'); ed.className = 'led'; ed.textContent = '✎'; ed.title = I18n.t('layerRenameTitle');
+      ed.onclick = e => { e.stopPropagation(); renameLayerAction(ly.id, ly.name); };
+      const del = document.createElement('span'); del.className = 'lx'; del.textContent = '✕'; del.title = I18n.t('layerDeleteTitle');
+      del.onclick = e => { e.stopPropagation(); deleteLayerAction(ly.id, ly.name); };
+      chip.appendChild(name); chip.appendChild(ed); chip.appendChild(del);
+      bar.appendChild(chip);
+    }
+  }
+  function renderActiveLayer() {   // re-render the canvas for the current unit's ACTIVE layer (selection/paint/dots)
+    if (!cur || cur.virtual || cur.mismatch) return;
+    view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));
+    refreshCanvasSelection();   // setSelected(selColorMap) + refreshDots + render
+    refreshMeta();
+  }
+  function switchLayer(id) {
+    if (!cur || id === State.getActiveLayer(cur.caseId, cur.unitId)) return;
+    commitActiveStroke();       // don't let a live paint stroke bleed onto the layer we switch to
+    State.setActiveLayer(cur.caseId, cur.unitId, id);
+    renderActiveLayer(); buildLayerBar(); updateDirtyUI(); updateCopyBtn();
+  }
+  function addLayerAction() {
+    if (!cur || cur.virtual || cur.mismatch) return;
+    commitActiveStroke();
+    State.addLayer(cur.caseId, cur.unitId);   // creates an empty layer + switches active to it
+    renderActiveLayer(); buildLayerBar(); updateDirtyUI(); highlightNav(); scheduleAutoSave();
+  }
+  function renameLayerAction(id, curName) {
+    if (!cur) return;
+    const name = prompt(I18n.t('layerRenamePrompt'), curName); if (name == null) return;
+    State.renameLayer(cur.caseId, cur.unitId, id, name.trim() || curName);
+    buildLayerBar(); updateDirtyUI(); scheduleAutoSave();
+  }
+  function deleteLayerAction(id, name) {
+    if (!cur) return;
+    if (!confirm(I18n.t('layerDeleteConfirm', { name }))) return;
+    commitActiveStroke();
+    State.deleteLayer(cur.caseId, cur.unitId, id);
+    renderActiveLayer(); buildLayerBar(); updateDirtyUI(); highlightNav(); scheduleAutoSave();
   }
 
   // ---- multiclass: colors, class management, active class ----
@@ -538,10 +590,10 @@
     });
   }
   // ---- copy annotation from another frame (re-resolved by coordinate onto the current frame) ----
-  // Copy-from-frame only writes into an EMPTY target — refuse if the frame already has any content
-  // (segments/points, brush paint, or numbered markers), so copied paint/selections never collide.
+  // Copy-from-frame mirrors ALL of the source frame's layers, so it only writes into an EMPTY target —
+  // refuse if the frame has any content across ANY layer (segments/points/paint), or any numbered marker.
   function copyTargetBusy(c, u) {
-    return State.markCount(c, u) > 0 || State.hasPaint(c, u) || State.markerList(c, u).length > 0;
+    return State.unitHasContent(c, u) || State.markerList(c, u).length > 0;
   }
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
@@ -572,48 +624,59 @@
     if (src && uidx !== ui && cur && !copyTargetBusy(cur.caseId, cur.unitId)) doCopyFrom(curCase().id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
-    // gather source clicks (segments + background points) — each carries the class chosen when it was clicked
-    const clicks = State.selectedSegs(srcCaseId, srcUnit.id).map(s => ({ xy: s.xy, cls: s.cls }))
-      .concat(State.pointItems(srcCaseId, srcUnit.id));
-    const srcHasPaint = State.hasPaint(srcCaseId, srcUnit.id);
-    if (!clicks.length && !srcHasPaint) { setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return; }
-    // re-resolve EACH coordinate against the current frame's label: segment there -> class mark; background -> red dot.
-    // clicks with no class are dropped.
-    const segMap = new Map(), ptSeen = new Set(), pts = [];
-    let dropped = 0;
-    for (const { xy, cls } of clicks) {
-      if (cls == null) { dropped++; continue; }
-      if (!xy || !view.inBounds(xy[0], xy[1])) continue;
-      const seg = view.segAt(xy[0], xy[1]);
-      if (seg > 0) { if (!segMap.has(seg)) segMap.set(seg, { xy, cls }); }
-      else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push({ xy, cls }); } }
+    const tc = cur.caseId, tu = cur.unitId;                   // target = the currently displayed (empty) frame
+    const srcLayers = State.getLayers(srcCaseId, srcUnit.id);
+    const layerData = srcLayers.map(ly => ({ ly, data: State.readLayer(srcCaseId, srcUnit.id, ly.id) }));
+    if (!layerData.some(({ data }) => data.segs.length || data.points.length || data.paint)) {
+      setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return;
     }
-    for (const [seg, v] of segMap) State.applyClass(cur.caseId, cur.unitId, seg, v.xy, v.cls);
-    for (const p of pts) State.addPoint(cur.caseId, cur.unitId, p.xy, p.cls);
-    // also copy the source brush-painted mask (paint layer). Paint is per-pixel — no coordinate
-    // re-resolution is possible — so it only transfers at IDENTICAL W×H; otherwise it's skipped.
-    let paintCopied = 0, paintSkipped = false;
-    if (srcHasPaint) {
-      const srcPaint = State.paintDense(srcCaseId, srcUnit.id, cur.W, cur.H);   // all-zero when the source was painted at a different size
-      const curPaint = view.getPaint(), changes = [];
-      for (let i = 0; i < srcPaint.length; i++) { const v = srcPaint[i]; if (v && curPaint[i] !== v) { changes.push([i, curPaint[i]]); curPaint[i] = v; paintCopied++; } }
-      if (paintCopied) {
-        view.setPaint(curPaint);
-        // keep paint ⟂ selection. The target was EMPTY before the copy, so every copied pixel's pre-copy
-        // value is 0 and `changes` already records [i,0] for each; do NOT fold clearPaintInSegment's
-        // [i,v] pairs in — that would make undo (last-write-wins) restore phantom paint at cleared pixels.
-        for (const seg of segMap.keys()) view.clearPaintInSegment(seg);
-        State.pushPaintUndo(cur.caseId, cur.unitId, changes);
-        State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
-      } else {
-        paintSkipped = true;   // had paint but nothing landed → frames differ in size
+    // target is empty per the gate, but may have empty extra layers the user added — collapse to a single layer 0
+    for (let tl = State.getLayers(tc, tu); tl.length > 1; tl = State.getLayers(tc, tu)) State.deleteLayer(tc, tu, tl[tl.length - 1].id);
+    // Mirror EVERY source layer onto the (empty) target: reuse the target's lone layer for the first source
+    // layer, add a fresh one for each subsequent. Segments/points are re-resolved by coordinate against the
+    // target's own label; paint copies 1:1 only at identical W×H. Each layer's writes go to that layer's bucket.
+    let totSegs = 0, totPts = 0, totPaint = 0, dropped = 0, paintSkipped = false;
+    for (let li = 0; li < layerData.length; li++) {
+      const { ly, data } = layerData[li];
+      let tLayer;
+      if (li === 0) { tLayer = State.getLayers(tc, tu)[0].id; State.setActiveLayer(tc, tu, tLayer); State.renameLayer(tc, tu, tLayer, ly.name); }
+      else { tLayer = State.addLayer(tc, tu, ly.name); }      // new empty layer, becomes active
+      view.setPaint(State.paintDense(tc, tu, cur.W, cur.H));  // load this (empty) target layer into the view
+      const segMap = new Map(), ptSeen = new Set(), pts = [];
+      for (const s of data.segs.concat(data.points)) {
+        const xy = s.xy, cls = s.cls;
+        if (cls == null) { dropped++; continue; }
+        if (!xy || !view.inBounds(xy[0], xy[1])) continue;
+        const seg = view.segAt(xy[0], xy[1]);
+        if (seg > 0) { if (!segMap.has(seg)) segMap.set(seg, { xy, cls }); }
+        else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push({ xy, cls }); } }
+      }
+      for (const [seg, v] of segMap) State.applyClass(tc, tu, seg, v.xy, v.cls);
+      for (const p of pts) State.addPoint(tc, tu, p.xy, p.cls);
+      totSegs += segMap.size; totPts += pts.length;
+      if (data.paint) {
+        if (data.paint.width === cur.W && data.paint.height === cur.H) {
+          const srcDense = State.decodeRLE(data.paint, cur.W, cur.H), curPaint = view.getPaint(), changes = [];
+          let n = 0;
+          for (let i = 0; i < srcDense.length; i++) { const v = srcDense[i]; if (v && curPaint[i] !== v) { changes.push([i, curPaint[i]]); curPaint[i] = v; n++; } }
+          if (n) {
+            view.setPaint(curPaint);
+            for (const seg of segMap.keys()) view.clearPaintInSegment(seg);   // keep paint ⟂ selection (do NOT fold into the undo)
+            State.pushPaintUndo(tc, tu, changes); State.setPaintDense(tc, tu, view.getPaint(), cur.W, cur.H);
+            totPaint += n;
+          }
+        } else paintSkipped = true;
       }
     }
-    State.markDirty(cur.caseId, cur.unitId);
-    refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+    // land on the layer that was active in the source (mapped by position), then re-render
+    const srcActiveIdx = Math.max(0, srcLayers.findIndex(l => l.id === State.getActiveLayer(srcCaseId, srcUnit.id)));
+    const tLayers = State.getLayers(tc, tu);
+    State.setActiveLayer(tc, tu, (tLayers[srcActiveIdx] || tLayers[0]).id);
+    State.markDirty(tc, tu);
+    renderActiveLayer(); buildLayerBar(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
     const droppedTxt = dropped ? I18n.t('copyDoneDropped', { n: dropped }) : '';
-    const paintTxt = paintCopied ? I18n.t('copyDonePaint', { n: paintCopied }) : (paintSkipped ? I18n.t('copyPaintSkipped') : '');
-    setBanner('copyDone', { id: srcUnit.id, segs: segMap.size, pts: pts.length, dropped: droppedTxt + paintTxt }, paintSkipped ? 'warn' : 'ok');
+    const paintTxt = totPaint ? I18n.t('copyDonePaint', { n: totPaint }) : (paintSkipped ? I18n.t('copyPaintSkipped') : '');
+    setBanner('copyDone', { id: srcUnit.id, segs: totSegs, pts: totPts, dropped: droppedTxt + paintTxt }, paintSkipped ? 'warn' : 'ok');
   }
 
   // ---- note markers: place numbered circles from the note panel ----
@@ -1127,17 +1190,24 @@
     if (!cur) return;
     const e = State.undo();
     if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
-    const isCur = e.c === cur.caseId && e.u === cur.unitId;
+    const sameUnit = e.c === cur.caseId && e.u === cur.unitId;
+    // if the undone action was on a DIFFERENT layer of this frame, switch to it so the change is visible/editable
+    if (sameUnit && (e.layer || 0) !== State.getActiveLayer(cur.caseId, cur.unitId)) {
+      State.setActiveLayer(cur.caseId, cur.unitId, e.layer || 0);
+      view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // load that layer's paint before any paint-undo apply
+      buildLayerBar();
+    }
+    const isCurLayer = sameUnit && (e.layer || 0) === State.getActiveLayer(cur.caseId, cur.unitId);
     if (e.kind === 'paint') {
-      if (isCur) {
-        view.applyPaintUndo(e.changes);                     // current unit: apply via the view's dense array
+      if (isCurLayer) {
+        view.applyPaintUndo(e.changes);                     // current unit+layer: apply via the view's dense array
         State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
-      } else if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes)) {
-        return;                                             // other unit: apply to its stored paint; bail only if its RLE dims are gone
+      } else if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes, e.layer)) {
+        return;                                             // other unit/layer: apply to its stored paint; bail only if its RLE dims are gone
       }
     }
     State.markDirty(e.c, e.u);                              // dirty the unit the undo actually touched
-    if (!isCur) {                                           // persist THAT unit directly, leave the displayed one alone
+    if (!sameUnit) {                                        // persist THAT unit directly, leave the displayed one alone
       highlightNav(); updateDirtyUI();
       const oc = cases.find(c => c.id === e.c), ou = oc && oc.units.find(u => u.id === e.u);
       if (ou && rootHandle && State.getAutoSave()) {
@@ -1205,6 +1275,7 @@
     $('btnSave').onclick = save;
     $('btnUndo').onclick = undo;
     $('btnClear').onclick = askClear;
+    $('btnAddLayer').onclick = addLayerAction;
     $('cancelClear').onclick = closeClear;
     $('doClear').onclick = () => { closeClear(); clear(); };
     $('confirmClear').addEventListener('click', e => { if (e.target === $('confirmClear')) closeClear(); });

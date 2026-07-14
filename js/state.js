@@ -476,7 +476,7 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
-    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint,
+    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler };
