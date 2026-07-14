@@ -1129,9 +1129,12 @@
     if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
     const isCur = e.c === cur.caseId && e.u === cur.unitId;
     if (e.kind === 'paint') {
-      if (!isCur) return;                                   // another unit's paint can't be applied without its dense array (entry consumed)
-      view.applyPaintUndo(e.changes);                       // paint undo needs the view's dense array
-      State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+      if (isCur) {
+        view.applyPaintUndo(e.changes);                     // current unit: apply via the view's dense array
+        State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
+      } else if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes)) {
+        return;                                             // other unit: apply to its stored paint; bail only if its RLE dims are gone
+      }
     }
     State.markDirty(e.c, e.u);                              // dirty the unit the undo actually touched
     if (!isCur) {                                           // persist THAT unit directly, leave the displayed one alone

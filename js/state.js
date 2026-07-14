@@ -285,6 +285,17 @@
     if (Object.keys(rle.classes).length) paintR[key(c, u)] = rle; else delete paintR[key(c, u)];
     persist();
   }
+  // Apply a paint-undo change-list to a unit that is NOT currently displayed (no view dense array):
+  // decode its stored RLE (dims come from the RLE), apply [i,old] changes, re-encode. Returns false if
+  // there's no stored RLE to take dims from — then the caller leaves state untouched rather than half-apply.
+  function applyPaintUndoOffscreen(c, u, changes) {
+    const r = paintR[key(c, u)];
+    if (!r || !r.width || !r.height) return false;
+    const dense = paintDense(c, u, r.width, r.height);
+    for (const [i, old] of changes) if (i >= 0 && i < dense.length) dense[i] = old;
+    setPaintDense(c, u, dense, r.width, r.height);
+    return true;
+  }
   const usedClassesInPaint = () => { const s = new Set(); for (const kk in paintR) { const cl = paintR[kk] && paintR[kk].classes; for (const c in (cl || {})) { const n = +c; if (n) s.add(n); } } return [...s]; };
 
   function markVisited(c, u) { visited[key(c, u)] = true; persist(); }
@@ -350,7 +361,7 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
-    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
+    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);
