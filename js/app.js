@@ -55,7 +55,8 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    if (lastBanner && (lastBanner.key === 'shapeMismatchBanner' || lastBanner.key === 'annCorrupt' || lastBanner.key === 'maskBad')) setBanner(null);
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'errLoadUnitFailed', 'perfFailed'];
+    if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
   // A stable per-dataset id lives in a hidden .annotator_dataset.json at the folder root, so
@@ -171,6 +172,7 @@
       if (rm.length) selPointChanges.push(...rm);
     }
     for (const [seg, xy] of view.segsInBrush(x, y, sb.radius)) {
+      if (!segVisible(seg)) continue;                       // honor the geometry filter: never select/deselect a hidden vessel
       if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
       selStrokeSegs.add(seg);
       if (sb.mode === 'add' && State.hasPaint(cur.caseId, cur.unitId)) {   // paint ⟂ selection: wipe paint under a newly-selected segment
@@ -576,7 +578,10 @@
       for (let i = 0; i < srcPaint.length; i++) { const v = srcPaint[i]; if (v && curPaint[i] !== v) { changes.push([i, curPaint[i]]); curPaint[i] = v; paintCopied++; } }
       if (paintCopied) {
         view.setPaint(curPaint);
-        for (const seg of segMap.keys()) { const c2 = view.clearPaintInSegment(seg); if (c2.length) changes.push(...c2); }   // keep paint ⟂ selection
+        // keep paint ⟂ selection. The target was EMPTY before the copy, so every copied pixel's pre-copy
+        // value is 0 and `changes` already records [i,0] for each; do NOT fold clearPaintInSegment's
+        // [i,v] pairs in — that would make undo (last-write-wins) restore phantom paint at cleared pixels.
+        for (const seg of segMap.keys()) view.clearPaintInSegment(seg);
         State.pushPaintUndo(cur.caseId, cur.unitId, changes);
         State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
       } else {
