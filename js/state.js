@@ -270,6 +270,7 @@
     return dense;
   }
   const hasPaint = (c, u) => { const r = paintR[key(c, u)]; return !!(r && r.classes && Object.keys(r.classes).length); };
+  const paintDims = (c, u) => { const r = paintR[key(c, u)]; return (r && r.width && r.height) ? { w: r.width, h: r.height } : null; };   // stored RLE dims (to detect a size mismatch)
   // decode paint for display. If the stored RLE was recorded at other dimensions (frame re-exported at a
   // new size, or annotation.json copied between differently-sized units), don't decode it into the current
   // frame's coordinate grid — that would display paint at wrong locations. Return empty; the stored RLE is
@@ -349,7 +350,7 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
-    hasPaint, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
+    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);

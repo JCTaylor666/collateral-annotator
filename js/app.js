@@ -21,7 +21,8 @@
   let snapTarget = null;                      // {seg,x,y} nearest segment under the cursor (magnetic snap preview)
   let curGeom = null;                         // current unit's geometry.json ({metrics,values,filter,raw}) or null
   let geomLo = 0, geomHi = 0, geomMin = 0, geomMax = 0, geomMetric = null;   // active metric name + its data range [lo,hi] and filter window [min,max]
-  let geomSaveTimer = null, pendingGeom = null;   // debounced write-back of the reviewer's radius window into geometry.json
+  let geomSaveTimer = null;
+  const pendingGeom = new Map();   // unitKey -> {unit, raw}: debounced write-back of each edited unit's radius window into geometry.json
 
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
@@ -55,7 +56,7 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'errLoadUnitFailed', 'perfFailed'];
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
@@ -65,17 +66,25 @@
   // written (no permission yet), fall back to a folder-name id for this session.
   async function ensureDatasetId(root) {
     const FNAME = '.annotator_dataset.json';
-    try {
-      const fh = await root.getFileHandle(FNAME);
-      const o = JSON.parse(await (await fh.getFile()).text());
-      if (o && typeof o.id === 'string' && o.id) return o.id;
-    } catch (e) { /* absent or unreadable — create below */ }
+    let fh = null;
+    try { fh = await root.getFileHandle(FNAME); } catch (e) { /* truly absent — create one below */ }
+    if (fh) {
+      // File EXISTS. If it parses, use its id. If it's present-but-unreadable (corrupt, or a transient
+      // Google-Drive sync glitch), return a STABLE name-based id and DON'T overwrite it with a fresh
+      // random id — minting a new id here would make switchDataset wipe all unsaved state.
+      try {
+        const o = JSON.parse(await (await fh.getFile()).text());
+        if (o && typeof o.id === 'string' && o.id) return o.id;
+      } catch (e) { /* present but unparseable */ }
+      return 'name:' + (root.name || 'unknown');
+    }
     const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
     try { await FS.writeText(root, FNAME, JSON.stringify({ id, created: new Date().toISOString() }, null, 2)); return id; }
     catch (e) { return 'name:' + (root.name || 'unknown'); }
   }
 
   async function openFolder() {
+    flushAutoSave(); flushGeomWrite(true);   // persist any pending edits to the CURRENT dataset before we switch away
     try {
       rootHandle = await FS.pickDirectory();
       cases = await Loader.discover(rootHandle);
@@ -199,6 +208,14 @@
     selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null;
   }
 
+  // realign ci/ui to whatever unit is actually displayed (cur) — used after a load fails/is superseded so
+  // the nav indicator can't point at a frame the canvas isn't showing.
+  function syncNavToCur() {
+    if (!cur) return false;
+    const nc = cases.findIndex(c => c.id === cur.caseId); if (nc < 0) return false;
+    const nu = cases[nc].units.findIndex(u => u.id === cur.unitId); if (nu < 0) return false;
+    ci = nc; ui = nu; return true;
+  }
   async function showUnit(nci, nui) {
     commitActiveStroke();     // never let a live stroke bleed onto the frame we're switching to
     exitCopyPick();           // leaving a frame cancels an in-progress copy-from-frame pick
@@ -215,7 +232,7 @@
     try { data = await loadCur(); }
     catch (e) {
       if (gen !== navGen) return false;          // a newer navigation superseded this one — stay silent
-      ci = prevCi; ui = prevUi;                  // keep nav state matching the still-displayed unit
+      if (!syncNavToCur()) { ci = prevCi; ui = prevUi; }   // realign nav to the unit still on screen (fallback: previous)
       setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
       return false;
     }
@@ -236,6 +253,7 @@
     updateDirtyUI(); updateCopyBtn();
     if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
+    else { const pd = State.hasPaint(c.id, u.id) && State.paintDims(c.id, u.id); if (pd && (pd.w !== data.W || pd.h !== data.H)) setBanner('paintSizeBad', { id: u.id }, 'warn'); }   // stored paint saved at a different size: hidden, and painting will replace it
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
     return true;
   }
@@ -289,6 +307,7 @@
     view.setPlaceholder({ title: u.id, subtitle: I18n.t('shapeMismatchTitle'), hint: I18n.t('shapeMismatchHint'), rows });
     view.setPerfLegend(0);
     view.setSnapPreview(0, 0, false); view.setHovered(0);
+    if (inspect) exitInspect();                              // a placeholder frame has no valid image for the loupe
     exitMarkerArm();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList();
@@ -354,9 +373,12 @@
   }
   function refreshGeomPanel() {                               // show/populate the panel for the current unit (or hide it)
     const panel = $('geomPanel'); if (!panel) return;
-    const has = !!(cur && !cur.virtual && !cur.mismatch && curGeom && curGeom.metrics && curGeom.metrics.length);
-    if (!has) { panel.classList.add('hidden'); view.setVisibleSegs(null); return; }
-    const metrics = curGeom.metrics;
+    const okUnit = !!(cur && !cur.virtual && !cur.mismatch && curGeom && curGeom.metrics && curGeom.metrics.length);
+    // only offer metrics that actually have a value on THIS frame's segments (a metric may be defined only
+    // for ids absent from this label) — prevents selecting a valueless metric and saving a stale window.
+    const segs = okUnit ? view.labelSegs() : [];
+    const metrics = okUnit ? curGeom.metrics.filter(m => segs.some(s => typeof curGeom.values[m][String(s)] === 'number')) : [];
+    if (!metrics.length) { panel.classList.add('hidden'); view.setVisibleSegs(null); return; }
     geomMetric = (curGeom.filter && curGeom.filter.metric && metrics.indexOf(curGeom.filter.metric) >= 0) ? curGeom.filter.metric : metrics[0];
     const sel = $('geomMetric');
     sel.innerHTML = metrics.map(m => '<option value="' + m + '">' + m + '</option>').join('');
@@ -406,7 +428,7 @@
     if (!curGeom || !curGeom.raw || !cur) return;
     curGeom.filter = { metric: geomMetric, min: geomMin, max: geomMax };
     curGeom.raw.filter = { metric: geomMetric, min: geomMin, max: geomMax };   // mutate the (cached) raw object so it round-trips in-session too
-    pendingGeom = { unit: cur.unit, raw: curGeom.raw };       // remember for nav-flush / manual save
+    pendingGeom.set(State.key(cur.caseId, cur.unitId), { unit: cur.unit, raw: curGeom.raw });   // per-unit, so a manual Save persists EVERY edited unit's window (not just the last)
     if ($('autoSave').checked && rootHandle) {
       if (geomSaveTimer) clearTimeout(geomSaveTimer);
       geomSaveTimer = setTimeout(() => flushGeomWrite(false), 600);
@@ -414,10 +436,9 @@
   }
   function flushGeomWrite(force) {
     if (geomSaveTimer) { clearTimeout(geomSaveTimer); geomSaveTimer = null; }
-    const p = pendingGeom;
-    if (!p || !p.unit || !p.unit.handle || !rootHandle || (!force && !$('autoSave').checked)) return;
-    pendingGeom = null;
-    FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).catch(() => {});   // best-effort; a filter write must never block
+    if (!rootHandle || !pendingGeom.size || (!force && !$('autoSave').checked)) return;
+    for (const [, p] of pendingGeom) if (p.unit && p.unit.handle) FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).catch(() => {});   // best-effort; a filter write must never block
+    pendingGeom.clear();
   }
   function ensureActiveClass() {
     if (!classes.length) { State.setActiveClass(null); return; }
@@ -661,12 +682,14 @@
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
-    const c = cur.caseId, u = cur.unitId, unit = curUnit();
+    const c = cur.caseId, u = cur.unitId, unit = curUnit(), k = State.key(c, u);
     State.setNote(c, u, $('note').value);
     try {
-      const data = cache.get(State.key(c, u)) || await Loader.loadUnit(unit);
+      const data = cache.get(k) || await Loader.loadUnit(unit);
+      await backupCorruptOnce(k, unit);                       // preserve an unparseable annotation.json before overwriting it
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(c, u), null, 2));
+      corruptUnits.delete(k);                                 // the file on disk is valid JSON again
       State.markClean(c, u); updateDirtyUI();
       setSaveStatus('noteSaved', { time: hhmm() });
     } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
@@ -766,9 +789,9 @@
     let snap;
     if (State.getMagSnap()) { snap = view.nearestSegNear(x, y, SNAP_SCREEN_R); }
     else { const s = view.segAt(x, y); snap = s ? { seg: s, x, y } : null; }
+    if (snap && !segVisible(snap.seg)) snap = null;           // a filtered-out (hidden) vessel is "not there" → fall through to the background-dot path
     if (snap) {
       const seg = snap.seg;
-      if (!segVisible(seg)) return;                          // clicking a filtered-out (hidden) vessel does nothing
       // paint ⟂ selection: if this click will SELECT the segment, wipe any paint under it first
       if (State.hasPaint(cur.caseId, cur.unitId)) {
         const now = State.selectedSegs(cur.caseId, cur.unitId).find(s => s.seg === seg);

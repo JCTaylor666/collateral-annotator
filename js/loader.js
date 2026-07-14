@@ -49,8 +49,8 @@
     const url = URL.createObjectURL(pngFile);
     const img = await new Promise((resolve, reject) => {
       const im = new Image();
-      im.onload = () => resolve(im);
-      im.onerror = () => reject(new Error(unit.id + ': failed to load frames.png'));
+      im.onload = () => { URL.revokeObjectURL(url); resolve(im); };      // decoded — free the blob URL (no per-frame leak)
+      im.onerror = () => { URL.revokeObjectURL(url); reject(new Error(unit.id + ': failed to load frames.png')); };
       im.src = url;
     });
     const imgW = img.naturalWidth, imgH = img.naturalHeight;
@@ -66,6 +66,9 @@
         const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
         maskShape = mp.shape.slice();
         if (mp.shape.length === 2 && mp.shape[0] === H && mp.shape[1] === W && mp.data.length === W * H) mask = mp.data;
+        // non-2-D, or data shorter than the header claims (truncated) → the shape can't be trusted; flag it
+        // as unreadable so the mismatch panel shows "unreadable" (✗) instead of a false matching-shape ✓.
+        else if (mp.shape.length !== 2 || mp.data.length !== mp.shape.reduce((a, b) => a * b, 1)) maskUnreadable = true;
       } catch (pe) { maskUnreadable = true; }
     } catch (e) { /* mask.npy absent — fine */ }
 
@@ -75,8 +78,7 @@
     const imgOk = (imgW === W && imgH === H);
     const maskOk = !maskPresent || mask !== null;             // absent, or present AND exactly matching
     if (!imgOk || !maskOk) {
-      URL.revokeObjectURL(url);                               // can't align the image to the label grid; drop it
-      return {
+      return {                                                 // (blob URL already revoked on decode)
         shapeMismatch: true,
         W, H,                                                 // nominal (label) grid — used only as the placeholder's cur size
         imgShape: [imgW, imgH],                               // W × H
@@ -89,7 +91,7 @@
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
-    return { W, H, img, url, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, geometry };
+    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from

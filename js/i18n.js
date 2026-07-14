@@ -163,6 +163,7 @@
       annCorrupt: '{id}: annotation.json is unreadable and was left as-is (it will be backed up to annotation.json.corrupt before any save). This frame shows no marks until the file is fixed.',
       classesCorrupt: 'classes.json is unreadable and was left untouched (class names not regenerated). Fix the file to restore your class names.',
       maskBad: '{id}: mask.npy is present but unreadable — the vessel-mask overlay and the brush “foreground only” limit are off for this frame.',
+      paintSizeBad: '{id}: this frame’s saved brush paint was recorded at a different size — it is hidden, and painting here will replace it.',
       savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.'
     },
     zh: {
@@ -320,6 +321,7 @@
       annCorrupt: '{id}：annotation.json 无法解析，已原样保留（保存前会先备份为 annotation.json.corrupt）。修好文件前本帧不显示标注。',
       classesCorrupt: 'classes.json 无法解析，已原样保留（未重新生成类别名）。修好文件即可恢复你的类别名称。',
       maskBad: '{id}：mask.npy 存在但无法解析 —— 本帧的血管 mask 叠加层和笔刷“仅前景”限制已关闭。',
+      paintSizeBad: '{id}：本帧保存的笔刷涂抹是按其它尺寸记录的 —— 已隐藏,在此涂抹会替换掉它。',
       savedPartial: '已保存 {n} 个单元；{failed} 个失败（文件损坏或缺失）—— 这些未被改动。'
     }
   };
