@@ -11,6 +11,11 @@
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
+  // ---- LAYERS (per-frame). The layered content (selections/points/paintR) is bucketed by lkey = caseUnit#layerId
+  // (layer 0 has NO suffix, so single-layer data is byte-identical to the pre-layers format). note/markers/star/dirty
+  // stay per-frame (caseUnit). unitLayers absent => an implicit single layer {id:0,name:'Layer 1'}.
+  let unitLayers = {};        // caseUnit -> [{id, name}]
+  let activeLayerByUnit = {}; // caseUnit -> active layer id (default 0)
   let tool = 'click';                                  // 'click' | 'brush' (top-level: point-select vs pixel-paint)
   let brush = { mode: 'add', radius: 6, onmask: false };
   let clickMode = 'single';                            // within the click tool: 'single' (one segment) | 'brush' (drag to select segments)
@@ -30,7 +35,7 @@
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
   function persist() {
-    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, tool, brush, clickMode, selBrush, magSnap, geomFilter, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
     catch (e) { if (e && (e.name === 'QuotaExceededError' || e.code === 22) && !quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
   }
   function setPersistFailHandler(fn) { onPersistFail = fn; }
@@ -39,6 +44,7 @@
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
         selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
+        unitLayers = o.unitLayers || {}; activeLayerByUnit = o.activeLayerByUnit || {};
         if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
         if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
         if (o.clickMode === 'brush' || o.clickMode === 'single') clickMode = o.clickMode;
@@ -64,7 +70,7 @@
     if (datasetId === newId) return { switched: false, hadDirty: false };
     const hadDirty = Object.keys(dirty).length > 0;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
-    dirty = {}; starred = {}; paintR = {}; undoStack.length = 0;
+    dirty = {}; starred = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;
     datasetId = newId; persist();
     return { switched: true, hadDirty };
   }
@@ -79,11 +85,22 @@
   const getAutoSave = () => autoSave;
   function setAutoSave(b) { autoSave = !!b; persist(); }
 
-  const sel = (c, u) => selections[key(c, u)] || (selections[key(c, u)] = {});   // create-on-read: writers only
-  const pts = (c, u) => points[key(c, u)] || (points[key(c, u)] = []);
-  const selR = (c, u) => selections[key(c, u)] || {};                             // non-creating: readers, so merely displaying a frame doesn't fabricate empty entries that later get saved as empty annotation.json
-  const ptsR = (c, u) => points[key(c, u)] || [];
-  const hasLocal = (c, u) => (key(c, u) in selections) || (key(c, u) in points);
+  // ---- layer plumbing ----
+  const defaultLayers = () => [{ id: 0, name: 'Layer 1' }];
+  const layersOf = (c, u) => unitLayers[key(c, u)] || defaultLayers();            // non-creating read (default = single layer 0)
+  const layersMut = (c, u) => unitLayers[key(c, u)] || (unitLayers[key(c, u)] = defaultLayers());
+  const activeLayerId = (c, u) => { const v = activeLayerByUnit[key(c, u)]; return Number.isFinite(v) ? v : 0; };
+  const lkey = (c, u, L) => L === 0 ? key(c, u) : key(c, u) + '#' + L;            // layer 0 has NO suffix (back-compat)
+  const bkey = (c, u) => lkey(c, u, activeLayerId(c, u));                          // the active layer's bucket
+  // layer-parameterized bucket accessors (used by undo/import/build for a SPECIFIC layer)
+  const selLW = (c, u, L) => selections[lkey(c, u, L)] || (selections[lkey(c, u, L)] = {});
+  const ptsLW = (c, u, L) => points[lkey(c, u, L)] || (points[lkey(c, u, L)] = []);
+
+  const sel = (c, u) => selLW(c, u, activeLayerId(c, u));   // active-layer, create-on-read: writers only
+  const pts = (c, u) => ptsLW(c, u, activeLayerId(c, u));
+  const selR = (c, u) => selections[bkey(c, u)] || {};                             // non-creating: readers, so merely displaying a frame doesn't fabricate empty entries that later get saved as empty annotation.json
+  const ptsR = (c, u) => points[bkey(c, u)] || [];
+  const hasLocal = (c, u) => (bkey(c, u) in selections) || (bkey(c, u) in points);
   const selectedIds = (c, u) => Object.keys(selR(c, u)).map(Number).sort((a, b) => a - b);
   const count = (c, u) => Object.keys(selR(c, u)).length;
   // click coords of selected segments (for red dots); skip any without a real coord
@@ -99,6 +116,45 @@
   const pointItems = (c, u) => ptsR(c, u).map(p => ({ xy: ptXY(p), cls: ptCls(p) }));                // coords + class, for copy/json
   const pointCount = (c, u) => ptsR(c, u).length;
   const markCount = (c, u) => count(c, u) + pointCount(c, u);
+
+  // ---- layer API (per-frame) ----
+  const getLayers = (c, u) => layersOf(c, u).map(l => ({ id: l.id, name: l.name }));
+  const getActiveLayer = (c, u) => activeLayerId(c, u);
+  function setActiveLayer(c, u, id) { if (layersOf(c, u).some(l => l.id === id)) { activeLayerByUnit[key(c, u)] = id; persist(); } }
+  const nextLayerId = (c, u) => layersOf(c, u).reduce((m, l) => Math.max(m, l.id), -1) + 1;
+  function addLayer(c, u, name) {
+    const list = layersMut(c, u), id = nextLayerId(c, u);
+    list.push({ id, name: name || ('Layer ' + (id + 1)) });
+    activeLayerByUnit[key(c, u)] = id;                        // switch to the fresh (empty) layer
+    markDirty(c, u); persist(); return id;
+  }
+  function deleteLayer(c, u, id) {
+    const k = key(c, u), list = layersMut(c, u);
+    if (list.length <= 1) {                                   // min 1 layer: "delete the only layer" == clear its content
+      const L = list[0].id;
+      selections[lkey(c, u, L)] = {}; points[lkey(c, u, L)] = []; delete paintR[lkey(c, u, L)];
+      undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker'));
+      markDirty(c, u); persist(); return;
+    }
+    const idx = list.findIndex(l => l.id === id); if (idx < 0) return;
+    list.splice(idx, 1);
+    delete selections[lkey(c, u, id)]; delete points[lkey(c, u, id)]; delete paintR[lkey(c, u, id)];
+    undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker' && (e.layer || 0) === id));
+    if (activeLayerId(c, u) === id) activeLayerByUnit[k] = list[0].id;   // was active → fall back to the first remaining
+    markDirty(c, u); persist();
+  }
+  function renameLayer(c, u, id, name) { const l = layersMut(c, u).find(x => x.id === id); if (l) { l.name = String(name || l.name); markDirty(c, u); persist(); } }
+  // read ONE layer's raw content (for copy-from-frame, which mirrors all of a source frame's layers)
+  function readLayer(c, u, L) {
+    const s = selections[lkey(c, u, L)] || {}, p = points[lkey(c, u, L)] || [], pr = paintR[lkey(c, u, L)] || null;
+    const ly = layersOf(c, u).find(x => x.id === L);
+    return {
+      id: L, name: ly ? ly.name : ('Layer ' + (L + 1)),
+      segs: Object.keys(s).map(k => ({ seg: +k, cls: segCls(s[k]), xy: segXY(s[k]) })),
+      points: p.map(pt => ({ xy: ptXY(pt), cls: ptCls(pt) })),
+      paint: pr,
+    };
+  }
 
   const getActiveClass = () => activeClass;
   function setActiveClass(cls) { activeClass = Number.isFinite(cls) ? cls : null; persist(); }
@@ -156,12 +212,12 @@
     const s = sel(c, u), ks = String(seg), prev = (ks in s) ? s[ks] : null;
     if (prev !== null && segCls(prev) === (cls == null ? null : cls)) { delete s[ks]; }
     else { s[ks] = { xy: [clickXY[0], clickXY[1]], cls: cls == null ? null : cls }; }
-    undoStack.push({ kind: 'seg', c, u, ks, prev });
+    undoStack.push({ kind: 'seg', c, u, layer: activeLayerId(c, u), ks, prev });
     persist();
   }
-  function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, op: 'add' }); persist(); }
-  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, op: 'remove', index, item }); persist(); }
-  function pushPaintUndo(c, u, changes) { undoStack.push({ kind: 'paint', c, u, changes }); }
+  function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'add' }); persist(); }
+  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'remove', index, item }); persist(); }
+  function pushPaintUndo(c, u, changes) { undoStack.push({ kind: 'paint', c, u, layer: activeLayerId(c, u), changes }); }
   // brush-select: select (or deselect) a segment WITHOUT its own undo/persist entry — the caller
   // batches a whole drag into one undo via pushSegBatchUndo, and persists once via markDirty.
   // Returns { ks, prev } describing the change, or null if nothing changed (idempotent).
@@ -177,7 +233,7 @@
     s[ks] = { xy: [xy[0], xy[1]], cls: want };
     return { ks, prev };
   }
-  function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) undoStack.push({ kind: 'segbatch', c, u, changes }); }
+  function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) undoStack.push({ kind: 'segbatch', c, u, layer: activeLayerId(c, u), changes }); }
   // brush-select ERASE also clears background red dots: remove every point inside the circle WITHOUT its
   // own undo/persist (the whole drag is batched via pushPointBatchUndo). Returns [{index,item}] desc by index.
   function removePointsInCircle(c, u, cx, cy, r) {
@@ -189,32 +245,44 @@
     }
     return removed;
   }
-  function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) undoStack.push({ kind: 'pointbatch', c, u, removed }); }
+  function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) undoStack.push({ kind: 'pointbatch', c, u, layer: activeLayerId(c, u), removed }); }
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
+    const L = e.layer || 0;   // the layer this entry belongs to (marker is frame-level; L unused there)
     if (e.kind === 'point') {
-      const a = pts(e.c, e.u);
+      const a = ptsLW(e.c, e.u, L);
       if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
     } else if (e.kind === 'marker') {
       const a = mksMut(e.c, e.u);
       if (e.op === 'add') a.pop(); else a.splice(e.index, 0, e.item);
     } else if (e.kind === 'paint') {
-      /* paint undo needs the view's dense array — the caller (app) applies e.changes then re-encodes */
+      /* paint undo needs the view's dense array — the caller (app) applies e.changes to e.layer then re-encodes */
     } else if (e.kind === 'segbatch') {
-      const s = sel(e.c, e.u);
+      const s = selLW(e.c, e.u, L);
       for (const ch of e.changes) { if (ch.prev === null) delete s[ch.ks]; else s[ch.ks] = ch.prev; }
     } else if (e.kind === 'pointbatch') {
-      const a = pts(e.c, e.u);
+      const a = ptsLW(e.c, e.u, L);
       for (let i = e.removed.length - 1; i >= 0; i--) a.splice(e.removed[i].index, 0, e.removed[i].item);   // re-insert ascending by original index
     } else {
-      const s = sel(e.c, e.u);
+      const s = selLW(e.c, e.u, L);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
     }
     persist(); return e;
   }
-  function clearUnit(c, u) { selections[key(c, u)] = {}; points[key(c, u)] = []; delete paintR[key(c, u)]; delete starred[key(c, u)]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
-  // wipe a unit's in-memory annotation so it can be re-seeded from disk (used for clean units on load)
-  function resetUnit(c, u) { const k = key(c, u); delete selections[k]; delete points[k]; delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete paintR[k]; undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist(); }
+  // "Clear this unit" = clear the ACTIVE layer's content only (star / markers / note / other layers are kept).
+  function clearUnit(c, u) {
+    const L = activeLayerId(c, u);
+    selections[lkey(c, u, L)] = {}; points[lkey(c, u, L)] = []; delete paintR[lkey(c, u, L)];
+    undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker' && (e.layer || 0) === L));
+    persist();
+  }
+  // wipe a unit's in-memory annotation (ALL layers + frame-level) so it can be re-seeded from disk (clean units on load)
+  function resetUnit(c, u) {
+    const k = key(c, u), pfx = k + '#';
+    for (const store of [selections, points, paintR]) for (const kk of Object.keys(store)) if (kk === k || kk.startsWith(pfx)) delete store[kk];
+    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete activeLayerByUnit[k];
+    undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist();
+  }
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
   function markDirty(c, u) { dirty[key(c, u)] = true; persist(); }
@@ -269,86 +337,133 @@
     }
     return dense;
   }
-  const hasPaint = (c, u) => { const r = paintR[key(c, u)]; return !!(r && r.classes && Object.keys(r.classes).length); };
-  const paintDims = (c, u) => { const r = paintR[key(c, u)]; return (r && r.width && r.height) ? { w: r.width, h: r.height } : null; };   // stored RLE dims (to detect a size mismatch)
+  const hasPaint = (c, u) => { const r = paintR[bkey(c, u)]; return !!(r && r.classes && Object.keys(r.classes).length); };
+  const paintDims = (c, u) => { const r = paintR[bkey(c, u)]; return (r && r.width && r.height) ? { w: r.width, h: r.height } : null; };   // stored RLE dims (to detect a size mismatch)
   // decode paint for display. If the stored RLE was recorded at other dimensions (frame re-exported at a
   // new size, or annotation.json copied between differently-sized units), don't decode it into the current
   // frame's coordinate grid — that would display paint at wrong locations. Return empty; the stored RLE is
   // left untouched (buildAnnotation writes it verbatim) so a load+save can't destroy it.
   const paintDense = (c, u, W, H) => {
-    const r = paintR[key(c, u)];
+    const r = paintR[bkey(c, u)];
     if (r && (r.encoding !== 'rle_rows_v1' || (r.width && r.width !== W) || (r.height && r.height !== H))) return new Uint16Array(W * H);
     return rleDecode(r, W, H);
   };
   function setPaintDense(c, u, dense, W, H) {
     const rle = rleEncode(dense, W, H);
-    if (Object.keys(rle.classes).length) paintR[key(c, u)] = rle; else delete paintR[key(c, u)];
+    if (Object.keys(rle.classes).length) paintR[bkey(c, u)] = rle; else delete paintR[bkey(c, u)];
     persist();
   }
-  // Apply a paint-undo change-list to a unit that is NOT currently displayed (no view dense array):
-  // decode its stored RLE (dims come from the RLE), apply [i,old] changes, re-encode. Returns false if
-  // there's no stored RLE to take dims from — then the caller leaves state untouched rather than half-apply.
-  function applyPaintUndoOffscreen(c, u, changes) {
-    const r = paintR[key(c, u)];
+  // Apply a paint-undo change-list to a paint bucket that is NOT currently displayed (other unit OR other
+  // layer of the current unit): decode that layer's stored RLE (dims from the RLE), apply [i,old], re-encode.
+  // Returns false if there's no stored RLE to take dims from — the caller then leaves state untouched.
+  function applyPaintUndoOffscreen(c, u, changes, layer) {
+    const lk = lkey(c, u, layer || 0), r = paintR[lk];
     if (!r || !r.width || !r.height) return false;
-    const dense = paintDense(c, u, r.width, r.height);
+    const dense = rleDecode(r, r.width, r.height);
     for (const [i, old] of changes) if (i >= 0 && i < dense.length) dense[i] = old;
-    setPaintDense(c, u, dense, r.width, r.height);
-    return true;
+    const rle = rleEncode(dense, r.width, r.height);
+    if (Object.keys(rle.classes).length) paintR[lk] = rle; else delete paintR[lk];
+    persist(); return true;
   }
   const usedClassesInPaint = () => { const s = new Set(); for (const kk in paintR) { const cl = paintR[kk] && paintR[kk].classes; for (const c in (cl || {})) { const n = +c; if (n) s.add(n); } } return [...s]; };
 
   function markVisited(c, u) { visited[key(c, u)] = true; persist(); }
   const isVisited = (c, u) => !!visited[key(c, u)];
 
-  // seed selections + background points from a file's annotation.json (convert its coord_order to internal x,y)
-  function importAnnotation(c, u, ann) {
-    if (!ann) return;
-    const order = ann.coord_order === 'yx' ? 'yx' : 'xy';
+  // seed ONE layer's selections/points/paint from a v5-shaped object (its own coord_order already resolved to `order`)
+  function importLayerContent(c, u, L, obj, order) {
     const conv = arr => order === 'xy' ? [arr[0], arr[1]] : [arr[1], arr[0]];
-    if (Array.isArray(ann.collaterals)) {
-      const s = sel(c, u);
-      for (const item of ann.collaterals) {
+    if (Array.isArray(obj.collaterals)) {
+      const s = selLW(c, u, L);
+      for (const item of obj.collaterals) {
         if (!item || typeof item !== 'object') continue;   // a null/garbage element must not abort the whole import (and the folder open)
         const id = Number(item.id); if (!Number.isFinite(id)) continue;
         const xy = (Array.isArray(item.click) && item.click.length === 2) ? conv(item.click) : [-1, -1];
         s[String(id)] = { xy, cls: Number.isFinite(item.class) ? item.class : null };
       }
     }
-    if (Array.isArray(ann.points)) {
-      const a = pts(c, u);
-      for (const item of ann.points) {
+    if (Array.isArray(obj.points)) {
+      const a = ptsLW(c, u, L);
+      for (const item of obj.points) {
         const click = Array.isArray(item) ? item : (item && item.click);
         if (Array.isArray(click) && click.length === 2) a.push({ xy: conv(click), cls: (item && Number.isFinite(item.class)) ? item.class : null });
       }
     }
+    if (obj.paint && obj.paint.classes && typeof obj.paint.classes === 'object') paintR[lkey(c, u, L)] = obj.paint;
+  }
+  // seed a frame from its annotation.json. v6 → each layer into its bucket + set the layer list/active;
+  // flat v5 (or older) → a single layer 0. star is frame-level.
+  function importAnnotation(c, u, ann) {
+    if (!ann) return;
+    const order = ann.coord_order === 'yx' ? 'yx' : 'xy';
+    if (Array.isArray(ann.layers) && ann.layers.length) {
+      const list = [];
+      for (const ly of ann.layers) {
+        if (!ly || typeof ly !== 'object') continue;
+        const id = Number(ly.id); if (!Number.isFinite(id)) continue;
+        list.push({ id, name: String(ly.name || ('Layer ' + (id + 1))) });
+        importLayerContent(c, u, id, ly, order);
+      }
+      if (list.length) {
+        unitLayers[key(c, u)] = list;
+        const a = Number(ann.active_layer);
+        activeLayerByUnit[key(c, u)] = (Number.isFinite(a) && list.some(x => x.id === a)) ? a : list[0].id;
+      }
+    } else {
+      importLayerContent(c, u, 0, ann, order);   // flat v5 → layer 0 (unitLayers left absent = implicit single layer)
+    }
     if (ann.starred === true) starred[key(c, u)] = true;
-    if (ann.paint && ann.paint.classes && typeof ann.paint.classes === 'object') paintR[key(c, u)] = ann.paint;
     persist();
   }
 
-  function buildAnnotation(c, u, W, H) {
-    const s = sel(c, u);
+  // build one layer's { collaterals, points, paint } (non-creating reads)
+  function layerContentOut(c, u, L) {
     const enc = xy => coordOrder === 'xy' ? [xy[0], xy[1]] : [xy[1], xy[0]];
+    const s = selections[lkey(c, u, L)] || {};
     const collaterals = Object.keys(s).map(Number).sort((a, b) => a - b).map(id => {
       const v = s[String(id)], o = { id, click: enc(segXY(v)) }, cls = segCls(v);
       if (cls != null) o.class = cls;
       return o;
     });
-    const pointsOut = pts(c, u).map(p => { const o = { click: enc(ptXY(p)) }; const cl = ptCls(p); if (cl != null) o.class = cl; return o; });
-    const out = { schema_version: 5, case: c, unit: u, image_size: [W, H], coord_order: coordOrder, collaterals, points: pointsOut };
+    const p = points[lkey(c, u, L)] || [];
+    const pointsOut = p.map(pt => { const o = { click: enc(ptXY(pt)) }; const cl = ptCls(pt); if (cl != null) o.class = cl; return o; });
+    return { collaterals, points: pointsOut, paint: paintR[lkey(c, u, L)] || null };
+  }
+  function buildAnnotation(c, u, W, H) {
+    const layers = layersOf(c, u), base = { case: c, unit: u, image_size: [W, H], coord_order: coordOrder };
+    if (layers.length <= 1) {                                  // one layer → flat v5 (byte-compatible with the pre-layers format)
+      const ct = layerContentOut(c, u, layers[0] ? layers[0].id : 0);
+      const out = { schema_version: 5, ...base, collaterals: ct.collaterals, points: ct.points };
+      if (starred[key(c, u)]) out.starred = true;
+      if (ct.paint) out.paint = ct.paint;
+      return out;
+    }
+    const layersOut = layers.map(ly => {                       // ≥2 layers → v6
+      const ct = layerContentOut(c, u, ly.id), o = { id: ly.id, name: ly.name, collaterals: ct.collaterals, points: ct.points };
+      if (ct.paint) o.paint = ct.paint;
+      return o;
+    });
+    const out = { schema_version: 6, ...base, active_layer: activeLayerId(c, u), layers: layersOut };
     if (starred[key(c, u)]) out.starred = true;
-    if (paintR[key(c, u)]) out.paint = paintR[key(c, u)];
     return out;
   }
 
-  const unitsWithData = () => [...new Set([...Object.keys(selections), ...Object.keys(visited), ...Object.keys(points), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(paintR)])];
-  // does this unit hold anything actually worth writing to disk? (used to skip empty, merely-viewed frames)
+  const unitsWithData = () => {   // frame keys (strip the #layer suffix so a unit isn't listed once per layer)
+    const set = new Set();
+    const addStrip = k => { const i = k.indexOf('#'); set.add(i >= 0 ? k.slice(0, i) : k); };
+    [...Object.keys(selections), ...Object.keys(points), ...Object.keys(paintR)].forEach(addStrip);
+    [...Object.keys(visited), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred)].forEach(k => set.add(k));
+    return [...set];
+  };
+  // does this unit hold anything actually worth writing to disk (across ALL layers)? (skip empty, merely-viewed frames)
   function unitHasContent(c, u) {
     const k = key(c, u);
-    if (selections[k] && Object.keys(selections[k]).length) return true;
-    if (points[k] && points[k].length) return true;
-    if (paintR[k] && paintR[k].classes && Object.keys(paintR[k].classes).length) return true;
+    for (const ly of layersOf(c, u)) {
+      const lk = lkey(c, u, ly.id);
+      if (selections[lk] && Object.keys(selections[lk]).length) return true;
+      if (points[lk] && points[lk].length) return true;
+      const p = paintR[lk]; if (p && p.classes && Object.keys(p.classes).length) return true;
+    }
     if (starred[k]) return true;
     if (notes[k] && notes[k].length) return true;
     if (noteMarkers[k] && noteMarkers[k].length) return true;
@@ -363,5 +478,6 @@
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, key,
+    getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);
