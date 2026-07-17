@@ -26,7 +26,7 @@
 </ul></div>
 <div class="doc-sec"><h4><code>frames.png</code> — input, required</h4><ul>
 <li>The DSA frame as a grayscale PNG. The tool reads the <b>red channel</b> as the raw gray value (0–255) for contrast windowing and the inspect loupe.</li>
-<li>Width/height must exactly match <code>label.npy</code> (W = shape[1], H = shape[0]) — otherwise the frame fails to load with an error.</li>
+<li>Width/height must exactly match <code>label.npy</code> (W = shape[1], H = shape[0]). If they disagree, the frame is <b>not</b> opened for editing — it shows a grey placeholder panel listing the three shapes (see “Shape rule” under <code>mask.npy</code>).</li>
 </ul></div>
 <div class="doc-sec"><h4><code>label.npy</code> — input, required</h4><ul>
 <li>NumPy 2-D array, shape <code>(H, W)</code>, C-order, little-endian. dtype <code>uint16</code> (uint8 / int32 / uint32 also accepted; fortran_order is rejected).</li>
@@ -34,7 +34,8 @@
 </ul></div>
 <div class="doc-sec"><h4><code>mask.npy</code> — input, optional</h4><ul>
 <li>2-D <code>(H, W)</code> uint8 array of 0/1: the vessel mask. Rendered as the bright-blue overlay; also limits the brush when “Foreground only” is checked.</li>
-<li>If missing, or its shape mismatches label.npy, it is silently ignored (no overlay).</li>
+<li><b>Shape rule:</b> <code>frames.png</code>, <code>label.npy</code>, and <code>mask.npy</code> (when present) must all share one H×W. If any disagree, the frame becomes a view-only grey placeholder that lists the shapes — it is never annotated or saved.</li>
+<li>If <code>mask.npy</code> is <b>absent</b> there is simply no overlay (everything else works). If it is <b>present</b> it must match exactly — a present mask with a different shape, or one that is truncated / non-2-D, triggers the placeholder above (it is <em>not</em> silently ignored).</li>
 </ul></div>
 <div class="doc-sec"><h4><code>geometry.json</code> — input + output, optional</h4>
 <pre class="doc-tree">{ "segments": {
@@ -136,7 +137,7 @@
 </ul></div>
 <div class="doc-sec"><h4><code>frames.png</code> — 输入，必需</h4><ul>
 <li>DSA 帧图像，灰度 PNG。工具读取其<b>红色通道</b>作为原始灰度值（0–255），用于窗宽窗位和检视放大镜。</li>
-<li>宽高必须与 <code>label.npy</code> 一致（W = shape[1]，H = shape[0]），否则该帧报错不加载。</li>
+<li>宽高必须与 <code>label.npy</code> 完全一致（W = shape[1]，H = shape[0]）。若不一致，该帧<b>不</b>进入编辑，而是显示一个灰色占位面板列出三者的尺寸（见 <code>mask.npy</code> 下的“尺寸规则”）。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>label.npy</code> — 输入，必需</h4><ul>
 <li>NumPy 二维数组，shape <code>(H, W)</code>，C 序、小端。dtype <code>uint16</code>（也接受 uint8 / int32 / uint32；fortran_order 会报错）。</li>
@@ -144,7 +145,8 @@
 </ul></div>
 <div class="doc-sec"><h4><code>mask.npy</code> — 输入，可选</h4><ul>
 <li>二维 <code>(H, W)</code> uint8 的 0/1 血管 mask。显示为亮蓝叠加层；勾选“仅前景”时限制笔刷范围。</li>
-<li>缺失或尺寸不匹配时静默忽略（不显示叠加层）。</li>
+<li><b>尺寸规则：</b><code>frames.png</code>、<code>label.npy</code>、以及存在时的 <code>mask.npy</code> 必须同为一个 H×W。任一不符，该帧就变成只读的灰色占位面板并列出各自尺寸，不会被标注或保存。</li>
+<li><code>mask.npy</code> <b>缺失</b>时只是没有叠加层（其它功能正常）；<b>存在</b>时必须尺寸完全一致——存在但尺寸不符、或被截断/非二维的 mask 会触发上面的占位面板，<em>不是</em>静默忽略。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>geometry.json</code> — 输入 + 输出，可选</h4>
 <pre class="doc-tree">{ "segments": {
