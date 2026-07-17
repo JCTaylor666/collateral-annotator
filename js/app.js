@@ -8,7 +8,7 @@
   let rootHandle = null, cases = [], ci = 0, ui = 0;
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
-  const perfCache = new Map();                 // caseId -> { W,H,rgba,canvas } | 'computing' | 'failed' (arrival-time perfusion map)
+  const perfCache = new Map();                 // caseId -> { fields, rendered, radius } | 'failed' (arrival-time fields cached once; coloured on demand at the current smoothness)
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
@@ -42,6 +42,7 @@
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
   let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
   let navBusy = false;     // a frame load is in flight: block new strokes (they'd straddle the old/new frame)
+  let perfSmoothRAF = false;   // coalesce perfusion re-colours while dragging the smoothness slider
 
   const curCase = () => cases[ci];
   const curUnit = () => curCase() && curCase().units[ui];
@@ -134,13 +135,23 @@
     return data;
   }
 
-  // Compute (once, cached) a case's arrival-time perfusion map from its raw frame grays. No mask/labels.
+  // Analyze (once, cached) a case's arrival-time FIELDS from its raw frame grays, then colour on demand.
+  // The expensive part (gather every frame's gray + per-pixel argmin) runs once; the smoothness slider
+  // only re-colours (Perfusion.render) the cached fields — no re-read, no re-analyze.
   const perfInflight = new Map();   // caseId -> Promise (so concurrent callers share one computation)
+  // rendered perfusion map at the CURRENT smoothness (lazy re-colour when the slider moved). null if not ready/failed.
+  function perfView(c) {
+    const e = perfCache.get(c && c.id);
+    if (!e || e === 'failed' || !e.fields) return null;
+    const want = State.getPerfSmooth();
+    if (!e.rendered || e.radius !== want) { e.rendered = window.Perfusion.render(e.fields, want); e.radius = want; }
+    return e.rendered;
+  }
   function ensureCasePerfusion(c) {
     if (!c) return Promise.resolve(null);
     const got = perfCache.get(c.id);
-    if (got && got !== 'failed') return Promise.resolve(got);
     if (got === 'failed') return Promise.resolve(null);
+    if (got && got.fields) return Promise.resolve(perfView(c));   // cached fields -> colour at current smoothness
     if (perfInflight.has(c.id)) return perfInflight.get(c.id);
     const p = (async () => {
       try {
@@ -153,17 +164,19 @@
           if (g.W !== W || g.H !== H) { perfCache.set(c.id, 'failed'); return null; }   // frames must share dimensions
           grays.push(g.gray);
         }
-        const perf = window.Perfusion.compute(grays, W, H);
-        perfCache.set(c.id, perf || 'failed');
-        if (perf && inspect) scheduleLoupe();   // a pinned perfusion tile can now render
-        return perf || null;
+        const fields = window.Perfusion.analyze(grays, W, H);
+        if (!fields) { perfCache.set(c.id, 'failed'); return null; }
+        perfCache.set(c.id, { fields, rendered: null, radius: -1 });
+        const view = perfView(c);   // colour at the current smoothness
+        if (inspect) scheduleLoupe();   // a pinned perfusion tile can now render
+        return view;
       } catch (e) { perfCache.set(c.id, 'failed'); return null; }
       finally { perfInflight.delete(c.id); }
     })();
     perfInflight.set(c.id, p);
     return p;
   }
-  const perfState = c => { const v = perfCache.get(c && c.id); return v === 'failed' ? 'error' : (v && v !== 'failed') ? 'ok' : 'loading'; };
+  const perfState = c => { const v = perfCache.get(c && c.id); return v === 'failed' ? 'error' : (v && v.fields) ? 'ok' : 'loading'; };
 
   // commit an in-progress stroke (pixel-paint OR brush-select) to the CURRENT unit before we navigate
   // away, so its pixels/selection/undo can never be misattributed to (or lost by) the unit we switch to.
@@ -271,21 +284,26 @@
     return true;
   }
 
+  // draw a perfusion map into the main canvas (shared by nav-in and the live smoothness slider). Keeps
+  // zoom/pan (setUnit only re-fits on a dimension change) so re-colouring mid-drag doesn't jump the view.
+  function paintPerfIntoView(perf) {
+    const W = perf.W, H = perf.H;
+    view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
+    view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
+    view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
+    view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
+    view.layout(); view.render(); updateZoomReadout();
+  }
   // the computed, view-only perfusion unit: colour image, no label/mask/annotation
   async function showPerfusionUnit(c, u, gen, prevCi, prevUi) {
     navBusy = true;
     let perf; try { perf = await ensureCasePerfusion(c); } finally { navBusy = false; }
     if (gen !== navGen) return false;                       // superseded by a newer navigation
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
-    const W = perf.W, H = perf.H;
-    cur = { W, H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
+    cur = { W: perf.W, H: perf.H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
     curGeom = null; refreshGeomPanel();                     // perfusion unit has no geometry — hide the panel
-    view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
-    view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
-    view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
-    view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
     exitMarkerArm();
-    view.layout(); view.render(); updateZoomReadout();
+    paintPerfIntoView(perf);
     refreshMeta(); buildFrameList(); buildLayerBar();
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
@@ -772,6 +790,20 @@
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }, 'image/png');
   }
+  // perfusion smoothness slider: re-colour the cached fields at the new radius (no re-read/analyze). Live
+  // while dragging (rAF-coalesced) — updates the shown map and any pinned perfusion loupe tile.
+  function onPerfSmoothInput() {
+    const v = +$('perfSmooth').value;
+    $('perfSmoothv').textContent = v;
+    State.setPerfSmooth(v);
+    if (perfSmoothRAF) return;
+    perfSmoothRAF = true;
+    requestAnimationFrame(() => {
+      perfSmoothRAF = false;
+      if (cur && cur.virtual) { const pv = perfView(curCase()); if (pv) paintPerfIntoView(pv); }
+      if (inspect) { stripSig = ''; scheduleLoupe(); }   // repaint the pinned perfusion tile at the new smoothness
+    });
+  }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -1024,7 +1056,7 @@
       const el = tileEls.get(i); if (!el) continue;
       if (units[i].kind === 'perfusion') {
         const st = perfState(c);
-        Loupe.drawColorTile(el.canvas, st === 'ok' ? perfCache.get(c.id) : null, x, y, S, st);
+        Loupe.drawColorTile(el.canvas, st === 'ok' ? perfView(c) : null, x, y, S, st);   // coloured at the current smoothness
       } else {
         const g = grayOf(c, i);
         let st = 'ok';
@@ -1309,6 +1341,7 @@
     $('loupeMean').checked = !!l0.mean;
     $('loupeSize').value = l0.size; $('loupeSizev').textContent = l0.size;
     $('pinMinip').checked = l0.pinMinip !== false; $('pinPerfusion').checked = l0.pinPerfusion !== false;
+    $('perfSmooth').value = State.getPerfSmooth(); $('perfSmoothv').textContent = State.getPerfSmooth();
     applyLoupeSize();
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
@@ -1343,6 +1376,7 @@
     $('loupeMean').onchange = e => { State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, e.target.checked, +$('loupeSize').value); if (inspect) scheduleLoupe(); };
     const syncPins = () => { State.setLoupePins($('pinMinip').checked, $('pinPerfusion').checked); stripSig = ''; if (inspect) scheduleLoupe(); };
     $('pinMinip').onchange = syncPins; $('pinPerfusion').onchange = syncPins;
+    $('perfSmooth').oninput = onPerfSmoothInput;
     $('btnExportPerf').onclick = exportPerfusion;
     $('loupeSize').oninput = e => { $('loupeSizev').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, $('loupeMean').checked, +e.target.value); applyLoupeSize(); if (inspect) scheduleLoupe(); };
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });

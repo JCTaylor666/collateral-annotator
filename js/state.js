@@ -22,6 +22,7 @@
   let selBrush = { mode: 'add', radius: 8 };           // the segment-select brush: mode add/erase, radius
   let magSnap = false;                                 // single-click select: magnetic snap to nearest vessel (OFF = click exactly on the segment)
   let geomFilter = false;                              // hide segments outside the geometry (radius) range (only when the unit has geometry.json)
+  let perfSmooth = 0;                                  // perfusion map: spatial smoothing radius of the arrival-time field (0 = raw per-pixel, the original look)
   let win = { center: 128, width: 255 };
   let loupe = { zoom: 6, R: 3, mean: false, size: 92, pinMinip: true, pinPerfusion: true };   // size = loupe tile edge in CSS px; pin* = keep minip/perfusion tiles always visible
   let autoSave = true;
@@ -35,7 +36,7 @@
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
   function persist() {
-    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
     catch (e) { if (e && (e.name === 'QuotaExceededError' || e.code === 22) && !quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
   }
   function setPersistFailHandler(fn) { onPersistFail = fn; }
@@ -50,6 +51,7 @@
         if (o.clickMode === 'brush' || o.clickMode === 'single') clickMode = o.clickMode;
         if (typeof o.magSnap === 'boolean') magSnap = o.magSnap;
         if (typeof o.geomFilter === 'boolean') geomFilter = o.geomFilter;
+        if (Number.isFinite(o.perfSmooth)) perfSmooth = clamp(o.perfSmooth | 0, 0, 8);
         if (o.selBrush && typeof o.selBrush === 'object') selBrush = { mode: o.selBrush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.selBrush.radius || 8, 1, 40) };
         coordOrder = o.coordOrder === 'yx' ? 'yx' : 'xy';
         if (o.window && Number.isFinite(o.window.center) && Number.isFinite(o.window.width)) win = { center: o.window.center, width: o.window.width };
@@ -318,6 +320,8 @@
   function setMagSnap(b) { magSnap = !!b; persist(); }
   const getGeomFilter = () => geomFilter;
   function setGeomFilter(b) { geomFilter = !!b; persist(); }
+  const getPerfSmooth = () => perfSmooth;
+  function setPerfSmooth(v) { perfSmooth = clamp(v | 0, 0, 8); persist(); }
   const getSelBrush = () => ({ mode: selBrush.mode, radius: selBrush.radius });
   function setSelBrush(b) { selBrush = { mode: b.mode === 'erase' ? 'erase' : 'add', radius: clamp(b.radius, 1, 40) }; persist(); }
 
@@ -508,7 +512,7 @@
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, getDirtySeq, resetUnit, isStarred, setStarred, caseStarred,
-    getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
+    getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
