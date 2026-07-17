@@ -9,6 +9,10 @@
   let notes = {};    // caseUnit -> note text (mirrors note.json on disk)
   let noteMarkers = {}; // caseUnit -> [{id, xy:[x,y]}] : numbered circle markers referenced from the note
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
+  let editedAt = {}; // caseUnit -> ms of the LAST edit (persisted). Lets open-time reconciliation detect a STALE
+                     // dirty flag: if annotation.json's mtime is newer than this, the disk write happened after
+                     // our last recorded edit (persist() was failing, or the tab died before markClean persisted)
+                     // — so the localStorage copy is the old one and must NOT be re-saved over the newer file.
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
   // ---- LAYERS (per-frame). The layered content (selections/points/paintR) is bucketed by lkey = caseUnit#layerId
@@ -36,15 +40,17 @@
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
   function persist() {
-    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
-    catch (e) { if (e && (e.name === 'QuotaExceededError' || e.code === 22) && !quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, editedAt, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    // warn on ANY persist failure (quota, blocked storage, …) — from here on the localStorage backup is
+    // stale, so the user must rely on save-to-folder; the open-time mtime check guards the reload path.
+    catch (e) { if (!quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
   }
   function setPersistFailHandler(fn) { onPersistFail = fn; }
   function load() {
     try {
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
-        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; starred = o.starred || {}; paintR = o.paint || {};
+        selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; editedAt = o.editedAt || {}; starred = o.starred || {}; paintR = o.paint || {};
         unitLayers = o.unitLayers || {}; activeLayerByUnit = o.activeLayerByUnit || {};
         if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
         if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
@@ -72,7 +78,7 @@
     if (datasetId === newId) return { switched: false, hadDirty: false };
     const hadDirty = Object.keys(dirty).length > 0;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
-    dirty = {}; starred = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;
+    dirty = {}; editedAt = {}; starred = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;
     datasetId = newId; persist();
     return { switched: true, hadDirty };
   }
@@ -293,7 +299,7 @@
   function resetUnit(c, u) {
     const k = key(c, u), pfx = k + '#';
     for (const store of [selections, points, paintR]) for (const kk of Object.keys(store)) if (kk === k || kk.startsWith(pfx)) delete store[kk];
-    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k];
+    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
     // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
     // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
     undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist();
@@ -301,8 +307,10 @@
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
   let dirtySeq = {};   // per-unit edit counter (session-only): lets an async writer detect edits made while it was writing
-  function markDirty(c, u) { const k = key(c, u); dirty[k] = true; dirtySeq[k] = (dirtySeq[k] || 0) + 1; persist(); }
+  function markDirty(c, u) { const k = key(c, u); dirty[k] = true; dirtySeq[k] = (dirtySeq[k] || 0) + 1; editedAt[k] = Date.now(); persist(); }
   const getDirtySeq = (c, u) => dirtySeq[key(c, u)] || 0;
+  const getEditedAt = (c, u) => editedAt[key(c, u)] || 0;          // 0 = unknown (pre-feature data): callers must stay conservative
+  const dirtyCount = () => Object.keys(dirty).length;              // frames with edits not yet on disk
   // seq (optional): only clean if no new edit landed since the caller snapshotted its file content
   function markClean(c, u, seq) { if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return; delete dirty[key(c, u)]; persist(); }
 
@@ -511,7 +519,7 @@
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
-    isDirty, markDirty, markClean, getDirtySeq, resetUnit, isStarred, setStarred, caseStarred,
+    isDirty, markDirty, markClean, getDirtySeq, getEditedAt, dirtyCount, storageKey: LSKEY, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, key,

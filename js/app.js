@@ -88,14 +88,24 @@
   async function openFolder() {
     flushAutoSave(); flushGeomWrite(true);   // persist any pending edits to the CURRENT dataset before we switch away
     try {
-      rootHandle = await FS.pickDirectory();
+      const newRoot = await FS.pickDirectory();
       // Committed to switching. Freeze annotation NOW: the old frame stays visible through the (slow, async)
       // scan below, and a click landing after switchDataset() wipes State would autosave a near-empty file
       // over the OLD dataset's annotation.json via the captured handle — and leak stray marks into the new one.
       commitActiveStroke();
       await flushAutoSave();                 // write any just-committed stroke to the OLD folder before the wipe
+      const prevView = { had: !!cur, ci, ui };
       cur = null; exitCopyPick(); exitMarkerArm();
       $('note').disabled = true; updateCopyBtn();
+      // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
+      // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
+      const newId = await ensureDatasetId(newRoot);
+      if (newId !== State.getDatasetId() && State.dirtyCount() > 0 &&
+          !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) {
+        if (prevView.had) await showUnit(prevView.ci, prevView.ui);   // un-freeze: back to the old dataset
+        return;
+      }
+      rootHandle = newRoot;
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
       for (const c of cases) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
@@ -103,7 +113,7 @@
       const cls = await Loader.loadClasses(rootHandle);
       classes = cls.list; classesFileCorrupt = !cls.ok;
       corruptUnits.clear(); corruptBackedUp.clear();
-      const sw = State.switchDataset(await ensureDatasetId(rootHandle));   // wipe any carryover from a different dataset
+      const sw = State.switchDataset(newId);   // wipe any carryover from a different dataset
       setBanner('scanningExisting');
       await scanDataset();
       ensureActiveClass();
@@ -564,12 +574,21 @@
     const used = new Set(State.usedClasses());
     for (const c of cases) for (const u of c.units) {
       if (u.virtual) continue;                                // perfusion unit has no files on disk
-      let ann = null, note = null, annCorrupt = false;
-      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; } catch (e) { }
+      let ann = null, note = null, annCorrupt = false, annMtime = 0;
+      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; } catch (e) { }
       if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
+      const ea = State.getEditedAt(c.id, u.id);
       if (!State.isDirty(c.id, u.id)) {
         State.resetUnit(c.id, u.id);
         try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the whole scan
+      } else if (ann && annMtime && ea && annMtime > ea) {
+        // Unit is "dirty" in localStorage, but annotation.json was written AFTER our last recorded edit:
+        // the dirty flag is a stale leftover (persist() was failing, or the tab died between the disk write
+        // and markClean's persist). Trusting it would DISPLAY the old work and re-save it over the newer
+        // file. The disk copy is provably newer — import it and drop the stale flag.
+        State.resetUnit(c.id, u.id);
+        try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
+        State.markClean(c.id, u.id);
       }
       collectAnnClasses(ann, used);   // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
     }
@@ -848,7 +867,7 @@
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
     if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
       try { setSaveStatus('saving'); await writeUnit(c.id, u); setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); }
-      catch (e) { setSaveStatus('saveFailed', null, true); }
+      catch (e) { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: u.id }, 'warn'); }
     }
   }
   function buildFrameList() {
@@ -1249,7 +1268,7 @@
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
     try { setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSaveStatus('saved', { time: hhmm() }); }
-    catch (e) { setSaveStatus('autoSaveFailed', null, true); }
+    catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
   }
 
   function undo() {
@@ -1284,7 +1303,7 @@
       if (ou && rootHandle && State.getAutoSave()) {
         setSaveStatus('saving');
         writeUnit(e.c, ou).then(() => { setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); })
-          .catch(() => setSaveStatus('saveFailed', null, true));
+          .catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
       }
       return;
     }
@@ -1479,6 +1498,23 @@
     }
     window.addEventListener('blur', resetTransientInput);
     document.addEventListener('visibilitychange', () => { if (document.hidden) resetTransientInput(); });
+    // Closing / reloading the tab: flush the debounced write immediately and, if any frame is still
+    // unsaved, show the browser's leave-confirmation. Staying gives the in-flight write time to land;
+    // leaving anyway is still safe for the SAME browser (localStorage has every edit) — the dialog exists
+    // so the folder isn't handed over while it's missing the last strokes.
+    window.addEventListener('beforeunload', e => {
+      commitActiveStroke();
+      flushGeomWrite(true); flushAutoSave();
+      if (State.dirtyCount() > 0) { e.preventDefault(); e.returnValue = ''; }
+    });
+    window.addEventListener('pagehide', () => { commitActiveStroke(); flushGeomWrite(true); flushAutoSave(); });   // bfcache / mobile: no dialog possible, just flush
+    // A second tab on the same origin shares (and overwrites) the ONE localStorage backup blob — the
+    // folder files stay safe per-frame, but crash recovery breaks. Warn once when another tab writes it.
+    let multiTabWarned = false;
+    window.addEventListener('storage', ev => {
+      if (ev.key !== State.storageKey || multiTabWarned || !rootHandle) return;
+      multiTabWarned = true; setBanner('multiTabWarn', null, 'warn');
+    });
     view.setOpacity($('opacity').value / 100);
     view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {

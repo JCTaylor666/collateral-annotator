@@ -102,13 +102,15 @@
   async function readAnnotation(unit) {
     let fh;
     try { fh = await unit.handle.getFileHandle('annotation.json'); }
-    catch (e) { return { annotation: null, corrupt: false }; }   // absent
+    catch (e) { return { annotation: null, corrupt: false, mtime: 0 }; }   // absent
     try {
-      const ann = JSON.parse(await (await fh.getFile()).text());
-      if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true };
-      return { annotation: ann, corrupt: false };
+      const file = await fh.getFile();
+      const mtime = file.lastModified || 0;   // when the file was last WRITTEN — lets open-time reconciliation spot a stale localStorage dirty flag
+      const ann = JSON.parse(await file.text());
+      if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true, mtime };
+      return { annotation: ann, corrupt: false, mtime };
     }
-    catch (e) { return { annotation: null, corrupt: true }; }    // present but broken
+    catch (e) { return { annotation: null, corrupt: true, mtime: 0 }; }    // present but broken
   }
   async function readNote(unit) {
     try { const h = await unit.handle.getFileHandle('note.json'); return { note: JSON.parse(await (await h.getFile()).text()) }; }
@@ -141,7 +143,7 @@
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
-    return { annotation: a.annotation, annCorrupt: a.corrupt, note: n.note };
+    return { annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, mtime: a.mtime || 0 };
   }
 
   // read the dataset-level class definitions from classes.json at the root.
