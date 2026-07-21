@@ -12,6 +12,7 @@
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
+  let lastScanStaleBackups = 0;               // # frames whose unsaved local edits were sidecar-backed-up during the last open (disk was newer)
   const corruptUnits = new Set();             // State.key() of units whose annotation.json is present but unparseable
   const corruptBackedUp = new Set();          // …of those, the ones already copied to annotation.json.corrupt
   let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
@@ -95,7 +96,10 @@
       commitActiveStroke();
       await flushAutoSave();                 // write any just-committed stroke to the OLD folder before the wipe
       const prevView = { had: !!cur, ci, ui };
-      cur = null; exitCopyPick(); exitMarkerArm();
+      // Invalidate any in-flight showUnit BEFORE the async scan below: a slow (Google-Drive) loadCur that
+      // resolves during the scan would otherwise pass its `gen === navGen` gate and resurrect the OLD unit
+      // (with the OLD folder handle) into `cur`, re-enabling edits that then autosave into the wrong folder.
+      cur = null; navGen++; exitCopyPick(); exitMarkerArm();
       $('note').disabled = true; updateCopyBtn();
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
@@ -123,7 +127,8 @@
       const okUnit = await showUnit(0, 0);   // may set a per-unit corrupt/mask warning
       // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
       if (okUnit) {
-        if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+        if (lastScanStaleBackups) setBanner('unsavedBackedUp', { n: lastScanStaleBackups }, 'warn');   // highest priority: unsaved edits were superseded by newer disk files (backed up, recoverable)
+        else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
         else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
       }
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
@@ -475,7 +480,10 @@
     if (!metrics.length) { panel.classList.add('hidden'); view.setVisibleSegs(null); return; }
     geomMetric = (curGeom.filter && curGeom.filter.metric && metrics.indexOf(curGeom.filter.metric) >= 0) ? curGeom.filter.metric : metrics[0];
     const sel = $('geomMetric');
-    sel.innerHTML = metrics.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+    sel.innerHTML = '';
+    // metric names come from an untrusted geometry.json — build options via DOM so a name like
+    // `r"><img src=x onerror=…>` can't inject markup (textContent/value, never innerHTML concatenation)
+    for (const m of metrics) { const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o); }
     sel.value = geomMetric;
     $('geomMetricRow').classList.toggle('hidden', metrics.length <= 1);   // show the dropdown only when there's a choice
     panel.classList.remove('hidden');
@@ -545,6 +553,15 @@
   }
   function randomName() { return I18n.t('unnamedPrefix') + Math.random().toString(36).slice(2, 6); }
   // collect every class index used anywhere inside one annotation.json object — flat v5 AND layered v6
+  // canonical ANNOTATION-CONTENT signature (ignores metadata: schema_version/case/unit/image_size/coord_order/
+  // layer_name) so "same annotations, different file wrapper" compares equal — used to avoid a spurious
+  // unsaved-backup when a stale dirty flag actually matches the disk content.
+  function annContentSig(a) {
+    if (!a || typeof a !== 'object') return 'null';
+    const layer = o => ({ collaterals: o.collaterals || [], points: o.points || [], paint: (o.paint && o.paint.classes) || null });
+    if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => ({ id: l.id, ...layer(l) })) });
+    return JSON.stringify({ starred: !!a.starred, layers: [{ id: 0, ...layer(a) }] });
+  }
   function collectAnnClasses(ann, used) {
     const cls = v => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
     const one = o => {
@@ -572,6 +589,7 @@
   // badges are accurate on open + any frame is a valid copy source); auto-add any class used but missing from meta.
   async function scanDataset() {
     const used = new Set(State.usedClasses());
+    let staleDiscarded = 0;
     for (const c of cases) for (const u of c.units) {
       if (u.virtual) continue;                                // perfusion unit has no files on disk
       let ann = null, note = null, annCorrupt = false, annMtime = 0;
@@ -583,9 +601,23 @@
         try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the whole scan
       } else if (ann && annMtime && ea && annMtime > ea) {
         // Unit is "dirty" in localStorage, but annotation.json was written AFTER our last recorded edit:
-        // the dirty flag is a stale leftover (persist() was failing, or the tab died between the disk write
-        // and markClean's persist). Trusting it would DISPLAY the old work and re-save it over the newer
-        // file. The disk copy is provably newer — import it and drop the stale flag.
+        // the dirty flag is probably stale (persist() was failing, or the tab died between the disk write and
+        // markClean's persist), so the disk copy wins the display and re-save. BUT mtime>editedAt can be a
+        // FALSE positive — a folder copy / cloud re-sync bumps mtime without changing content — so we must
+        // never destroy the local edits silently: if they differ from disk, stash them to a sidecar first
+        // (recoverable), then import disk + drop the stale flag. Lossless in every case.
+        try {
+          if (State.unitHasContent(c.id, u.id)) {
+            const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
+            const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
+            // only back up (and alarm) when the local edits DIFFER in content — a spurious dirty flag whose
+            // content already matches disk (the common case after a failed persist) needs neither.
+            if (annContentSig(localAnn) !== annContentSig(ann)) {
+              await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
+              staleDiscarded++;
+            }
+          }
+        } catch (e) { /* best effort — a failed backup must not abort the scan; the flag is still stale per mtime */ }
         State.resetUnit(c.id, u.id);
         try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
         State.markClean(c.id, u.id);
@@ -598,6 +630,7 @@
     // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
     if (added && !classesFileCorrupt) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
     else if (added) classes.sort((a, b) => a.index - b.index);
+    lastScanStaleBackups = staleDiscarded;
   }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
