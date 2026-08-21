@@ -13,6 +13,13 @@
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
   let lastScanStaleBackups = 0;               // # frames whose unsaved local edits were sidecar-backed-up during the last open (disk was newer)
+  let openGen = 0;                            // bumped per openFolder: stale async work (background scan / prefetch / late reads) must never touch the new dataset
+  let scanTotal = 0, scanDone = 0;            // background-scan progress (rendered into #scanProg, NOT the banner)
+  const sessionLoaded = new Set();            // State.key() of units already disk-reconciled THIS session by loadCur — the background scan skips them (re-resetting would wipe the user's undo history)
+  const inflightLoads = new Map();            // State.key() -> Promise<data>: dedups pixel reads between loadCur / prefetch / writeUnit
+  const writingUnits = new Set();             // State.key() of units with an annotation write in flight — the stale-dirty reconcile must not race a save
+  const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
+  let cacheCap = 64;                          // LRU capacity, recomputed per dataset: clamp(3 × largest sequence + 16, 64, 192)
   const corruptUnits = new Set();             // State.key() of units whose annotation.json is present but unparseable
   const corruptBackedUp = new Set();          // …of those, the ones already copied to annotation.json.corrupt
   let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
@@ -118,35 +125,115 @@
       classes = cls.list; classesFileCorrupt = !cls.ok;
       corruptUnits.clear(); corruptBackedUp.clear();
       const sw = State.switchDataset(newId);   // wipe any carryover from a different dataset
-      setBanner('scanningExisting');
-      await scanDataset();
-      ensureActiveClass();
-      cache.clear(); window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
+      openGen++;                                // kill any stale background scan / prefetch / late pixel reads
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear();
+      window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
+      // adaptive LRU capacity: current + previous + next-two sequences always fit, whatever their real sizes
+      const maxSeq = cases.reduce((m, c) => Math.max(m, c.units.filter(un => !un.virtual).length), 0);
+      cacheCap = Math.max(64, Math.min(192, 3 * maxSeq + 16));
+      ensureActiveClass();                      // classes.json is already loaded; the scan may ADD missing ones when it finishes
       buildClassMgr(); buildClassPicker();
       setBanner(null);
-      const okUnit = await showUnit(0, 0);   // may set a per-unit corrupt/mask warning
+      const okUnit = await showUnit(0, 0);      // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
       // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
       if (okUnit) {
-        if (lastScanStaleBackups) setBanner('unsavedBackedUp', { n: lastScanStaleBackups }, 'warn');   // highest priority: unsaved edits were superseded by newer disk files (backed up, recoverable)
-        else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+        if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
         else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
       }
+      startBackgroundScan();                    // badges / copy-sources / class auto-add fill in behind the first frame
     } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
+  }
+
+  // ---- bounded LRU over `cache` (PIXEL data only: decoded image + label + mask; ~2.5MB/frame at 800²).
+  // Map iteration order = insertion order; touching re-inserts at the hot end. Prefetched-but-never-viewed
+  // entries evict first, then oldest; the currently displayed frame never evicts. Annotations do NOT live
+  // here — they are in State, always reconciled from disk on show, so eviction can never lose annotation data.
+  function cacheTouch(k) {
+    const v = cache.get(k); if (v === undefined) return undefined;
+    prefetchCold.delete(k);                                   // it's being USED now — promote out of the cold tier
+    cache.delete(k); cache.set(k, v);
+    return v;
+  }
+  function cacheInsert(k, data, cold) {
+    if (cache.has(k)) cache.delete(k);
+    cache.set(k, data);
+    if (cold) prefetchCold.add(k); else prefetchCold.delete(k);
+    evictOver();
+  }
+  function evictOver() {
+    if (cache.size <= cacheCap) return;
+    const curKey = cur ? State.key(cur.caseId, cur.unitId) : null;
+    for (const coldPass of [true, false]) {                   // pass 1: unviewed prefetches, oldest first; pass 2: oldest of the rest
+      for (const k of cache.keys()) {
+        if (cache.size <= cacheCap) return;
+        if (k === curKey) continue;
+        if (coldPass && !prefetchCold.has(k)) continue;
+        cache.delete(k); prefetchCold.delete(k);
+      }
+    }
+  }
+  // one shared pixel-read path so loadCur / prefetch / writeUnit never double-read the same unit,
+  // and a late read from a switched-away dataset can never pollute the new dataset's cache.
+  function loadUnitCached(u, k, cold) {
+    const hit = cacheTouch(k); if (hit !== undefined) return Promise.resolve(hit);
+    let p = inflightLoads.get(k);
+    if (!p) {
+      const gen = openGen;
+      p = Loader.loadUnit(u).then(data => {
+        inflightLoads.delete(k);
+        if (gen === openGen) cacheInsert(k, data, cold);
+        return data;
+      }, err => { inflightLoads.delete(k); throw err; });
+      inflightLoads.set(k, p);
+    } else if (!cold) p.then(() => { if (cache.has(k)) cacheTouch(k); });   // a real view promotes a pending prefetch
+    return p;
+  }
+
+  // Reconcile ONE unit's State from its on-disk annotation. Shared by loadCur (the frame being shown) and
+  // the background scan (unvisited frames). Returns 'stale-backed-up' when unsaved local edits were
+  // superseded by a provably-newer disk file and stashed to annotation.unsaved-backup.json first.
+  async function reconcileUnitFromDisk(c, u, ann, note, annMtime) {
+    const gen = openGen, k = State.key(c.id, u.id);
+    if (!State.isDirty(c.id, u.id)) {
+      State.resetUnit(c.id, u.id);
+      try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the load
+      return 'clean';
+    }
+    const ea = State.getEditedAt(c.id, u.id);
+    if (!(ann && annMtime && ea && annMtime > ea)) return 'kept-dirty';
+    if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
+    // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
+    // cloud re-sync), so never destroy silently: stash differing local content to a sidecar first.
+    let backedUp = false;
+    try {
+      if (State.unitHasContent(c.id, u.id)) {
+        const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
+        const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
+        if (annContentSig(localAnn) !== annContentSig(ann)) {
+          await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
+          backedUp = true;
+        }
+      }
+    } catch (e) { /* best-effort backup must not abort the reconcile */ }
+    // the backup write yielded: bail if the world moved on (dataset switched, user edited, a save cleaned it)
+    if (gen !== openGen || !State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
+    State.resetUnit(c.id, u.id);
+    try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
+    State.markClean(c.id, u.id);
+    return backedUp ? 'stale-backed-up' : 'stale-clean';
   }
 
   async function loadCur() {
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
-    let data = cache.get(k);
-    if (!data) { data = await Loader.loadUnit(u); cache.set(k, data); }
-    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; }
+    let data = cacheTouch(k);
+    if (data === undefined) data = await loadUnitCached(u, k, false);
+    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; data.annMtime = fresh.mtime || 0; }
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (data.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);
-    // disk is the source of truth: reconcile CLEAN units from disk each load; keep unsaved (dirty) units as-is
-    if (!State.isDirty(c.id, u.id)) {
-      State.resetUnit(c.id, u.id);
-      if (data.annotation) State.importAnnotation(c.id, u.id, data.annotation);
-      if (data.note) State.importNoteJson(c.id, u.id, data.note);
-    }
+    // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH a sidecar backup
+    const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, data.annMtime || 0);
+    sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
+    data.staleBackedUp = rec === 'stale-backed-up';
     return data;
   }
 
@@ -289,13 +376,15 @@
     refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
-    if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
+    if (data.staleBackedUp) setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // this frame's unsaved edits were superseded by a newer file (stashed to the sidecar)
+    else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
     else {   // stored paint saved at a different size (ANY layer): hidden, and painting there will replace it
       const badPaint = State.getLayers(c.id, u.id).some(ly => { const p = State.readLayer(c.id, u.id, ly.id).paint; return p && p.width && p.height && (p.width !== data.W || p.height !== data.H); });
       if (badPaint) setBanner('paintSizeBad', { id: u.id }, 'warn');
     }
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
+    schedulePrefetch();       // warm the rest of this sequence + the next two (bounded, cold-tier, cancellable)
     return true;
   }
 
@@ -585,52 +674,86 @@
     }
     return used;
   }
-  // startup: read every unit's annotation from disk. Import clean units into memory (disk-as-truth, so frame
-  // badges are accurate on open + any frame is a valid copy source); auto-add any class used but missing from meta.
-  async function scanDataset() {
+  // Startup scan, now BACKGROUND + CONCURRENT: reads every unit's annotation to (a) reconcile UNVISITED
+  // units into State (accurate badges + any frame usable as a copy source), (b) auto-add classes used on
+  // disk but missing from classes.json. The displayed frame never depends on this — loadCur reconciles it
+  // at show time. Progress renders in #scanProg (never the banner, which per-frame warnings own).
+  // A new openFolder bumps openGen and this whole scan goes inert.
+  async function startBackgroundScan() {
+    const gen = openGen;
+    const units = [];
+    for (const c of cases) for (const u of c.units) if (!u.virtual) units.push({ c, u });
+    scanTotal = units.length; scanDone = 0; lastScanStaleBackups = 0;
+    updateScanProg();
     const used = new Set(State.usedClasses());
-    let staleDiscarded = 0;
-    for (const c of cases) for (const u of c.units) {
-      if (u.virtual) continue;                                // perfusion unit has no files on disk
-      let ann = null, note = null, annCorrupt = false, annMtime = 0;
-      try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; } catch (e) { }
-      if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
-      const ea = State.getEditedAt(c.id, u.id);
-      if (!State.isDirty(c.id, u.id)) {
-        State.resetUnit(c.id, u.id);
-        try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the whole scan
-      } else if (ann && annMtime && ea && annMtime > ea) {
-        // Unit is "dirty" in localStorage, but annotation.json was written AFTER our last recorded edit:
-        // the dirty flag is probably stale (persist() was failing, or the tab died between the disk write and
-        // markClean's persist), so the disk copy wins the display and re-save. BUT mtime>editedAt can be a
-        // FALSE positive — a folder copy / cloud re-sync bumps mtime without changing content — so we must
-        // never destroy the local edits silently: if they differ from disk, stash them to a sidecar first
-        // (recoverable), then import disk + drop the stale flag. Lossless in every case.
-        try {
-          if (State.unitHasContent(c.id, u.id)) {
-            const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
-            const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
-            // only back up (and alarm) when the local edits DIFFER in content — a spurious dirty flag whose
-            // content already matches disk (the common case after a failed persist) needs neither.
-            if (annContentSig(localAnn) !== annContentSig(ann)) {
-              await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
-              staleDiscarded++;
-            }
-          }
-        } catch (e) { /* best effort — a failed backup must not abort the scan; the flag is still stale per mtime */ }
-        State.resetUnit(c.id, u.id);
-        try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
-        State.markClean(c.id, u.id);
+    let next = 0, stale = 0;
+    const worker = async () => {
+      while (next < units.length) {
+        if (gen !== openGen) return;
+        const { c, u } = units[next++];
+        let ann = null, note = null, annCorrupt = false, annMtime = 0;
+        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; } catch (e) { }
+        if (gen !== openGen) return;
+        if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
+        if (!sessionLoaded.has(State.key(c.id, u.id))) {       // units the user already opened were reconciled by loadCur — skip (keeps their undo history intact)
+          const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
+          if (gen !== openGen) return;
+          if (rec === 'stale-backed-up') stale++;
+        }
+        collectAnnClasses(ann, used);                          // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
+        scanDone++;
+        if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();
       }
-      collectAnnClasses(ann, used);   // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
-    }
-    const have = new Set(classes.map(c => c.index));
+    };
+    await Promise.all(Array.from({ length: Math.min(8, Math.max(1, units.length)) }, worker));
+    if (gen !== openGen) return;
+    scanDone = scanTotal; updateScanProg();
+    lastScanStaleBackups = stale;
+    const have = new Set(classes.map(cl => cl.index));
     let added = 0;
     for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
-    // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
-    if (added && !classesFileCorrupt) { classes.sort((a, b) => a.index - b.index); await saveClasses(); }
-    else if (added) classes.sort((a, b) => a.index - b.index);
-    lastScanStaleBackups = staleDiscarded;
+    if (added) {
+      classes.sort((a, b) => a.index - b.index);
+      ensureActiveClass(); buildClassMgr(); buildClassPicker();
+      // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
+      if (!classesFileCorrupt) await saveClasses();
+    }
+    highlightNav();                                            // frame badges are complete now
+    if (stale) setBanner('unsavedBackedUp', { n: stale }, 'warn');
+  }
+  function updateScanProg() {
+    const el = $('scanProg'); if (!el) return;
+    el.textContent = scanDone < scanTotal ? I18n.t('scanProgress', { done: scanDone, total: scanTotal }) : '';
+  }
+
+  // ---- prefetch: rest of the CURRENT sequence + the next TWO (whatever their real frame counts — nothing
+  // hardcoded). Inserts into the LRU's COLD tier (dies before anything actually viewed), count-capped so the
+  // current sequence always stays resident, deduped via loadUnitCached, dead on any nav/open via gens.
+  let prefetchGen = 0;
+  function schedulePrefetch() {
+    const gen = ++prefetchGen, oGen = openGen;
+    const c0 = curCase(); if (!c0 || !cur || cur.virtual || cur.mismatch || !rootHandle) return;
+    const curLen = c0.units.filter(un => !un.virtual).length;
+    const maxCount = Math.max(0, cacheCap - curLen - 8);       // headroom so prefetch can never push the live sequence out
+    const list = [];
+    for (const cIdx of [ci, ci + 1, ci + 2]) {
+      const c = cases[cIdx]; if (!c) continue;
+      for (const u of c.units) {
+        if (u.virtual || list.length >= maxCount) continue;
+        const k = State.key(c.id, u.id);
+        if (cache.has(k) || inflightLoads.has(k)) continue;
+        list.push({ u, k });
+      }
+    }
+    let next = 0;
+    const worker = async () => {
+      while (next < list.length) {
+        if (gen !== prefetchGen || oGen !== openGen) return;
+        const it = list[next++];
+        try { await loadUnitCached(it.u, it.k, true); } catch (e) { /* best-effort */ }
+      }
+    };
+    for (let i = 0; i < 2; i++) worker();
   }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
@@ -1288,13 +1411,16 @@
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
     const k = State.key(caseId, unit.id);
     const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
-    let data = cache.get(k); if (!data) { data = await Loader.loadUnit(unit); cache.set(k, data); }
-    if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
-    await backupCorruptOnce(k, unit);
-    await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
-    if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
-    corruptUnits.delete(k);   // the file on disk is valid JSON again
-    State.markClean(caseId, unit.id, seq);
+    writingUnits.add(k);                              // the stale-dirty reconcile must never race an in-flight save of the same unit
+    try {
+      let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
+      if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
+      await backupCorruptOnce(k, unit);
+      await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+      if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+      corruptUnits.delete(k);   // the file on disk is valid JSON again
+      State.markClean(caseId, unit.id, seq);
+    } finally { writingUnits.delete(k); }
   }
   async function runAutoSave() {
     saveTimer = null;

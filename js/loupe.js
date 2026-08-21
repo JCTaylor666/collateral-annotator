@@ -5,7 +5,8 @@
 (function (root) {
   'use strict';
 
-  const grayCache = new Map();   // key -> { W, H, gray }
+  const grayCache = new Map();   // key -> { W, H, gray } — bounded LRU (Map order = recency; get() touches)
+  const MAX_GRAY = 96;           // ~0.6MB per 800² frame -> ≤~60MB; oldest evicted, never grows unbounded
   const inflight = new Map();    // key -> Promise
   const failed = new Map();      // key -> failure timestamp (retryable after a cooldown, not permanent)
   const RETRY_MS = 5000;
@@ -30,6 +31,7 @@
       inflight.delete(key);
       if (myEpoch !== epoch) return;      // dataset changed while loading — discard
       grayCache.set(key, g);
+      while (grayCache.size > MAX_GRAY) grayCache.delete(grayCache.keys().next().value);   // evict oldest
       fireReady();
     }).catch(() => {
       inflight.delete(key);
@@ -39,7 +41,11 @@
     return p;
   }
 
-  function get(key) { return grayCache.get(key) || null; }
+  function get(key) {
+    const g = grayCache.get(key); if (!g) return null;
+    grayCache.delete(key); grayCache.set(key, g);            // touch: keep frames the loupe is actually using hot
+    return g;
+  }
   function state(key) {
     if (grayCache.has(key)) return 'ok';
     if (failed.has(key)) return 'error';

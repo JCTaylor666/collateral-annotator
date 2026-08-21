@@ -129,6 +129,7 @@
 
       errNoCases: 'No case_* folders found. Please choose a data root containing case_0001 etc.',
       scanningExisting: 'Scanning existing annotations…',
+      scanProgress: 'Scanning {done}/{total}…',
       errOpenFailed: 'Open failed: {msg}',
       errLoadUnitFailed: '{id} failed to load: {msg}',
       classesSaved: 'Classes saved {time}',
@@ -301,6 +302,7 @@
 
       errNoCases: '没找到 case_* 文件夹,请选包含 case_0001 等的数据根目录。',
       scanningExisting: '正在扫描已有标注…',
+      scanProgress: '扫描中 {done}/{total}…',
       errOpenFailed: '打开失败:{msg}',
       errLoadUnitFailed: '{id} 载入失败:{msg}',
       classesSaved: '类别已保存 {time}',

@@ -91,7 +91,7 @@
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
-    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, geometry };
+    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, annMtime: a.mtime || 0, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
