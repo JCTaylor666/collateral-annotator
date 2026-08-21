@@ -1013,7 +1013,7 @@
         State.removeMarker(cur.caseId, cur.unitId, m.id);
         view.setMarkerHighlight(0);
         State.markDirty(cur.caseId, cur.unitId);
-        refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
+        refreshMarkers(); view.render(); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave();
       };
       chip.onmouseenter = () => { view.setMarkerHighlight(m.id); view.render(); };
       chip.onmouseleave = () => { view.setMarkerHighlight(0); view.render(); };
@@ -1039,10 +1039,10 @@
     State.addMarker(cur.caseId, cur.unitId, [x, y]);
     exitMarkerArm();
     State.markDirty(cur.caseId, cur.unitId);
-    refreshMarkers(); view.render(); updateDirtyUI(); scheduleAutoSave();
+    refreshMarkers(); view.render(); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave();
   }
 
-  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -1171,11 +1171,19 @@
     const k = State.key(curCase().id, curUnit().id);
     document.querySelectorAll('#frameList .frm').forEach(el => {
       const [cc, uu] = el.dataset.k.split('/');
-      const n = State.markCount(cc, uu), active = el.dataset.k === k;
+      const active = el.dataset.k === k;
       el.classList.toggle('active', active);
       el.classList.toggle('done', State.isVisited(cc, uu));
-      el.querySelector('.frm-b').textContent = n ? n : '';
+      el.querySelector('.frm-b').classList.toggle('on', State.unitAnnotated(cc, uu));
       if (active) el.scrollIntoView({ block: 'nearest' });
+    });
+  }
+  // refresh ONE row's annotated-dot, without highlightNav's scroll side-effect (per-keystroke note
+  // input and marker add/delete never changed the old count badge, so they lack highlightNav calls)
+  function updateFrameDot(c, u) {
+    const k = State.key(c, u);
+    document.querySelectorAll('#frameList .frm').forEach(el => {
+      if (el.dataset.k === k) el.querySelector('.frm-b').classList.toggle('on', State.unitAnnotated(c, u));
     });
   }
 

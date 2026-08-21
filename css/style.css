@@ -59,8 +59,8 @@ body.copy-picking .frm{cursor:copy}
 .frm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .frm-virtual .frm-name{font-style:italic}   /* computed view-only unit (perfusion) */
 .loupe-tile.perf .cap{color:#e5484d}
-.frm-b{font-size:11px;color:var(--muted)}
-.frm.active .frm-b{color:var(--accent)}
+.frm-b{width:6px;height:6px;border-radius:50%;flex:none}   /* annotated-dot: blank until .on */
+.frm-b.on{background:#333}
 .frm-star{color:#c9ccd2;font-size:15px;line-height:1;padding:0 1px}
 .frm-star:hover{color:#e5a50a}
 .frm-star.on{color:#e5a50a}

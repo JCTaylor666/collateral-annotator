@@ -519,6 +519,15 @@
     if (noteMarkers[k] && noteMarkers[k].length) return true;
     return false;
   }
+  // frame-list dot: annotated at all? segments / points / paint on ANY layer, or note text / note markers.
+  // Star deliberately excluded — it already shows as ★ in the same row.
+  function unitAnnotated(c, u) {
+    const k = key(c, u);
+    if (unitHasLayerContent(c, u)) return true;
+    if (notes[k] && notes[k].length) return true;
+    if (noteMarkers[k] && noteMarkers[k].length) return true;
+    return false;
+  }
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, setLoupePins, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo, peekUndo,
@@ -527,7 +536,7 @@
     isDirty, markDirty, markClean, getDirtySeq, getEditedAt, dirtyCount, storageKey: LSKEY, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getPerfMask, setPerfMask, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
-    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, key,
+    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);
