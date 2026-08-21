@@ -191,5 +191,16 @@
     }
   }
 
-  root.Loader = { discover, loadUnit, loadAnnotation, loadGray, loadClasses };
+  // Light read of ONLY mask.npy (perfusion minip-mask filter): no PNG decode, no label parse.
+  // Returns { W, H, mask } or null (absent / unreadable / non-2D / truncated).
+  async function loadMask(unit) {
+    try {
+      const mH = await unit.handle.getFileHandle('mask.npy');
+      const mp = root.NPY.parseNpy(await (await mH.getFile()).arrayBuffer());
+      if (mp.shape.length !== 2 || mp.data.length !== mp.shape[0] * mp.shape[1]) return null;
+      return { W: mp.shape[1], H: mp.shape[0], mask: mp.data };
+    } catch (e) { return null; }
+  }
+
+  root.Loader = { discover, loadUnit, loadAnnotation, loadGray, loadClasses, loadMask };
 })(typeof window !== 'undefined' ? window : globalThis);

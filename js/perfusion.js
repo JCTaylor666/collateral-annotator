@@ -61,10 +61,12 @@
   // (amp>=thresh) contribute, weighted by their contrast amplitude (stronger contrast = more reliable
   // arrival estimate); background contributes weight 0, so timing never bleeds into or out of the mask
   // (normalized convolution: result = blur(t*w) / blur(w)). `iters` box passes ≈ a Gaussian.
-  function smoothArrival(fields, radius, iters) {
+  function smoothArrival(fields, radius, iters, mask) {
     const { W, H, tstar, amp, thresh } = fields, N = W * H;
     const num = new Float32Array(N), den = new Float32Array(N), tmpA = new Float32Array(N), tmpB = new Float32Array(N);
-    for (let i = 0; i < N; i++) { const w = amp[i] >= thresh ? amp[i] : 0; num[i] = tstar[i] * w; den[i] = w; }
+    // mask (optional, minip vessel mask): out-of-mask pixels get weight 0 so their (extra-vascular, often
+    // noisy) arrival times can never bleed into the vessel tree through the normalized convolution
+    for (let i = 0; i < N; i++) { const w = (amp[i] >= thresh && (!mask || mask[i])) ? amp[i] : 0; num[i] = tstar[i] * w; den[i] = w; }
     for (let it = 0; it < iters; it++) {
       boxH(num, tmpA, W, H, radius); boxV(tmpA, num, W, H, radius);
       boxH(den, tmpB, W, H, radius); boxV(tmpB, den, W, H, radius);
@@ -76,16 +78,17 @@
 
   // ---- stage 2: colour the (optionally smoothed) arrival-time field. CHEAP + pure — re-run on slider
   // change without re-reading frames. radius 0 == the original per-pixel argmin colouring, byte-identical. ----
-  function render(fields, radius) {
+  function render(fields, radius, mask) {
     if (!fields) return null;
     const { W, H, tstar, amp, thresh, frames } = fields, N = W * H;
     const r = Math.max(0, Math.min(64, radius | 0));
-    const arr = r > 0 ? smoothArrival(fields, r, 2) : null;   // null => use the integer tstar (exact original)
+    if (mask && mask.length !== N) mask = null;               // dimension mismatch: ignore the mask rather than mis-index
+    const arr = r > 0 ? smoothArrival(fields, r, 2, mask) : null;   // null => use the integer tstar (exact original)
     const denom = frames > 1 ? (frames - 1) : 1;
     const rgba = new Uint8ClampedArray(N * 4);
     for (let i = 0; i < N; i++) {
       const p = i * 4;
-      if (amp[i] < thresh) { rgba[p] = rgba[p + 1] = rgba[p + 2] = 12; rgba[p + 3] = 255; continue; }   // dark background (mask UNCHANGED by smoothing)
+      if (amp[i] < thresh || (mask && !mask[i])) { rgba[p] = rgba[p + 1] = rgba[p + 2] = 12; rgba[p + 3] = 255; continue; }   // dark background: below amplitude OR outside the minip vessel mask
       const col = jet((arr ? arr[i] : tstar[i]) / denom);
       rgba[p] = col[0]; rgba[p + 1] = col[1]; rgba[p + 2] = col[2]; rgba[p + 3] = 255;
     }
@@ -94,7 +97,7 @@
       canvas = document.createElement('canvas'); canvas.width = W; canvas.height = H;
       canvas.getContext('2d').putImageData(new ImageData(rgba, W, H), 0, 0);
     }
-    return { W, H, rgba, canvas, frames, smooth: r };
+    return { W, H, rgba, canvas, frames, smooth: r, masked: !!mask };
   }
 
   // one-shot convenience (analyze + colour at a given smoothness; default 0). Kept for existing callers/tests.

@@ -18,6 +18,8 @@
   const sessionLoaded = new Set();            // State.key() of units already disk-reconciled THIS session by loadCur — the background scan skips them (re-resetting would wipe the user's undo history)
   const inflightLoads = new Map();            // State.key() -> Promise<data>: dedups pixel reads between loadCur / prefetch / writeUnit
   const writingUnits = new Set();             // State.key() of units with an annotation write in flight — the stale-dirty reconcile must not race a save
+  const ownWriteAt = new Map();               // State.key() -> ms of OUR last successful annotation write: a file mtime ≤ this+margin is our own write, never "externally newer"
+  const lastSeenMtime = new Map();            // State.key() -> annotation.json mtime at our last reconcile: unchanged mtime on a clean revisit ⇒ skip the reset (preserves undo history)
   const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
   let cacheCap = 64;                          // LRU capacity — BYTE-aware: min(count formula, ~900MB ÷ real per-frame bytes), refined as frames load
   let maxSeqLen = 0;                          // largest sequence (frame count) in the open dataset
@@ -68,7 +70,7 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed'];
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
@@ -108,7 +110,9 @@
       // Invalidate any in-flight showUnit BEFORE the async scan below: a slow (Google-Drive) loadCur that
       // resolves during the scan would otherwise pass its `gen === navGen` gate and resurrect the OLD unit
       // (with the OLD folder handle) into `cur`, re-enabling edits that then autosave into the wrong folder.
-      cur = null; navGen++; exitCopyPick(); exitMarkerArm();
+      // openGen bumps HERE too — before rootHandle changes — so the OLD dataset's background scan/prefetch/
+      // late reconciles go inert immediately (a scan tail must never saveClasses into the NEW folder).
+      cur = null; navGen++; openGen++; exitCopyPick(); exitMarkerArm();
       $('note').disabled = true; updateCopyBtn();
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
@@ -116,6 +120,7 @@
       if (newId !== State.getDatasetId() && State.dirtyCount() > 0 &&
           !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) {
         if (prevView.had) await showUnit(prevView.ci, prevView.ui);   // un-freeze: back to the old dataset
+        startBackgroundScan();                                         // the early openGen++ killed the old scan — restart it
         return;
       }
       rootHandle = newRoot;
@@ -127,8 +132,8 @@
       classes = cls.list; classesFileCorrupt = !cls.ok;
       corruptUnits.clear(); corruptBackedUp.clear();
       const sw = State.switchDataset(newId);   // wipe any carryover from a different dataset
-      openGen++;                                // kill any stale background scan / prefetch / late pixel reads
-      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear();
+      openGen++;                                // second bump: also kills anything started between pick and here
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear();
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
       maxSeqLen = cases.reduce((m, c) => Math.max(m, c.units.filter(un => !un.virtual).length), 0);
@@ -199,9 +204,18 @@
     return p;
   }
 
+  // canonical NOTE-content signature (text + markers as internal [x,y], any coord_order): null/absent == empty
+  function noteContentSig(n) {
+    if (!n || typeof n !== 'object') return JSON.stringify({ t: '', m: [] });
+    const order = n.coord_order === 'yx' ? 'yx' : 'xy';
+    const conv = c2 => (Array.isArray(c2) && c2.length === 2) ? (order === 'xy' ? [c2[0], c2[1]] : [c2[1], c2[0]]) : null;
+    const mks = Array.isArray(n.markers) ? n.markers.map(m => ({ id: m && m.id, p: conv(m && m.click) })) : [];
+    return JSON.stringify({ t: typeof n.text === 'string' ? n.text : '', m: mks });
+  }
   // Reconcile ONE unit's State from its on-disk annotation. Shared by loadCur (the frame being shown) and
   // the background scan (unvisited frames). Returns 'stale-backed-up' when unsaved local edits were
-  // superseded by a provably-newer disk file and stashed to annotation.unsaved-backup.json first.
+  // superseded by a provably-newer disk file and stashed to sidecar backups first. NEVER discards silently:
+  // if a needed sidecar write fails, the local (dirty) copy is kept.
   async function reconcileUnitFromDisk(c, u, ann, note, annMtime) {
     const gen = openGen, k = State.key(c.id, u.id);
     if (!State.isDirty(c.id, u.id)) {
@@ -211,39 +225,67 @@
     }
     const ea = State.getEditedAt(c.id, u.id);
     if (!(ann && annMtime && ea && annMtime > ea)) return 'kept-dirty';
+    if (annMtime <= (ownWriteAt.get(k) || 0) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale
     if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
     // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
-    // cloud re-sync), so never destroy silently: stash differing local content to a sidecar first.
+    // cloud re-sync), so never destroy silently: stash differing local content (ANNOTATION and NOTE —
+    // notes/markers are unsaved content too) to sidecars first. A failed backup keeps the local copy.
     let backedUp = false;
     try {
-      if (State.unitHasContent(c.id, u.id)) {
-        const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
-        const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
-        if (annContentSig(localAnn) !== annContentSig(ann)) {
-          await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
-          backedUp = true;
-        }
+      const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
+      const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
+      if (State.unitHasContent(c.id, u.id) && annContentSig(localAnn) !== annContentSig(ann)) {
+        await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
+        backedUp = true;
       }
-    } catch (e) { /* best-effort backup must not abort the reconcile */ }
-    // the backup write yielded: bail if the world moved on (dataset switched, user edited, a save cleaned it)
+      const localNote = State.buildNote(c.id, u.id);
+      if (State.hasNoteData(c.id, u.id) && noteContentSig(localNote) !== noteContentSig(note)) {
+        await FS.writeText(u.handle, 'note.unsaved-backup.json', JSON.stringify(localNote, null, 2));
+        backedUp = true;
+      }
+    } catch (e) { return 'kept-dirty'; }   // sidecar write FAILED — never proceed to a discard we couldn't back up
+    // the backup writes yielded: bail if the world moved on (dataset switched, user edited, a save cleaned it)
     if (gen !== openGen || !State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
     State.resetUnit(c.id, u.id);
     try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
     State.markClean(c.id, u.id);
     return backedUp ? 'stale-backed-up' : 'stale-clean';
   }
+  // seed a unit's State from disk if this session never did (star-click / Save reaching a frame the
+  // background scan hasn't touched yet, on a browser with no localStorage for this dataset — building
+  // from unseeded State would overwrite the on-disk annotation with an EMPTY one)
+  async function ensureSeeded(c, u) {
+    const k = State.key(c.id, u.id);
+    if (sessionLoaded.has(k)) return;
+    try {
+      const r = await Loader.loadAnnotation(u);
+      await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
+      lastSeenMtime.set(k, r.mtime || 0);
+    } catch (e) { }
+    sessionLoaded.add(k);
+  }
 
   async function loadCur() {
+    const gen = openGen;
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cacheTouch(k);
     if (data === undefined) data = await loadUnitCached(u, k, false);
     else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; data.annMtime = fresh.mtime || 0; }
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
+    if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
     if (data.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);
-    // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH a sidecar backup
-    const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, data.annMtime || 0);
+    const m = data.annMtime || 0;
+    // clean revisit with the disk file unchanged since our last reconcile (or only changed by OUR OWN write):
+    // State already equals disk — skip the reset so the frame's undo history survives navigation.
+    const unchanged = sessionLoaded.has(k) && !State.isDirty(c.id, u.id) &&
+      (m === (lastSeenMtime.get(k) || 0) || m <= (ownWriteAt.get(k) || 0) + 2000);
+    if (!unchanged) {
+      // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
+      const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
+      data.staleBackedUp = rec === 'stale-backed-up';
+    }
+    lastSeenMtime.set(k, m);
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
-    data.staleBackedUp = rec === 'stale-backed-up';
     return data;
   }
 
@@ -255,9 +297,35 @@
   function perfView(c) {
     const e = perfCache.get(c && c.id);
     if (!e || e === 'failed' || !e.fields) return null;
-    const want = State.getPerfSmooth();
-    if (!e.rendered || e.radius !== want) { e.rendered = window.Perfusion.render(e.fields, want); e.radius = want; }
+    const maskOn = State.getPerfMask();
+    const m = (maskOn && e.minipMask && e.minipMask.mask && e.minipMask.W === e.fields.W && e.minipMask.H === e.fields.H) ? e.minipMask.mask : null;
+    if (maskOn && !m) ensureMinipMask(c);                      // kick the lazy load; repaint happens on arrival
+    const key = State.getPerfSmooth() + '|' + (m ? 'm' : 'u');
+    if (!e.rendered || e.renderedKey !== key) { e.rendered = window.Perfusion.render(e.fields, State.getPerfSmooth(), m); e.renderedKey = key; }
     return e.rendered;
+  }
+  // lazily read the CASE's minip mask.npy (light: no PNG decode) for the perfusion filter; repaint on arrival
+  function ensureMinipMask(c) {
+    const e = perfCache.get(c && c.id);
+    if (!c || !e || e === 'failed' || e.minipMask !== undefined) return;   // undefined = never tried
+    const minip = c.units.find(un => un.kind === 'minip');
+    if (!minip) { e.minipMask = null; maybeWarnPerfMask(c); return; }
+    e.minipMask = 'pending';
+    const gen = openGen;
+    Loader.loadMask(minip).then(m => {
+      if (gen !== openGen) return;
+      const e2 = perfCache.get(c.id); if (!e2 || e2 === 'failed') return;
+      e2.minipMask = m;                                        // null = absent/unreadable
+      if (cur && cur.virtual && cur.caseId === c.id) { const pv = perfView(c); if (pv) paintPerfIntoView(pv); maybeWarnPerfMask(c); }
+      if (inspect) { stripSig = ''; scheduleLoupe(); }
+    });
+  }
+  function maybeWarnPerfMask(c) {   // showing the perfusion unit with the filter ON but no usable minip mask
+    if (!cur || !cur.virtual || !c || cur.caseId !== c.id || !State.getPerfMask()) return;
+    const e = perfCache.get(c.id);
+    const m = e && e !== 'failed' && e.minipMask;
+    const usable = m && m.mask && e.fields && m.W === e.fields.W && m.H === e.fields.H;
+    if (m !== undefined && m !== 'pending' && !usable) setBanner('perfMaskUnavailable', null, 'warn');
   }
   function ensureCasePerfusion(c) {
     if (!c) return Promise.resolve(null);
@@ -265,6 +333,7 @@
     if (got === 'failed') return Promise.resolve(null);
     if (got && got.fields) return Promise.resolve(perfView(c));   // cached fields -> colour at current smoothness
     if (perfInflight.has(c.id)) return perfInflight.get(c.id);
+    const pGen = openGen;
     const p = (async () => {
       try {
         const frames = c.units.filter(u => u.kind === 'frame');
@@ -277,8 +346,9 @@
           grays.push(g.gray);
         }
         const fields = window.Perfusion.analyze(grays, W, H);
+        if (pGen !== openGen) return null;                    // dataset switched while computing — a reused case id must not show the OLD dataset's map
         if (!fields) { perfCache.set(c.id, 'failed'); return null; }
-        perfCache.set(c.id, { fields, rendered: null, radius: -1 });
+        perfCache.set(c.id, { fields, rendered: null, renderedKey: '' });
         const view = perfView(c);   // colour at the current smoothness
         if (inspect) scheduleLoupe();   // a pinned perfusion tile can now render
         return view;
@@ -418,6 +488,7 @@
     curGeom = null; refreshGeomPanel();                     // perfusion unit has no geometry — hide the panel
     exitMarkerArm();
     paintPerfIntoView(perf);
+    maybeWarnPerfMask(c);                                   // filter ON but minip mask known-unavailable for this case
     refreshMeta(); buildFrameList(); buildLayerBar();
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
@@ -690,7 +761,7 @@
   // at show time. Progress renders in #scanProg (never the banner, which per-frame warnings own).
   // A new openFolder bumps openGen and this whole scan goes inert.
   async function startBackgroundScan() {
-    const gen = openGen;
+    const gen = openGen, scanRoot = rootHandle;   // saveClasses at the tail must never target a folder opened later
     const units = [];
     for (const c of cases) for (const u of c.units) if (!u.virtual) units.push({ c, u });
     scanTotal = units.length; scanDone = 0; lastScanStaleBackups = 0;
@@ -705,10 +776,12 @@
         try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; } catch (e) { }
         if (gen !== openGen) return;
         if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
-        if (!sessionLoaded.has(State.key(c.id, u.id))) {       // units the user already opened were reconciled by loadCur — skip (keeps their undo history intact)
+        const uk = State.key(c.id, u.id);
+        if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
           if (gen !== openGen) return;
           if (rec === 'stale-backed-up') stale++;
+          lastSeenMtime.set(uk, annMtime);
         }
         collectAnnClasses(ann, used);                          // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
         scanDone++;
@@ -722,7 +795,7 @@
     const have = new Set(classes.map(cl => cl.index));
     let added = 0;
     for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
-    if (added) {
+    if (added && scanRoot === rootHandle) {
       classes.sort((a, b) => a.index - b.index);
       ensureActiveClass(); buildClassMgr(); buildClassPicker();
       // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
@@ -965,7 +1038,17 @@
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
-    const perf = await ensureCasePerfusion(c);
+    let perf = await ensureCasePerfusion(c);
+    if (State.getPerfMask() && perf) {                       // wait for the minip mask (bounded) so the export matches the on-screen filter
+      ensureMinipMask(c);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 4000) {
+        const e = perfCache.get(c.id);
+        if (!e || e === 'failed' || (e.minipMask !== undefined && e.minipMask !== 'pending')) break;
+        await new Promise(r => setTimeout(r, 60));
+      }
+      perf = perfView(c) || perf;
+    }
     if (!perf || !perf.canvas) { setBanner('perfFailed', null, 'warn'); return; }
     perf.canvas.toBlob(blob => {
       if (!blob) return;
@@ -975,19 +1058,31 @@
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }, 'image/png');
   }
-  // perfusion smoothness slider: re-colour the cached fields at the new radius (no re-read/analyze). Live
-  // while dragging (rAF-coalesced) — updates the shown map and any pinned perfusion loupe tile.
+  // shared perfusion repaint (smoothness slider + minip-mask checkbox): re-colour the cached fields —
+  // no re-read, no re-analyze. rAF-coalesced; refreshes the shown map and any pinned loupe tile.
+  function repaintPerfusionNow() {
+    if (cur && cur.virtual) {
+      const pv = perfView(curCase()); if (pv) paintPerfIntoView(pv);
+      maybeWarnPerfMask(curCase());
+      if (!State.getPerfMask() && lastBanner && lastBanner.key === 'perfMaskUnavailable') setBanner(null);   // unchecking clears the warning
+    }
+    if (inspect) { stripSig = ''; scheduleLoupe(); }
+  }
+  function repaintPerfusion() {   // rAF-coalesced variant for slider DRAGS (occluded windows pause rAF — discrete toggles must not depend on it)
+    if (perfSmoothRAF) return;
+    perfSmoothRAF = true;
+    requestAnimationFrame(() => { perfSmoothRAF = false; repaintPerfusionNow(); });
+  }
   function onPerfSmoothInput() {
     const v = +$('perfSmooth').value;
     $('perfSmoothv').textContent = v;
     State.setPerfSmooth(v);
-    if (perfSmoothRAF) return;
-    perfSmoothRAF = true;
-    requestAnimationFrame(() => {
-      perfSmoothRAF = false;
-      if (cur && cur.virtual) { const pv = perfView(curCase()); if (pv) paintPerfIntoView(pv); }
-      if (inspect) { stripSig = ''; scheduleLoupe(); }   // repaint the pinned perfusion tile at the new smoothness
-    });
+    repaintPerfusion();
+  }
+  function onPerfMaskToggle() {
+    State.setPerfMask($('perfMaskFilter').checked);
+    if (State.getPerfMask() && curCase()) ensureMinipMask(curCase());
+    repaintPerfusionNow();   // discrete toggle: repaint immediately, never queued behind a paused rAF
   }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
@@ -995,12 +1090,14 @@
     const c = cur.caseId, u = cur.unitId, unit = curUnit(), k = State.key(c, u);
     State.setNote(c, u, $('note').value);
     try {
+      const seq = State.getDirtySeq(c, u);                    // an edit landing during the writes below must stay dirty (same guard as writeUnit)
       const data = cache.get(k) || await Loader.loadUnit(unit);
       await backupCorruptOnce(k, unit);                       // preserve an unparseable annotation.json before overwriting it
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(c, u), null, 2));
       corruptUnits.delete(k);                                 // the file on disk is valid JSON again
-      State.markClean(c, u); updateDirtyUI();
+      ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now());
+      State.markClean(c, u, seq); updateDirtyUI();
       setSaveStatus('noteSaved', { time: hhmm() });
     } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
   }
@@ -1028,6 +1125,9 @@
     const c = curCase(); if (!c) return;
     const u = c.units[uidx];
     if (u.virtual || u.mismatch) return;   // view-only units can't be starred (no file to persist it to)
+    // CRITICAL guard: this frame may never have been seeded this session (fresh browser + background scan
+    // hasn't reached it) — starring would then autosave an EMPTY annotation over its real file. Seed first.
+    await ensureSeeded(c, u);
     State.setStarred(c.id, u.id, !State.isStarred(c.id, u.id));
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
@@ -1377,7 +1477,12 @@
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
     let n = 0, failed = 0;
     for (const k of State.unitsWithData()) {
-      const ref = map.get(k); if (!ref || ref.u.virtual || ref.u.mismatch) continue;   // perfusion / shape-mismatch units are never written
+      const ref = map.get(k);
+      if (!ref) { const [cc, uu] = k.split('/'); if (State.isDirty(cc, uu)) failed++; continue; }   // unit's folder no longer discoverable — surface it, don't silently skip
+      if (ref.u.virtual || ref.u.mismatch) continue;                                     // perfusion / shape-mismatch units are never written
+      // a unit the background scan hasn't reached yet must be seeded from disk BEFORE we serialize it,
+      // or a star-only/dirty-only entry would write an EMPTY annotation over its real file
+      try { await ensureSeeded(ref.c, ref.u); } catch (e) { }
       // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
       if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
       try { await writeUnit(ref.c.id, ref.u); n++; }
@@ -1419,16 +1524,19 @@
     } catch (e) { /* best effort — never block the real write */ }
   }
   async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
-    const k = State.key(caseId, unit.id);
+    const k = State.key(caseId, unit.id), gen = openGen;
     const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
     writingUnits.add(k);                              // the stale-dirty reconcile must never race an in-flight save of the same unit
     try {
       let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
+      if (gen !== openGen) return;                    // a folder switch happened during the load — State now belongs to ANOTHER dataset; writing would clobber the old folder with foreign/empty content
       if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
       await backupCorruptOnce(k, unit);
+      if (gen !== openGen) return;
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
       if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
       corruptUnits.delete(k);   // the file on disk is valid JSON again
+      ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now());   // a reconcile must never mistake OUR write for an externally-newer file
       State.markClean(caseId, unit.id, seq);
     } finally { writingUnits.delete(k); }
   }
@@ -1530,6 +1638,7 @@
     $('loupeSize').value = l0.size; $('loupeSizev').textContent = l0.size;
     $('pinMinip').checked = l0.pinMinip !== false; $('pinPerfusion').checked = l0.pinPerfusion !== false;
     $('perfSmooth').value = State.getPerfSmooth(); $('perfSmoothv').textContent = State.getPerfSmooth();
+    $('perfMaskFilter').checked = State.getPerfMask();
     applyLoupeSize();
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
@@ -1565,6 +1674,7 @@
     const syncPins = () => { State.setLoupePins($('pinMinip').checked, $('pinPerfusion').checked); stripSig = ''; if (inspect) scheduleLoupe(); };
     $('pinMinip').onchange = syncPins; $('pinPerfusion').onchange = syncPins;
     $('perfSmooth').oninput = onPerfSmoothInput;
+    $('perfMaskFilter').onchange = onPerfMaskToggle;
     $('btnExportPerf').onclick = exportPerfusion;
     $('loupeSize').oninput = e => { $('loupeSizev').textContent = e.target.value; State.setLoupe(+$('loupeZoom').value, +$('loupeR').value, $('loupeMean').checked, +e.target.value); applyLoupeSize(); if (inspect) scheduleLoupe(); };
     Loupe.onReady(() => { if (inspect) scheduleLoupe(); });
