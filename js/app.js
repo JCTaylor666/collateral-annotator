@@ -19,7 +19,9 @@
   const inflightLoads = new Map();            // State.key() -> Promise<data>: dedups pixel reads between loadCur / prefetch / writeUnit
   const writingUnits = new Set();             // State.key() of units with an annotation write in flight — the stale-dirty reconcile must not race a save
   const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
-  let cacheCap = 64;                          // LRU capacity, recomputed per dataset: clamp(3 × largest sequence + 16, 64, 192)
+  let cacheCap = 64;                          // LRU capacity — BYTE-aware: min(count formula, ~900MB ÷ real per-frame bytes), refined as frames load
+  let maxSeqLen = 0;                          // largest sequence (frame count) in the open dataset
+  let maxPxSeen = 0;                          // largest W×H actually loaded — real frames can be 1432², not the 512² of test data
   const corruptUnits = new Set();             // State.key() of units whose annotation.json is present but unparseable
   const corruptBackedUp = new Set();          // …of those, the ones already copied to annotation.json.corrupt
   let copyPickMode = false;                    // true while waiting for the user to pick a frame to copy from
@@ -128,9 +130,9 @@
       openGen++;                                // kill any stale background scan / prefetch / late pixel reads
       cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear();
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
-      // adaptive LRU capacity: current + previous + next-two sequences always fit, whatever their real sizes
-      const maxSeq = cases.reduce((m, c) => Math.max(m, c.units.filter(un => !un.virtual).length), 0);
-      cacheCap = Math.max(64, Math.min(192, 3 * maxSeq + 16));
+      // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
+      maxSeqLen = cases.reduce((m, c) => Math.max(m, c.units.filter(un => !un.virtual).length), 0);
+      maxPxSeen = 0; recomputeCacheCap();
       ensureActiveClass();                      // classes.json is already loaded; the scan may ADD missing ones when it finishes
       buildClassMgr(); buildClassPicker();
       setBanner(null);
@@ -154,10 +156,18 @@
     cache.delete(k); cache.set(k, v);
     return v;
   }
+  function recomputeCacheCap() {
+    // per cached frame ≈ label(2B/px) + mask(1B/px) + decoded image (~4B/px) ⇒ ~7B/px; budget ~900MB.
+    const byteCap = maxPxSeen ? Math.floor(900e6 / (maxPxSeen * 7)) : 192;
+    const want = Math.min(3 * maxSeqLen + 16, byteCap);
+    const floor_ = Math.min(192, Math.max(16, maxSeqLen + 8));   // always hold the longest live sequence + margin (anti-thrash)
+    cacheCap = Math.min(192, Math.max(floor_, want));
+  }
   function cacheInsert(k, data, cold) {
     if (cache.has(k)) cache.delete(k);
     cache.set(k, data);
     if (cold) prefetchCold.add(k); else prefetchCold.delete(k);
+    if (data && data.W && data.H && data.W * data.H > maxPxSeen) { maxPxSeen = data.W * data.H; recomputeCacheCap(); }   // big real frames shrink the cap
     evictOver();
   }
   function evictOver() {
@@ -1683,4 +1693,6 @@
     view.layout(); view.render(); updateZoomReadout();
   }
   window.addEventListener('DOMContentLoaded', init);
+  // read-only diagnostics (support/debug; never mutates anything)
+  window.__annotDebug = () => ({ cacheCap, cacheSize: cache.size, maxSeqLen, maxPxSeen, prefetchCold: prefetchCold.size, inflight: inflightLoads.size, scan: scanDone + '/' + scanTotal, dirty: State.dirtyCount() });
 })();
