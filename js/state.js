@@ -267,6 +267,7 @@
     return removed;
   }
   function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) undoStack.push({ kind: 'pointbatch', c, u, layer: activeLayerId(c, u), removed }); }
+  const peekUndo = () => undoStack.length ? undoStack[undoStack.length - 1] : null;   // read-only: lets the app pre-load an evicted unit's dims BEFORE popping a paint entry
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
     const L = e.layer || 0;   // the layer this entry belongs to (marker is frame-level; L unused there)
@@ -520,7 +521,7 @@
   }
 
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, setLoupePins, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
-    selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo,
+    selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo, peekUndo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, getDirtySeq, getEditedAt, dirtyCount, storageKey: LSKEY, resetUnit, isStarred, setStarred, caseStarred,

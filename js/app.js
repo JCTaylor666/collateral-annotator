@@ -113,6 +113,7 @@
       // openGen bumps HERE too — before rootHandle changes — so the OLD dataset's background scan/prefetch/
       // late reconciles go inert immediately (a scan tail must never saveClasses into the NEW folder).
       cur = null; navGen++; openGen++; exitCopyPick(); exitMarkerArm();
+      scanTotal = 0; scanDone = 0; updateScanProg();   // the old scan is dead — its progress text must not linger
       $('note').disabled = true; updateCopyBtn();
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
@@ -127,7 +128,7 @@
       cases = await Loader.discover(rootHandle);
       if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
       for (const c of cases) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
-      perfCache.clear();
+      perfCache.clear(); perfInflight.clear();
       const cls = await Loader.loadClasses(rootHandle);
       classes = cls.list; classesFileCorrupt = !cls.ok;
       corruptUnits.clear(); corruptBackedUp.clear();
@@ -148,7 +149,7 @@
         else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
       }
       startBackgroundScan();                    // badges / copy-sources / class auto-add fill in behind the first frame
-    } catch (e) { if (e && e.name === 'AbortError') return; setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
+    } catch (e) { if (e && e.name === 'AbortError') return; scanTotal = 0; scanDone = 0; updateScanProg(); setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
   }
 
   // ---- bounded LRU over `cache` (PIXEL data only: decoded image + label + mask; ~2.5MB/frame at 800²).
@@ -200,7 +201,7 @@
         return data;
       }, err => { inflightLoads.delete(k); throw err; });
       inflightLoads.set(k, p);
-    } else if (!cold) p.then(() => { if (cache.has(k)) cacheTouch(k); });   // a real view promotes a pending prefetch
+    } else if (!cold) p.then(() => { if (cache.has(k)) cacheTouch(k); }, () => { });   // a real view promotes a pending prefetch (rejection handled by the primary caller)
     return p;
   }
 
@@ -259,7 +260,9 @@
     if (sessionLoaded.has(k)) return;
     try {
       const r = await Loader.loadAnnotation(u);
-      await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
+      if (r.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the unparseable original
+      const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
+      if (rec === 'stale-backed-up') setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // never sidecar-and-revert silently
       lastSeenMtime.set(k, r.mtime || 0);
     } catch (e) { }
     sessionLoaded.add(k);
@@ -322,6 +325,8 @@
   }
   function maybeWarnPerfMask(c) {   // showing the perfusion unit with the filter ON but no usable minip mask
     if (!cur || !cur.virtual || !c || cur.caseId !== c.id || !State.getPerfMask()) return;
+    // a cosmetic per-unit hint must never replace a data-safety banner (failed write / backed-up edits / quota)
+    if (lastBanner && ['writeFailedBanner', 'unsavedBackedUp', 'errQuotaFull', 'multiTabWarn', 'savedPartial'].indexOf(lastBanner.key) >= 0) return;
     const e = perfCache.get(c.id);
     const m = e && e !== 'failed' && e.minipMask;
     const usable = m && m.mask && e.fields && m.W === e.fields.W && m.H === e.fields.H;
@@ -456,7 +461,7 @@
     refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
-    if (data.staleBackedUp) setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // this frame's unsaved edits were superseded by a newer file (stashed to the sidecar)
+    if (data.staleBackedUp) { setBanner('unsavedBackedUp', { n: 1 }, 'warn'); data.staleBackedUp = false; }   // one-shot: the backup happened once — a cached flag must not re-alarm on every revisit
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
     else {   // stored paint saved at a different size (ANY layer): hidden, and painting there will replace it
@@ -766,7 +771,7 @@
     for (const c of cases) for (const u of c.units) if (!u.virtual) units.push({ c, u });
     scanTotal = units.length; scanDone = 0; lastScanStaleBackups = 0;
     updateScanProg();
-    const used = new Set(State.usedClasses());
+    const diskUsed = new Set();          // classes seen in FILES this scan (authoritative even if the user deletes a class mid-scan)
     let next = 0, stale = 0;
     const worker = async () => {
       while (next < units.length) {
@@ -782,8 +787,9 @@
           if (gen !== openGen) return;
           if (rec === 'stale-backed-up') stale++;
           lastSeenMtime.set(uk, annMtime);
+          if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
-        collectAnnClasses(ann, used);                          // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
+        collectAnnClasses(ann, diskUsed);                      // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
         scanDone++;
         if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();
       }
@@ -792,6 +798,7 @@
     if (gen !== openGen) return;
     scanDone = scanTotal; updateScanProg();
     lastScanStaleBackups = stale;
+    const used = new Set([...diskUsed, ...State.usedClasses()]);   // disk truth + live memory AT THE TAIL — no stale start-snapshot (deleteClass mid-scan must stay deleted)
     const have = new Set(classes.map(cl => cl.index));
     let added = 0;
     for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
@@ -918,12 +925,13 @@
     updateCopyBtn();
   }
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
-  function pickCopySource(uidx) {
-    const src = curCase().units[uidx];
+  async function pickCopySource(uidx) {
+    const c = curCase(), src = c.units[uidx];
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
     if (!src || uidx === ui || !cur) return;
-    if (copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started (e.g. a note edit): say so, don't silently no-op
-    doCopyFrom(curCase().id, src);
+    if (!src.virtual && !src.mismatch) await ensureSeeded(c, src);   // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
+    if (!cur || copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started: say so, don't silently no-op
+    doCopyFrom(c.id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
     const tc = cur.caseId, tu = cur.unitId;                   // target = the currently displayed (empty) frame
@@ -1061,6 +1069,7 @@
   // shared perfusion repaint (smoothness slider + minip-mask checkbox): re-colour the cached fields —
   // no re-read, no re-analyze. rAF-coalesced; refreshes the shown map and any pinned loupe tile.
   function repaintPerfusionNow() {
+    if (navBusy) return;                     // mid-navigation cur is stale while ci already points at the target case — painting would show the WRONG case's map
     if (cur && cur.virtual) {
       const pv = perfView(curCase()); if (pv) paintPerfIntoView(pv);
       maybeWarnPerfMask(curCase());
@@ -1536,7 +1545,7 @@
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
       if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
       corruptUnits.delete(k);   // the file on disk is valid JSON again
-      ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now());   // a reconcile must never mistake OUR write for an externally-newer file
+      if (gen === openGen) { ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now()); }   // a reconcile must never mistake OUR write for an externally-newer file (and a cross-open write must not pollute the new dataset's maps)
       State.markClean(caseId, unit.id, seq);
     } finally { writingUnits.delete(k); }
   }
@@ -1548,8 +1557,18 @@
     catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
   }
 
-  function undo() {
+  async function undo() {
     if (!cur) return;
+    // Peek BEFORE popping: an offscreen paint entry needs the unit's dims; after LRU eviction (or a reopen)
+    // the cache may not have them and the entry would be consumed with no effect. Pre-load, THEN pop.
+    const top = State.peekUndo && State.peekUndo();
+    if (top && top.kind === 'paint' && cur && !(top.c === cur.caseId && top.u === cur.unitId)) {
+      const k = State.key(top.c, top.u);
+      if (!cache.has(k)) {
+        const oc = cases.find(cc => cc.id === top.c), ou = oc && oc.units.find(uu => uu.id === top.u);
+        if (ou && !ou.virtual) { try { await loadUnitCached(ou, k, false); } catch (err) { return; } }   // can't get dims: leave the entry ON the stack for a later retry
+      }
+    }
     const e = State.undo();
     if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
     const sameUnit = e.c === cur.caseId && e.u === cur.unitId;
@@ -1568,7 +1587,7 @@
         State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
       } else {
         // other unit/layer: apply to its stored paint. A full-erase stroke deleted the RLE (and its dims),
-        // so offer the unit's cached dims as fallback — else that erase would be silently un-undoable.
+        // so offer the unit's cached dims as fallback (pre-loaded by undo() before popping when evicted).
         const d = cache.get(State.key(e.c, e.u));
         if (!State.applyPaintUndoOffscreen(e.c, e.u, e.changes, e.layer, d && d.W, d && d.H)) return;
       }
@@ -1611,7 +1630,7 @@
     if (cur) refreshMeta();
     else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
     updateCopyBtn(); updateDirtyUI();
-    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips(); buildLayerBar();
+    buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips(); buildLayerBar(); updateScanProg();
     if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
     if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
   }
