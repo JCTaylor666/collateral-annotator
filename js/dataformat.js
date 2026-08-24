@@ -9,6 +9,7 @@
 <p class="doc-p">The folder you pick with “Open data folder” is the dataset root. <b>Inputs</b> (image + segmentation) come from your preprocessing pipeline; <b>outputs</b> are written by this tool. Every frame folder is self-contained.</p>
 <pre class="doc-tree">&lt;data root&gt;/                    ← picked with “Open data folder”
 ├─ classes.json                 ← output · class definitions (whole dataset)
+├─ .annotator_dataset.json      ← output · hidden; a stable id tying your saved progress to this folder
 ├─ case_0001/                   ← one case · any name carrying a number (e.g. case_0001, 12_patient)
 │  ├─ frame_0/                  ← one frame · any name carrying a number (e.g. frame_0, 3_dsa)
 │  │  ├─ frames.png             ← input · DSA frame image (grayscale PNG)
@@ -16,9 +17,11 @@
 │  │  ├─ mask.npy               ← input · 0/1 vessel mask (optional)
 │  │  ├─ geometry.json          ← input+output · per-segment metrics + saved filter (optional)
 │  │  ├─ annotation.json        ← output · your annotations for this frame
+│  │  ├─ (recovery copies)      ← output · *.corrupt / *.unsaved-backup.json, only when needed
 │  │  └─ note.json              ← output · frame note + numbered markers
 │  ├─ frame_1/ …
-│  └─ minip/                    ← minimum-intensity projection · same files, listed last
+│  ├─ minip/                    ← minimum-intensity projection · same files, listed last
+│  └─ (perfusion)               ← computed by the tool · view-only, NO files on disk, listed after minip
 └─ case_0002/ …</pre>
 <div class="doc-sec"><h4>Discovery rules</h4><ul>
 <li>A folder is a case (and, inside it, a frame) if its name carries a number — pure digits, a trailing <code>_&lt;digits&gt;</code>, or a leading <code>&lt;digits&gt;_</code>. The rest of the name is free (e.g. <code>case_0001</code>, <code>frame_3</code>, <code>12_patient</code>, <code>0_scan</code>). A unit folder named exactly <code>minip</code> is also loaded.</li>
@@ -114,12 +117,60 @@
 <ul>
 <li><code>index</code> = the number stored in annotations (the <code>class</code> fields and paint keys); <code>name</code> = display name.</li>
 <li>Colors are <b>not</b> stored here — they live only in your browser. The file is created/updated automatically; if any annotation on disk uses a class missing here, it is re-added on open with a placeholder name.</li>
+<li><b>If the file is missing entirely</b>, the tool still opens the dataset, then invents a <b>random name</b> for every class index it finds in the annotations and writes a new <code>classes.json</code>. Ship this file with the data — otherwise two copies of the same dataset end up with different class names.</li>
+</ul></div>
+<div class="doc-sec"><h4><code>.annotator_dataset.json</code> — output, dataset root</h4>
+<pre class="doc-tree">{ "id": "d3f1a2…" }</pre>
+<ul>
+<li>Hidden file created the first time you open the folder. Your in-browser progress (visited flags, unsaved edits, per-frame layer choice) is keyed to this id, so two different datasets that both use <code>case_1/frame_0</code> never bleed into each other.</li>
+<li>Safe to delete — a new id is minted on next open, which resets only the browser-side state, never the annotations on disk. Safe to leave out of an archive.</li>
+</ul></div>
+<div class="doc-sec"><h4>Recovery files — output, written only when something is wrong</h4>
+<p class="doc-p">The tool never discards work silently. Four files exist purely so that a bad file or a lost race is always recoverable. In normal use you will never see any of them.</p>
+<ul>
+<li><code>annotation.json.corrupt</code> (in the frame) — an <code>annotation.json</code> that cannot be parsed is copied here <b>once</b>, before anything overwrites it. The frame opens with a warning and shows no marks until the file is fixed.</li>
+<li><code>classes.json.corrupt</code> (at the root) — same, for an unparseable <code>classes.json</code>. The tool will not auto-overwrite it with placeholder names until the original is safely copied.</li>
+<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code> (in the frame) — if you have unsaved edits in the browser and the file on disk turns out to be <b>newer</b> (someone else saved, or another tab did), your edits are written here rather than being dropped or blindly overwriting the newer file.</li>
+</ul>
+<p class="doc-p">None of these are read back automatically. Inspect them yourself and merge by hand.</p></div>
+<div class="doc-sec"><h4>The <code>perfusion</code> unit — computed, not read from disk</h4><ul>
+<li>Every case gets one extra unit after <code>minip</code>, computed from that case's frames. It has <b>no folder and no files</b>; do not create one. It is view-only: no label, no mask, no geometry panel, and it can never be annotated or saved.</li>
+<li>The smoothness slider re-colours it live. It can be downloaded as <code>&lt;case&gt;_perfusion.png</code> — that is a browser download, not a file in the dataset.</li>
+</ul></div>
+<div class="doc-sec"><h4>Failures that are SILENT — read this before generating data</h4>
+<p class="doc-p">Most malformed input produces a visible warning. These three do not:</p>
+<ul>
+<li><b>Paint at the wrong size is discarded without a word.</b> If <code>paint.width</code>/<code>paint.height</code> differ from the frame's W/H, the brush layer is simply not decoded — no marks, no warning, no error. (The stored RLE is preserved verbatim, so a load-and-save cannot destroy it.) Always write <code>width</code>/<code>height</code> from the array you encoded.</li>
+<li><b>A folder whose name carries no number is skipped without a word.</b> Names like <code>s0</code> or <code>f1</code> match none of the discovery patterns and never appear in the UI.</li>
+<li><b>A missing <code>classes.json</code> is silently replaced</b> by one with invented names, as described above.</li>
+</ul>
+<p class="doc-p">By contrast, a <b>H×W disagreement</b> between <code>frames.png</code>, <code>label.npy</code> and <code>mask.npy</code> is loud: that frame becomes a grey read-only placeholder listing the three shapes.</p></div>
+<div class="doc-sec"><h4>Segment ids are not stable identifiers</h4>
+<p class="doc-p"><code>collaterals[].id</code> and the keys of <code>geometry.json</code> store <b>only a number</b>. The shape they refer to lives in <code>label.npy</code> and is looked up at display time. So if <code>label.npy</code> is regenerated, every existing selection silently points at whatever segment now carries that number.</p>
+<ul>
+<li>Ids are assigned deterministically by position, so a <b>small</b> change is harmless: re-running the same partition, removing one pixel, or adding a speck elsewhere leaves every id intact (measured).</li>
+<li>Replacing the <b>mask</b> — a better segmentation model, a changed partition rule — renumbers essentially everything. Measured on four sequences after swapping one vessel model for another, of the pixels that are foreground in <b>both</b> masks, the fraction keeping their old id was <b>0.73 %, 0.01 %, 0.00 %, 0.00 %</b>.</li>
+<li>Therefore: <b>never regenerate <code>label.npy</code> in place for a unit that already has an <code>annotation.json</code>.</b> Build a new dataset folder instead.</li>
+<li><b>Paint is immune</b> — it stores pixels, not ids. If annotations must survive a future re-partition, import them as paint. A segment-level view is recoverable from paint at any threshold: <code>(paint &amp; (label == i)).sum() / (label == i).sum()</code>.</li>
+</ul></div>
+<div class="doc-sec"><h4>Splitting the work across several annotators</h4>
+<p class="doc-p">Cases can be handed out in separate folders and merged back afterwards. Case numbers do <b>not</b> need to start at any particular value or be contiguous — the number is used only for ordering.</p>
+<ul>
+<li>Give every package <b>its own copy of <code>classes.json</code></b>, or each one invents its own class names.</li>
+<li>Keep each case whole — all of its frames and its <code>minip</code> go to one person.</li>
+<li>Merging is a plain copy: case folder names are unique, so nothing collides. Take the <b>union</b> of the <code>classes.json</code> files if anyone added a class.</li>
+<li>What comes back changed: <code>annotation.json</code>, <code>note.json</code>, the <code>filter</code> block of <code>geometry.json</code>, <code>classes.json</code>, and <code>.annotator_dataset.json</code>. Nothing else is ever written.</li>
+</ul></div>
+<div class="doc-sec"><h4>Copying an annotation from another frame</h4><ul>
+<li>The <b>Copy from frame</b> button only writes into a <b>completely empty</b> frame — it is disabled if the frame holds any segment, point or paint on <em>any</em> layer, or any numbered marker. (A star or a note does not block it.)</li>
+<li>Erasing a frame's content fully re-enables it. So a dataset shipped with pre-filled annotations has that button disabled until the frame is cleared.</li>
 </ul></div>`;
 
   const ZH_HTML = `
 <p class="doc-p">用“打开数据文件夹”选中的文件夹就是数据根目录。<b>输入</b>（图像 + 分割）由你的预处理流水线生成；<b>输出</b>由本工具写入。每个帧文件夹都是自包含的。</p>
 <pre class="doc-tree">&lt;数据根目录&gt;/                 ← “打开数据文件夹”选的就是它
 ├─ classes.json                 ← 输出 · 类别定义（全数据集共用）
+├─ .annotator_dataset.json      ← 输出 · 隐藏文件；把你的进度绑定到这个文件夹的稳定 id
 ├─ case_0001/                   ← 一个病例 · 名字带数字即可(如 case_0001、12_patient)
 │  ├─ frame_0/                  ← 一帧 · 名字带数字即可(如 frame_0、3_dsa)
 │  │  ├─ frames.png             ← 输入 · DSA 帧图像（灰度 PNG）
@@ -127,9 +178,11 @@
 │  │  ├─ mask.npy               ← 输入 · 0/1 血管 mask（可选）
 │  │  ├─ geometry.json          ← 输入+输出 · 每段参数 + 保存的过滤区间（可选）
 │  │  ├─ annotation.json        ← 输出 · 本帧的标注结果
+│  │  ├─ (恢复副本)              ← 输出 · *.corrupt / *.unsaved-backup.json，仅在需要时产生
 │  │  └─ note.json              ← 输出 · 本帧笔记 + 编号标记
 │  ├─ frame_1/ …
-│  └─ minip/                    ← 最小强度投影 · 文件相同，排在最后
+│  ├─ minip/                    ← 最小强度投影 · 文件相同，排在最后
+│  └─ (perfusion)               ← 工具计算得出 · 只读，磁盘上没有文件，排在 minip 之后
 └─ case_0002/ …</pre>
 <div class="doc-sec"><h4>扫描规则</h4><ul>
 <li>只要文件夹名<b>带数字</b>就算病例(以及病例里的帧)——纯数字、结尾 <code>_&lt;数字&gt;</code>、或开头 <code>&lt;数字&gt;_</code> 都行,前后缀随意(如 <code>case_0001</code>、<code>frame_3</code>、<code>12_patient</code>、<code>0_scan</code>)。名为 <code>minip</code> 的单元也会加载。</li>
@@ -225,6 +278,53 @@
 <ul>
 <li><code>index</code> = 写进标注的数字（各 <code>class</code> 字段和 paint 的键）；<code>name</code> = 显示名称。</li>
 <li>颜色<b>不</b>存在这里 — 颜色只存在浏览器本地。此文件自动创建/更新；如果磁盘上的标注用到了这里缺失的类别，打开时会自动补一个占位名。</li>
+<li><b>如果这个文件整个缺失</b>，工具照样能打开数据集，然后给标注里出现的每个类别序号<b>随机编一个名字</b>并写出一份新的 <code>classes.json</code>。请务必随数据一起分发 — 否则同一份数据的两个副本会得到不同的类别名。</li>
+</ul></div>
+<div class="doc-sec"><h4><code>.annotator_dataset.json</code> — 输出，位于数据根目录</h4>
+<pre class="doc-tree">{ "id": "d3f1a2…" }</pre>
+<ul>
+<li>第一次打开该文件夹时创建的隐藏文件。你在浏览器里的进度（已访问标记、未保存的修改、每帧的图层选择）都以这个 id 为键，所以两份都用 <code>case_1/frame_0</code> 命名的不同数据集不会互相串扰。</li>
+<li>可以放心删除 — 下次打开会重新生成一个新 id，只会重置浏览器端的状态，<b>绝不影响</b>磁盘上的标注。打包时不带也没关系。</li>
+</ul></div>
+<div class="doc-sec"><h4>恢复文件 — 输出，只在出问题时产生</h4>
+<p class="doc-p">工具从不静默丢弃工作。下面四个文件存在的唯一目的，就是让「文件坏了」或「写入撞车」永远可恢复。正常使用时你一个都不会见到。</p>
+<ul>
+<li><code>annotation.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>annotation.json</code> 会在被任何东西覆盖之前<b>备份一次</b>到这里。该帧带警告打开，在文件修好之前不显示任何标记。</li>
+<li><code>classes.json.corrupt</code>（在根目录）—— 同理，针对无法解析的 <code>classes.json</code>。在原文件被安全备份之前，工具不会用占位名去自动覆盖它。</li>
+<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code>（在帧文件夹里）—— 如果你在浏览器里有未保存的改动，而磁盘上的文件却<b>更新</b>（别人保存了，或另一个标签页写了），你的改动会写到这里，而不是被丢掉、也不会盲目覆盖那个更新的文件。</li>
+</ul>
+<p class="doc-p">这些文件都不会被自动读回。请自己查看并手动合并。</p></div>
+<div class="doc-sec"><h4><code>perfusion</code> 单元 — 计算得出，不来自磁盘</h4><ul>
+<li>每个病例在 <code>minip</code> 之后会自动多出一个单元，由该病例的各帧计算得到。它<b>没有文件夹、没有文件</b>，不要去创建。它是只读的：没有 label、没有 mask、没有几何面板，永远不能标注也不会保存。</li>
+<li>平滑度滑块会实时重新着色。可以下载为 <code>&lt;case&gt;_perfusion.png</code> — 那是浏览器下载，不是数据集里的文件。</li>
+</ul></div>
+<div class="doc-sec"><h4>会「静默失败」的三件事 — 生成数据前务必读</h4>
+<p class="doc-p">大部分格式错误都会给出可见的提示。下面三种<b>不会</b>：</p>
+<ul>
+<li><b>尺寸不对的 paint 会被无声丢弃。</b> 只要 <code>paint.width</code>/<code>paint.height</code> 和该帧的 W/H 不一致，画笔图层就直接不解码 —— 不显示、不警告、不报错。（原始 RLE 会原样保留，所以「打开再保存」不会破坏它。）<code>width</code>/<code>height</code> 一定要写你实际编码的那个数组的尺寸。</li>
+<li><b>名字里不带数字的文件夹会被无声跳过。</b> 像 <code>s0</code>、<code>f1</code> 这样的名字不匹配任何一条扫描规则，根本不会出现在界面里。</li>
+<li><b>缺失的 <code>classes.json</code> 会被无声替换</b>成一份随机命名的，见上。</li>
+</ul>
+<p class="doc-p">相比之下，<code>frames.png</code>、<code>label.npy</code>、<code>mask.npy</code> 三者<b>H×W 不一致</b>是有明确提示的：该帧会变成灰色只读占位面板，并列出三个尺寸。</p></div>
+<div class="doc-sec"><h4>segment id 不是稳定标识符</h4>
+<p class="doc-p"><code>collaterals[].id</code> 和 <code>geometry.json</code> 的键都<b>只存一个数字</b>，它对应的形状在 <code>label.npy</code> 里、显示时才去查。所以一旦 <code>label.npy</code> 被重新生成，已有的每一条选择都会静默地指向「现在恰好叫这个号」的那一段。</p>
+<ul>
+<li>id 是按位置确定性发号的，所以<b>小改动无害</b>：同一份分区重跑、删掉一个像素、在别处加一个斑点，实测每个 id 都原封不动。</li>
+<li>但<b>换掉 mask</b> —— 换一个更好的分割模型、改一条分区规则 —— 会让编号几乎全部重排。实测四个序列在更换血管模型后，在两张 mask 里<b>都</b>是前景的那些像素中，保住原 id 的比例是 <b>0.73 %、0.01 %、0.00 %、0.00 %</b>。</li>
+<li>因此：<b>绝不要对已经有 <code>annotation.json</code> 的单元原地重新生成 <code>label.npy</code></b>。请另建一个新的数据集文件夹。</li>
+<li><b>paint 不受影响</b> —— 它存的是像素，不是 id。如果标注需要在未来的重新分区中存活，就用 paint 导入。段级视图随时可以从 paint 按任意阈值还原：<code>(paint &amp; (label == i)).sum() / (label == i).sum()</code>。</li>
+</ul></div>
+<div class="doc-sec"><h4>多人分工标注：拆分与合并</h4>
+<p class="doc-p">病例可以拆成几个文件夹分发，标完再合并。病例编号<b>不需要</b>从某个特定值开始，也<b>不需要</b>连续 —— 这个数字只用来排序。</p>
+<ul>
+<li>每个分包都要带<b>自己的一份 <code>classes.json</code></b>，否则每个人会各自编出不同的类别名。</li>
+<li>每个病例必须整体分给同一个人 —— 它的所有帧和 <code>minip</code> 不能拆开。</li>
+<li>合并就是直接复制：病例文件夹名唯一，不会冲突。如果有人加过类别，<code>classes.json</code> 要取<b>并集</b>。</li>
+<li>会被改动的只有：<code>annotation.json</code>、<code>note.json</code>、<code>geometry.json</code> 的 <code>filter</code> 块、<code>classes.json</code>、以及 <code>.annotator_dataset.json</code>。除此之外工具不写任何文件。</li>
+</ul></div>
+<div class="doc-sec"><h4>从其他帧复制标注</h4><ul>
+<li><b>从其他帧复制</b>按钮只能写入<b>完全空白</b>的帧 —— 只要该帧在<em>任何</em>图层上有 segment、点或 paint，或者有编号标记，按钮就是禁用的。（打星或写笔记不影响。）</li>
+<li>把该帧内容全部擦掉后按钮会重新可用。所以一份带预填标注的数据集，这个按钮在清空该帧之前是用不了的。</li>
 </ul></div>`;
 
   // Part 2: a self-contained spec the user can copy to any AI agent with zero prior context, so that
@@ -241,6 +341,7 @@ FOLDER STRUCTURE
 ========================================
 <root>/
   classes.json                (optional, dataset-wide; the tool creates/updates it)
+  .annotator_dataset.json     (tool OUTPUT, hidden; do not create one)
   <case folder>/              (one per case)
     <unit folder>/            (one per frame; plus optional "minip")
       frames.png              (INPUT, required)
@@ -249,6 +350,21 @@ FOLDER STRUCTURE
       geometry.json           (INPUT + OUTPUT, optional)
       annotation.json         (tool OUTPUT)
       note.json               (tool OUTPUT)
+      annotation.json.corrupt          (tool OUTPUT, recovery -- see below)
+      annotation.unsaved-backup.json   (tool OUTPUT, recovery -- see below)
+      note.unsaved-backup.json         (tool OUTPUT, recovery -- see below)
+
+RECOVERY FILES. Written only when something is wrong; never read back
+automatically; never create them yourself.
+  annotation.json.corrupt / classes.json.corrupt (the latter at the root) -- an
+    unparseable file is copied here ONCE before anything overwrites it.
+  annotation.unsaved-backup.json / note.unsaved-backup.json -- if the browser
+    holds unsaved edits and the file on disk turns out to be NEWER, the edits are
+    written here instead of being dropped or overwriting the newer file.
+
+Do NOT create a "perfusion" folder. The tool appends one computed, view-only
+"perfusion" unit to every case, after minip. It has no files on disk, no label,
+no mask and no geometry, and can never be annotated.
 
 FOLDER NAMING & ORDERING
 - A folder counts as a CASE (and, inside it, a FRAME) only if its name CONTAINS A NUMBER: pure digits ("12"), a trailing "_<digits>" ("case_0001", "frame_3"), or a leading "<digits>_" ("12_patient", "0_scan"). The rest of the name is free text.
@@ -386,6 +502,67 @@ CHECKLIST FOR VALID INPUT DATA
 [ ] label.npy is 2-D (H, W), C-order, little-endian, uint16 (or uint8/int32/uint32); 0 = background, 1..N = segment ids.
 [ ] geometry.json keys equal the label.npy segment ids (as strings); each value is an object of numeric metrics.
 [ ] Case and frame folder names contain a number; a unit named exactly "minip" is allowed and sorts last.
+[ ] classes.json is shipped WITH the data, declaring every class index the annotations use.
+[ ] Any paint block's width/height equal that frame's W/H.
+
+========================================
+FAILURES THAT ARE SILENT -- CHECK THESE, NOTHING WILL WARN YOU
+========================================
+Most malformed input produces a visible warning. These do not:
+- PAINT AT THE WRONG SIZE IS DISCARDED. If paint.width/paint.height differ from
+  the frame's W/H the brush layer is simply not decoded: no marks, no warning,
+  no error. The stored RLE is preserved verbatim, so load+save cannot destroy
+  it, but nothing is shown. Always write width/height from the array you encoded.
+- A FOLDER WHOSE NAME CARRIES NO NUMBER IS SKIPPED. Names like "s0" or "f1"
+  match none of the discovery patterns and never appear in the UI at all.
+- A MISSING classes.json IS SILENTLY REPLACED. The tool invents a RANDOM name
+  for every class index found in the annotations and writes a new classes.json.
+  Two copies of one dataset then disagree on class names.
+By contrast a W x H disagreement between frames.png / label.npy / mask.npy is
+loud: that frame becomes a grey read-only placeholder listing the three shapes.
+
+========================================
+SEGMENT IDS ARE NOT STABLE IDENTIFIERS
+========================================
+collaterals[].id and the keys of geometry.json store ONLY a number. The shape it
+refers to lives in label.npy and is resolved at display time. Regenerating
+label.npy therefore re-points every existing selection at whatever segment now
+carries that number -- silently.
+- Ids are assigned deterministically by position, so SMALL changes are harmless:
+  re-running the same partition, deleting one pixel, or adding a speck elsewhere
+  leaves every id intact (measured).
+- Replacing the MASK -- a better segmentation model, a changed partition rule --
+  renumbers essentially everything. Measured on four sequences after swapping one
+  vessel model for another, of the pixels that are foreground in BOTH masks the
+  fraction that kept its old id was 0.73 %, 0.01 %, 0.00 %, 0.00 %.
+- So: NEVER regenerate label.npy in place for a unit that already has an
+  annotation.json. Build a new dataset folder instead.
+- PAINT IS IMMUNE: it stores pixels, not ids. If annotations must survive a
+  future re-partition, import them as paint. A segment-level view is recoverable
+  from paint at any threshold:
+      (paint & (label == i)).sum() / (label == i).sum()
+
+========================================
+SPLITTING THE WORK ACROSS SEVERAL ANNOTATORS
+========================================
+Cases can be handed out as separate folders and merged back. Case numbers need
+not start at any particular value and need not be contiguous -- the number is
+used only for ordering.
+- Give every package its own copy of classes.json, or each invents its own names.
+- Keep each case whole: all of its frames and its minip go to one person.
+- Merging is a plain copy; case folder names are unique so nothing collides. Take
+  the UNION of the classes.json files if anyone added a class.
+- What comes back changed: annotation.json, note.json, the "filter" block of
+  geometry.json, classes.json, .annotator_dataset.json. Nothing else is written.
+
+========================================
+COPY FROM FRAME
+========================================
+The tool's "Copy from frame" button only writes into a COMPLETELY EMPTY frame --
+it is disabled if the frame holds any segment, point or paint on ANY layer, or
+any numbered marker (a star or a note does not block it). Erasing the frame fully
+re-enables it. A dataset shipped with pre-filled annotations therefore has that
+button disabled until the frame is cleared.
 `;
 
   const S = {
