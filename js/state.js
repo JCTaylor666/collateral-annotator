@@ -14,6 +14,11 @@
                      // our last recorded edit (persist() was failing, or the tab died before markClean persisted)
                      // — so the localStorage copy is the old one and must NOT be re-saved over the newer file.
   let starred = {};  // caseUnit -> true : per-frame star flag (saved into annotation.json)
+  let writtenAt = {};// caseUnit -> mtime of the annotation.json this state was last written to / adopted from.
+                     // PERSISTED, unlike app.js's session-only ownWriteAt map: after a reload the stale-dirty
+                     // test (annotation.json is newer than our last edit) otherwise mistakes OUR OWN write for
+                     // someone else's and reverts the doctor's newest edits to a sidecar — or, when those edits
+                     // left the frame empty (Clear / un-star), silently and with no sidecar at all.
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
   // ---- LAYERS (per-frame). The layered content (selections/points/paintR) is bucketed by lkey = caseUnit#layerId
   // (layer 0 has NO suffix, so single-layer data is byte-identical to the pre-layers format). note/markers/star/dirty
@@ -41,7 +46,7 @@
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
   function persist() {
-    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, editedAt, starred, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, perfMask, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
+    try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, editedAt, starred, writtenAt, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, perfMask, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
     // warn on ANY persist failure (quota, blocked storage, …) — from here on the localStorage backup is
     // stale, so the user must rely on save-to-folder; the open-time mtime check guards the reload path.
     catch (e) { if (!quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
@@ -52,6 +57,7 @@
       const o = JSON.parse(localStorage.getItem(LSKEY) || 'null');
       if (o) {
         selections = o.selections || {}; visited = o.visited || {}; points = o.points || {}; notes = o.notes || {}; noteMarkers = o.noteMarkers || {}; dirty = o.dirty || {}; editedAt = o.editedAt || {}; starred = o.starred || {}; paintR = o.paint || {};
+        writtenAt = o.writtenAt || {};
         unitLayers = o.unitLayers || {}; activeLayerByUnit = o.activeLayerByUnit || {};
         if (o.tool === 'brush' || o.tool === 'click') tool = o.tool;
         if (o.brush && typeof o.brush === 'object') brush = { mode: o.brush.mode === 'erase' ? 'erase' : 'add', radius: clamp(o.brush.radius || 6, 1, 40), onmask: !!o.brush.onmask };
@@ -80,7 +86,7 @@
     if (datasetId === newId) return { switched: false, hadDirty: false };
     const hadDirty = Object.keys(dirty).length > 0;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
-    dirty = {}; editedAt = {}; starred = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;
+    dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
     datasetId = newId; persist();
     return { switched: true, hadDirty };
   }
@@ -302,7 +308,7 @@
   function resetUnit(c, u) {
     const k = key(c, u), pfx = k + '#';
     for (const store of [selections, points, paintR]) for (const kk of Object.keys(store)) if (kk === k || kk.startsWith(pfx)) delete store[kk];
-    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
+    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k]; delete writtenAt[k];
     // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
     // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
     undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persist();
@@ -314,8 +320,22 @@
   const getDirtySeq = (c, u) => dirtySeq[key(c, u)] || 0;
   const getEditedAt = (c, u) => editedAt[key(c, u)] || 0;          // 0 = unknown (pre-feature data): callers must stay conservative
   const dirtyCount = () => Object.keys(dirty).length;              // frames with edits not yet on disk
+  const getWrittenAt = (c, u) => writtenAt[key(c, u)] || 0;
+  // Record that the file on disk carries OUR content as of `ms` — ideally the FILE's own lastModified read
+  // back after the write, because on Google Drive the file's timestamp and this machine's clock can differ by
+  // more than the ±2 s margin the reconcile allows. Called on every successful write, NOT only when the unit
+  // ends up clean: an edit that landed mid-write leaves the unit dirty, and that is exactly the case the
+  // after-reload comparison used to get wrong.
+  function noteWritten(c, u, ms) { writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now(); persist(); }
   // seq (optional): only clean if no new edit landed since the caller snapshotted its file content
-  function markClean(c, u, seq) { if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return; delete dirty[key(c, u)]; persist(); }
+  // ms (optional): the mtime of the file this state now matches. Returns true when the unit was cleaned.
+  function markClean(c, u, seq, ms) {
+    if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return false;
+    delete dirty[key(c, u)];
+    writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now();   // State and the file agree as of ms
+    persist();
+    return true;
+  }
 
   const isStarred = (c, u) => !!starred[key(c, u)];
   function setStarred(c, u, on) { if (on) starred[key(c, u)] = true; else delete starred[key(c, u)]; persist(); }
@@ -428,10 +448,27 @@
     }
     if (obj.paint && obj.paint.classes && typeof obj.paint.classes === 'object') paintR[lkey(c, u, L)] = obj.paint;
   }
+  // How many v6 layer entries would importAnnotation SILENTLY DISCARD from this object? Mirrors exactly the
+  // three `continue`s in the loop below plus its Array.isArray gate. A file that loses content on import is
+  // as dangerous as an unparseable one: the frame renders short, and the next save writes the SHORTENED
+  // version back — so callers treat dropped > 0 like `corrupt` and back the original up first.
+  function annotationDropped(ann) {
+    if (!ann || typeof ann !== 'object') return 0;
+    if (!Array.isArray(ann.layers)) return (ann.layers && typeof ann.layers === 'object') ? 1 : 0;   // "layers" written as an OBJECT: the whole block is ignored and the file imports as flat v5
+    let dropped = 0; const seen = [];
+    for (const ly of ann.layers) {
+      if (!ly || typeof ly !== 'object') { dropped++; continue; }
+      const id = Number(ly.id);
+      if (!Number.isFinite(id) || seen.indexOf(id) >= 0) { dropped++; continue; }   // missing/non-numeric id, or a duplicate of an earlier layer
+      seen.push(id);
+    }
+    return dropped;
+  }
   // seed a frame from its annotation.json. v6 → each layer into its bucket + set the layer list/active;
   // flat v5 (or older) → a single layer 0. star is frame-level.
+  // Returns { dropped } — the number of layer entries this build could NOT represent (see annotationDropped).
   function importAnnotation(c, u, ann) {
-    if (!ann) return;
+    if (!ann) return { dropped: 0 };
     const order = ann.coord_order === 'yx' ? 'yx' : 'xy';
     if (Array.isArray(ann.layers) && ann.layers.length) {
       const list = [];
@@ -455,6 +492,7 @@
     }
     if (ann.starred === true) starred[key(c, u)] = true;
     persist();
+    return { dropped: annotationDropped(ann) };
   }
 
   // build one layer's { collaterals, points, paint } (non-creating reads)
@@ -533,10 +571,10 @@
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo, peekUndo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
-    isDirty, markDirty, markClean, getDirtySeq, getEditedAt, dirtyCount, storageKey: LSKEY, resetUnit, isStarred, setStarred, caseStarred,
+    isDirty, markDirty, markClean, getDirtySeq, getEditedAt, getWrittenAt, noteWritten, dirtyCount, storageKey: LSKEY, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getPerfMask, setPerfMask, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
-    clearUnit, markVisited, isVisited, importAnnotation, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,
+    clearUnit, markVisited, isVisited, importAnnotation, annotationDropped, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler };
 })(typeof window !== 'undefined' ? window : globalThis);

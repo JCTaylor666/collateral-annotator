@@ -185,7 +185,17 @@
       savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.',
       saveAborted: 'Saving stopped after {n} units because another folder was opened — the remaining frames were NOT written and are still marked unsaved.',
       frameNotSeeded: '{id}: could not read that frame’s annotation.json just now, so nothing was changed or written for it. Try again.',
-      navLoading: 'loading frame…'
+      navLoading: 'loading frame…',
+      retryPending: '{n} frame(s) NOT written yet — retrying automatically',
+      annUnreadable: '{id}: annotation.json exists but could NOT be read just now (permission or disk/Drive problem). Nothing is shown from it and nothing will be written over it — reopen the frame once the folder is reachable again.',
+      annLayersDropped: '{id}: {n} layer(s) in annotation.json are not in a form this version understands and are NOT shown. The original will be copied to annotation.json.corrupt before anything is saved over it.',
+      confirmClassesCorrupt: 'classes.json in this folder cannot be read, so the class list you see was rebuilt from the annotations and the original names are NOT known.\n\nSaving this change REPLACES the file for the whole dataset (a copy of the unreadable original is kept as classes.json.corrupt).\n\nContinue?',
+      classesReplaced: 'The unreadable classes.json was replaced by the class list shown here. The original was copied to classes.json.corrupt — restore the names from it if you need them.',
+      classesBackupFailed: 'classes.json could not be backed up to classes.json.corrupt, so it was NOT overwritten — your class change is only in this browser. Check the folder permission and try again.',
+      classScanProgress: 'checking whether the class is still used… {done}/{total}',
+      classDeleteAborted: 'Class {idx} was NOT deleted: another folder was opened while the frames were being checked. Nothing was changed in either folder — try again.',
+      classDeleteUnsure: 'Class {idx} was NOT deleted: {n} frame(s) could not be read, so it is not certain the class is unused. Nothing was changed.',
+      localEmptyReverted: 'On {n} frame(s) you had removed everything (Clear / un-star / the last mark), but the file in the folder is newer, so the earlier marks were put BACK. Nothing could be backed up — there was nothing left to back up. Remove them again if that was not what you wanted.'
     },
     zh: {
       pageTitle: '血管标注器',
@@ -364,7 +374,17 @@
       savedPartial: '已保存 {n} 个单元；{failed} 个失败（文件损坏或缺失）—— 这些未被改动。',
       saveAborted: '因为打开了另一个文件夹,保存在写完 {n} 个单元后停止 —— 其余帧【未写入】,仍标记为未保存。',
       frameNotSeeded: '{id}：刚才读不到该帧的 annotation.json,因此没有对它做任何改动,也没有写入。请重试。',
-      navLoading: '正在载入帧…'
+      navLoading: '正在载入帧…',
+      retryPending: '{n} 帧尚未写入磁盘 —— 正在自动重试',
+      annUnreadable: '{id}：annotation.json 存在，但刚才【读不出来】（权限或磁盘/云盘问题）。本帧不显示其中的标注，也不会向它写入任何内容 —— 等文件夹恢复后重新打开该帧。',
+      annLayersDropped: '{id}：annotation.json 中有 {n} 个图层不是本版本能识别的结构，未被显示。在覆盖保存之前，原文件会先备份为 annotation.json.corrupt。',
+      confirmClassesCorrupt: '本文件夹的 classes.json 无法解析，当前看到的类别列表是根据标注重建的，【原来的类别名称未知】。\n\n保存这次修改会覆盖整个数据集的该文件（原始的无法解析文件会另存为 classes.json.corrupt）。\n\n是否继续？',
+      classesReplaced: '无法解析的 classes.json 已被这里显示的类别列表覆盖。原文件已备份为 classes.json.corrupt —— 需要恢复名称请从该备份中取。',
+      classesBackupFailed: 'classes.json 未能备份为 classes.json.corrupt，因此【没有覆盖】它 —— 你的类别修改只存在于浏览器中。请检查文件夹权限后重试。',
+      classScanProgress: '正在检查该类别是否仍被使用… {done}/{total}',
+      classDeleteAborted: '类别 {idx} 【未删除】：检查各帧期间打开了另一个文件夹。两个文件夹都没有被改动 —— 请重试。',
+      classDeleteUnsure: '类别 {idx} 【未删除】：有 {n} 帧读不出来，无法确认该类别没被使用。未做任何改动。',
+      localEmptyReverted: '有 {n} 帧你本已清空（清除/取消星标/删掉最后一处标注），但文件夹里的文件更新，因此原来的标注被【恢复】了。这次没有备份 —— 因为本地已经没有内容可备份。如果这不是你想要的，请再删一次。'
     }
   };
 

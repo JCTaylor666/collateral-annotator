@@ -91,7 +91,8 @@
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
-    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt, annMtime: a.mtime || 0, note: n.note, geometry };
+    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt,
+             annDropped: a.dropped || 0, annUnreadable: !!(a.unreadable || n.unreadable), annMtime: a.mtime || 0, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
@@ -99,22 +100,43 @@
   // for "unannotated" and silently overwritten. A file from a NEWER schema than this build
   // understands (schema_version > 6) is treated the same way: importing it as v5/v6 would
   // misread it, and the corrupt path backs the original up before any overwrite.
+  // THREE outcomes must stay distinguishable, because "absent" is the only one that may be seeded as an
+  // empty annotation (and later overwritten):
+  //   absent      -> { annotation:null, corrupt:false }               nothing was ever saved for this frame
+  //   unreadable  -> { annotation:null, unreadable:true }             the file EXISTS but could not be read
+  //                                                                   (permission withdrawn, Drive/File-Provider
+  //                                                                   hiccup, I/O error) — callers must NOT reset
+  //                                                                   State from it and must NOT write over it
+  //   corrupt     -> { annotation:null, corrupt:true }                present, readable, but not usable JSON
+  // `dropped` counts layer entries this build cannot represent (see State.annotationDropped): the file is
+  // readable and mostly usable, but saving it back would SHRINK it, so callers back it up like a corrupt one.
   async function readAnnotation(unit) {
     let fh;
     try { fh = await unit.handle.getFileHandle('annotation.json'); }
-    catch (e) { return { annotation: null, corrupt: false, mtime: 0 }; }   // absent
-    try {
-      const file = await fh.getFile();
-      const mtime = file.lastModified || 0;   // when the file was last WRITTEN — lets open-time reconciliation spot a stale localStorage dirty flag
-      const ann = JSON.parse(await file.text());
-      if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true, mtime };
-      return { annotation: ann, corrupt: false, mtime };
+    catch (e) {
+      if (e && e.name === 'NotFoundError') return { annotation: null, corrupt: false, dropped: 0, mtime: 0 };   // truly absent
+      return { annotation: null, corrupt: false, unreadable: true, dropped: 0, mtime: 0 };                      // every OTHER error means "exists, but we could not look at it"
     }
-    catch (e) { return { annotation: null, corrupt: true, mtime: 0 }; }    // present but broken
+    let file, text;
+    try { file = await fh.getFile(); text = await file.text(); }
+    catch (e) { return { annotation: null, corrupt: false, unreadable: true, dropped: 0, mtime: 0 }; }
+    const mtime = file.lastModified || 0;   // when the file was last WRITTEN — lets open-time reconciliation spot a stale localStorage dirty flag
+    let ann;
+    try { ann = JSON.parse(text); }
+    catch (e) { return { annotation: null, corrupt: true, dropped: 0, mtime }; }   // read fine, but it is not JSON — the real "corrupt"
+    if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true, dropped: 0, mtime };
+    const dropped = (root.State && root.State.annotationDropped) ? root.State.annotationDropped(ann) : 0;
+    return { annotation: ann, corrupt: false, dropped, mtime };
   }
   async function readNote(unit) {
-    try { const h = await unit.handle.getFileHandle('note.json'); return { note: JSON.parse(await (await h.getFile()).text()) }; }
-    catch (e) { return { note: null }; }
+    let fh;
+    try { fh = await unit.handle.getFileHandle('note.json'); }
+    catch (e) { return (e && e.name === 'NotFoundError') ? { note: null } : { note: null, unreadable: true }; }   // absent vs. present-but-unreachable
+    let text;
+    try { text = await (await fh.getFile()).text(); }
+    catch (e) { return { note: null, unreadable: true }; }
+    try { return { note: JSON.parse(text) }; }
+    catch (e) { return { note: null }; }   // present but not JSON: unchanged for now — a corrupt note.json still needs its own .corrupt backup (separate finding, later commit)
   }
   // Optional geometry.json: per-segment named metrics that drive the stats + filter UI.
   // { segments: { "<segId>": { "<metric>": <number>, ... } }, filter?: {metric,min,max} }.
@@ -125,8 +147,20 @@
     try { const h = await unit.handle.getFileHandle('geometry.json'); o = JSON.parse(await (await h.getFile()).text()); }
     catch (e) { return null; }                                  // absent or unparseable — feature simply off
     if (!o || typeof o.segments !== 'object' || !o.segments) return null;
-    const values = {}, metrics = [];
-    const add = (name, id, raw) => { const v = Number(raw); if (!Number.isFinite(v)) return; if (!values[name]) { values[name] = {}; metrics.push(name); } values[name][id] = v; };
+    // Metric names and segment ids come straight from an untrusted file. With a plain {}, values['__proto__']
+    // resolves to Object.prototype, so the assignment below writes numeric properties onto Object.prototype for
+    // the WHOLE page: every frame then believes those segments carry a metric value (the geometry filter hides
+    // them and they can no longer be clicked), a second such key throws ("Cannot create property on number") and
+    // makes the frame unopenable, and a key like 'class' makes state.js read a class for marks that never had
+    // one — which the next save writes to disk.
+    const DANGEROUS = k => k === '__proto__' || k === 'constructor' || k === 'prototype';
+    const values = Object.create(null), metrics = [];
+    const add = (name, id, raw) => {
+      if (DANGEROUS(name) || DANGEROUS(id)) return;                     // never let a file-supplied key reach Object.prototype
+      const v = Number(raw); if (!Number.isFinite(v)) return;
+      if (!values[name]) { values[name] = Object.create(null); metrics.push(name); }
+      values[name][id] = v;
+    };
     for (const id in o.segments) {
       const sv = o.segments[id];
       if (sv && typeof sv === 'object') { for (const m in sv) add(m, id, sv[m]); }   // { radius:.., length:.. }
@@ -143,7 +177,8 @@
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
-    return { annotation: a.annotation, annCorrupt: a.corrupt, note: n.note, mtime: a.mtime || 0 };
+    return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0,
+             unreadable: !!(a.unreadable || n.unreadable), note: n.note, mtime: a.mtime || 0 };
   }
 
   // read the dataset-level class definitions from classes.json at the root.

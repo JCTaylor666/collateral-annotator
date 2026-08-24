@@ -21,6 +21,8 @@
   const inflightLoads = new Map();            // State.key() -> Promise<data>: dedups pixel reads between loadCur / prefetch / writeUnit
   const writingUnits = new Map();             // State.key() -> number of writes QUEUED OR IN FLIGHT for that unit — the stale-dirty reconcile must not race a save (.has() reads unchanged; counted so a write waiting its turn is visible too, not just the one running)
   const writeChain = new Map();               // State.key() -> promise of the last queued write for that unit: ONE writer per unit, in call order
+  const retryQ = new Map();                   // State.key() -> { caseId, unit, tok, tries } for writes that FAILED and are waiting to be retried
+  let retryTimer = null;                      // the single timer that drives retryQ
   const ownWriteAt = new Map();               // State.key() -> ms of OUR last successful annotation write: a file mtime ≤ this+margin is our own write, never "externally newer"
   const lastSeenMtime = new Map();            // State.key() -> annotation.json mtime at our last reconcile: unchanged mtime on a clean revisit ⇒ skip the reset (preserves undo history)
   const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
@@ -73,7 +75,7 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable'];
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
@@ -134,7 +136,7 @@
       // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
       for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
       rootHandle = newRoot; cases = found;
-      classes = cls.list; classesFileCorrupt = !cls.ok;
+      classes = cls.list; classesFileCorrupt = !cls.ok; classesBackedUp = false; classesOverwriteOK = false;
       dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
       openGen++;                                // bumped WITH rootHandle, never before it: the old dataset's scan/prefetch/late reconciles go inert, and a cancelled Open now aborts nothing
       committed = true;
@@ -143,6 +145,7 @@
       corruptUnits.clear(); corruptBackedUp.clear();
       sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
       cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear();
+      retryQ.clear(); if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }   // pending retries belong to the dataset we just closed (State for it is wiped below): they can never be written
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
       maxSeqLen = cases.reduce((m, c) => Math.max(m, c.units.filter(un => !un.virtual).length), 0);
@@ -232,6 +235,16 @@
     return p;
   }
 
+  // The FILE's own lastModified, read back after a write. Google Drive stamps its own (server) clock, which
+  // can sit further from this machine's clock than the ±2 s margin the reconcile allows — so the stamp we
+  // compare against must be the number the file itself will report. Best effort: 0 when it cannot be read.
+  async function annFileMtime(unit) {
+    try { return (await (await unit.handle.getFileHandle('annotation.json')).getFile()).lastModified || 0; }
+    catch (e) { return 0; }
+  }
+  // "Our own write" time for a unit: the session map, plus the PERSISTED stamp so the very first reconcile
+  // after a reload still recognises our own file instead of calling it an external change.
+  const ownWriteMs = (c, u, k) => Math.max(ownWriteAt.get(k) || 0, State.getWrittenAt(c, u) || 0);
   // canonical NOTE-content signature (text + markers as internal [x,y], any coord_order): null/absent == empty
   function noteContentSig(n) {
     if (!n || typeof n !== 'object') return JSON.stringify({ t: '', m: [] });
@@ -247,6 +260,8 @@
   //   'kept-dirty'       the local copy wins (it is newer, or a save of this unit is in flight)
   //   'stale-clean' /    the local copy was provably superseded by the file and was replaced; '-backed-up'
   //   'stale-backed-up'  means differing local content was stashed to the sidecar backups first
+  //   'stale-empty-     the local copy was empty (a Clear / un-star / the last mark removed) and the file was
+  //    reverted'         put back: there is nothing to stash in a sidecar, so the doctor must be TOLD instead
   //   'raced'            the unit changed under us while we were writing sidecars — nothing was replaced
   //   'aborted'          a DIFFERENT dataset was opened meanwhile — State is foreign now, nothing was touched
   // Only 'clean' / 'stale-*' / 'kept-dirty' mean "State is authoritative for this unit"; 'aborted' does not.
@@ -259,19 +274,20 @@
     }
     const ea = State.getEditedAt(c.id, u.id);
     if (!(ann && annMtime && ea && annMtime > ea)) return 'kept-dirty';
-    if (annMtime <= (ownWriteAt.get(k) || 0) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale
+    if (annMtime <= ownWriteMs(c.id, u.id, k) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale (persisted, so this still holds after a reload)
     if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
     // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
     // cloud re-sync), so never destroy silently: stash differing local content (ANNOTATION and NOTE —
     // notes/markers are unsaved content too) to sidecars first. A failed backup keeps the local copy.
-    let backedUp = false;
+    let backedUp = false, emptyReverted = false;
     try {
       const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
       const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
-      if (State.unitHasContent(c.id, u.id) && annContentSig(localAnn) !== annContentSig(ann)) {
+      const annDiffers = annContentSig(localAnn) !== annContentSig(ann);
+      if (State.unitHasContent(c.id, u.id) && annDiffers) {
         await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
         backedUp = true;
-      }
+      } else if (annDiffers) emptyReverted = true;   // nothing to stash — the local copy IS the deletion. Undoing it silently is the one revert the doctor can never notice.
       const localNote = State.buildNote(c.id, u.id);
       if (State.hasNoteData(c.id, u.id) && noteContentSig(localNote) !== noteContentSig(note)) {
         await FS.writeText(u.handle, 'note.unsaved-backup.json', JSON.stringify(localNote, null, 2));
@@ -283,8 +299,8 @@
     if (!State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
     State.resetUnit(c.id, u.id);
     try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
-    State.markClean(c.id, u.id);
-    return backedUp ? 'stale-backed-up' : 'stale-clean';
+    State.markClean(c.id, u.id, undefined, annMtime);   // State mirrors the file as of annMtime
+    return backedUp ? 'stale-backed-up' : (emptyReverted ? 'stale-empty-reverted' : 'stale-clean');
   }
   // Seed a unit's State from disk if this session never did (star-click / Save reaching a frame the
   // background scan hasn't touched yet, on a browser with no localStorage for this dataset — building
@@ -294,7 +310,8 @@
   //   'already'     this session had already reconciled the unit; State is authoritative
   //   'seeded'      just read from disk and reconciled; State is authoritative
   //   'aborted'     a different dataset was opened during the read; State is NOT authoritative
-  //   'unreadable'  the annotation could not be read at all; State is NOT authoritative
+  //   'unreadable'  the annotation file EXISTS but could not be read (or the read threw); State is NOT
+  //                 authoritative. Deliberately NOT the same as "absent": an absent file seeds empty+clean.
   // ONLY 'already' and 'seeded' permit a caller to write this unit. The two failure states deliberately do
   // NOT add the unit to sessionLoaded, so a later attempt (or the background scan) still seeds it properly.
   async function ensureSeeded(c, u) {
@@ -303,11 +320,14 @@
     let r;
     try { r = await Loader.loadAnnotation(u); }
     catch (e) { return 'unreadable'; }                                     // I/O failure: never let the caller build over a file we could not read
+    if (r.unreadable) return 'unreadable';                                 // …and the same when the read "succeeded" but the file could not be opened: seeding EMPTY here is what later lets a star/Save overwrite the real annotations
     if (tok !== dsToken) return 'aborted';                                 // folder switched during the read — this unit belongs to the OLD dataset
-    if (r.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);    // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the unparseable original
+    if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
     const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
     if (rec === 'aborted') return 'aborted';
     if (rec === 'stale-backed-up') setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // never sidecar-and-revert silently
+    else if (rec === 'stale-empty-reverted') setBanner('localEmptyReverted', { n: 1 }, 'warn');
+    else if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
     lastSeenMtime.set(k, r.mtime || 0);
     sessionLoaded.add(k);
     return 'seeded';
@@ -318,20 +338,22 @@
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cacheTouch(k);
     if (data === undefined) data = await loadUnitCached(u, k, false);
-    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.note = fresh.note; data.annMtime = fresh.mtime || 0; }
+    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.annDropped = fresh.annDropped || 0; data.annUnreadable = !!fresh.unreadable; data.note = fresh.note; data.annMtime = fresh.mtime || 0; }
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
-    if (data.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);
+    if (data.annUnreadable) return data;   // this frame's annotation.json exists but could not be read: do NOT reset State from it and do NOT mark the unit seeded — every write path re-reads first (and refuses meanwhile)
+    if (data.annCorrupt || data.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);
     const m = data.annMtime || 0;
     // clean revisit with the disk file unchanged since our last reconcile (or only changed by OUR OWN write):
     // State already equals disk — skip the reset so the frame's undo history survives navigation.
     const unchanged = sessionLoaded.has(k) && !State.isDirty(c.id, u.id) &&
-      (m === (lastSeenMtime.get(k) || 0) || m <= (ownWriteAt.get(k) || 0) + 2000);
+      (m === (lastSeenMtime.get(k) || 0) || m <= ownWriteMs(c.id, u.id, k) + 2000);
     if (!unchanged) {
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
       const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       data.staleBackedUp = rec === 'stale-backed-up';
+      data.staleEmptyReverted = rec === 'stale-empty-reverted';
     }
     lastSeenMtime.set(k, m);
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
@@ -525,7 +547,10 @@
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
     if (data.staleBackedUp) { setBanner('unsavedBackedUp', { n: 1 }, 'warn'); data.staleBackedUp = false; }   // one-shot: the backup happened once — a cached flag must not re-alarm on every revisit
+    else if (data.staleEmptyReverted) { setBanner('localEmptyReverted', { n: 1 }, 'warn'); data.staleEmptyReverted = false; }   // one-shot, same reason
+    else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
+    else if (data.annDropped) setBanner('annLayersDropped', { id: u.id, n: data.annDropped }, 'warn');   // parts of the file cannot be represented by this build
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
     else {   // stored paint saved at a different size (ANY layer): hidden, and painting there will replace it
       const badPaint = State.getLayers(c.id, u.id).some(ly => { const p = State.readLayer(c.id, u.id, ly.id).paint; return p && p.width && p.height && (p.width !== data.W || p.height !== data.H); });
@@ -792,9 +817,42 @@
     if (!classes.length) { State.setActiveClass(null); return; }
     if (!classes.some(c => c.index === State.getActiveClass())) State.setActiveClass(classes[0].index);
   }
+  let classesBackedUp = false;        // classes.json.corrupt already holds the unreadable file currently on disk
+  let classesOverwriteOK = false;     // the doctor confirmed (once per dataset) that replacing an unreadable classes.json is intended
+  // Copy an unparseable classes.json to classes.json.corrupt BEFORE anything overwrites it. Returns false if
+  // the copy could not be made — the caller must then NOT overwrite (same rule as the per-frame sidecars:
+  // never destroy what we could not back up). The latch is set only AFTER a successful copy, so a failed
+  // backup is retried on the next attempt instead of being skipped forever.
+  async function backupClassesOnce() {
+    if (!classesFileCorrupt || classesBackedUp) return true;
+    try {
+      const fh = await rootHandle.getFileHandle('classes.json');
+      await FS.writeText(rootHandle, 'classes.json.corrupt', await (await fh.getFile()).text());
+      classesBackedUp = true;
+      return true;
+    } catch (e) { return false; }
+  }
+  // Ask once per dataset before replacing an unreadable classes.json. The in-memory list is a RECONSTRUCTION
+  // (bare indices the scan found on disk, under random "Unnamed-xxxx" names), so writing it replaces the real
+  // class vocabulary of every case in the folder.
+  function confirmClassOverwrite() {
+    if (!classesFileCorrupt || classesOverwriteOK) return true;
+    if (!confirm(I18n.t('confirmClassesCorrupt'))) return false;
+    classesOverwriteOK = true;
+    return true;
+  }
   async function saveClasses() {
     if (!rootHandle) return;
-    try { await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2)); setSaveStatus('classesSaved', { time: hhmm() }); }
+    const wasCorrupt = classesFileCorrupt;
+    if (wasCorrupt && !(await backupClassesOnce())) { setBanner('classesBackupFailed', null, 'warn'); setSaveStatus('classesSaveFailed', null, true); return; }
+    try {
+      await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2));
+      if (wasCorrupt) {   // the file parses again — and the "left untouched" banner has just become FALSE
+        classesFileCorrupt = false; classesBackedUp = false;
+        setBanner('classesReplaced', null, 'warn');
+      }
+      setSaveStatus('classesSaved', { time: hhmm() });
+    }
     catch (e) { setSaveStatus('classesSaveFailed', null, true); }
   }
   function randomName() { return I18n.t('unnamedPrefix') + Math.random().toString(36).slice(2, 6); }
@@ -819,17 +877,37 @@
     one(ann);
     if (ann && Array.isArray(ann.layers)) for (const ly of ann.layers) one(ly);
   }
-  // every class index actually used by any annotation — in-memory (incl unsaved) + on disk across all units
-  async function usedClassSet() {
+  // Every class index actually used by any annotation: in-memory (incl. unsaved) + on disk.
+  // Three changes over the sequential version: it runs on the SAME 8-way pool as the background scan (the
+  // serial one measured 46 s over Drive on the real 6052-unit dataset, with no feedback at all — which is
+  // also what made the cross-dataset race so wide); it SKIPS units the scan already reconciled, because
+  // State.usedClasses() is authoritative for those (after the scan finishes it therefore reads nothing at
+  // all); and it counts units it could NOT read, so the caller can refuse to delete on partial evidence.
+  // Returns { used, unread, total }.
+  async function usedClassSet(onProgress) {
     const used = new Set(State.usedClasses());
+    const units = [];
     for (const c of cases) for (const u of c.units) {
-      if (u.virtual) continue;                                // perfusion unit has no files on disk
-      try {
-        const { annotation } = await Loader.loadAnnotation(u);
-        collectAnnClasses(annotation, used);
-      } catch (e) { }
+      if (u.virtual) continue;                                       // perfusion unit has no files on disk
+      if (sessionLoaded.has(State.key(c.id, u.id))) continue;        // already reconciled into State
+      units.push(u);
     }
-    return used;
+    const total = units.length;
+    let next = 0, done = 0, unread = 0;
+    if (onProgress) onProgress(0, total);
+    const worker = async () => {
+      while (next < units.length) {
+        const u = units[next++];
+        try {
+          const r = await Loader.loadAnnotation(u);
+          if (r.unreadable) unread++; else collectAnnClasses(r.annotation, used);
+        } catch (e) { unread++; }
+        done++;
+        if (onProgress && ((done & 7) === 0 || done === total)) onProgress(done, total);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, Math.max(1, units.length)) }, worker));
+    return { used, unread, total };
   }
   // Startup scan, now BACKGROUND + CONCURRENT: reads every unit's annotation to (a) reconcile UNVISITED
   // units into State (accurate badges + any frame usable as a copy source), (b) auto-add classes used on
@@ -843,20 +921,27 @@
     scanTotal = units.length; scanDone = 0; lastScanStaleBackups = 0;
     updateScanProg();
     const diskUsed = new Set();          // classes seen in FILES this scan (authoritative even if the user deletes a class mid-scan)
-    let next = 0, stale = 0;
+    let next = 0, stale = 0, reverted = 0;
     const worker = async () => {
       while (next < units.length) {
         if (gen !== openGen) return;
         const { c, u } = units[next++];
-        let ann = null, note = null, annCorrupt = false, annMtime = 0;
-        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; } catch (e) { }
+        let ann = null, note = null, annCorrupt = false, annMtime = 0, annDropped = 0, unreadable = false;
+        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; annDropped = r.annDropped || 0; unreadable = !!r.unreadable; }
+        catch (e) { unreadable = true; }
         if (gen !== openGen) return;
-        if (annCorrupt) corruptUnits.add(State.key(c.id, u.id));
         const uk = State.key(c.id, u.id);
+        if (unreadable) {   // could not read this unit's files. Seeding it EMPTY + marking it seeded (what
+          scanDone++;       // this loop used to do) is exactly what later lets a star/Save overwrite the real
+          if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();   // annotations. Leave State alone and let a write path re-read it.
+          continue;
+        }
+        if (annCorrupt || annDropped) corruptUnits.add(uk);
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
           if (gen !== openGen) return;
           if (rec === 'stale-backed-up') stale++;
+          else if (rec === 'stale-empty-reverted') reverted++;
           lastSeenMtime.set(uk, annMtime);
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
@@ -884,6 +969,11 @@
     // called highlightNav(), which updates .active/.done/the annotated dot but never a star.
     if (cases.length && curCase()) { buildCaseOptions(); buildFrameList(); } else highlightNav();
     if (stale) setBanner('unsavedBackedUp', { n: stale }, 'warn');
+    else if (reverted) setBanner('localEmptyReverted', { n: reverted }, 'warn');
+    // A reload (or a crash) leaves units marked unsaved that nothing would ever write again: auto-save only
+    // ever queues the frame on screen. Every unit is seeded by now, so this costs NO extra reads — it skips
+    // everything that is already clean.
+    if (State.getAutoSave()) sweepDirty();
   }
   function updateScanProg() {
     const el = $('scanProg'); if (!el) return;
@@ -921,17 +1011,43 @@
   }
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
+    if (!confirmClassOverwrite()) return;   // an unreadable classes.json would be REPLACED by this edit
     const idx = classes.reduce((m, c) => Math.max(m, c.index), 0) + 1;
     classes.push({ index: idx, name }); inp.value = '';
     ensureActiveClass(); buildClassMgr(); buildClassPicker(); saveClasses();
   }
   function renameClass(idx, name) {
     const c = classes.find(c => c.index === idx); if (!c) return;
+    if (!confirmClassOverwrite()) { buildClassMgr(); return; }   // rebuild so the input goes back to the name we still hold
     c.name = name; buildClassPicker(); saveClasses();
   }
+  // The class sweep and the background scan share #scanProg. The sweep is the FOREGROUND action, so it owns
+  // the line while it runs and hands it back to the scan afterwards.
+  function setSweepProg(done, total) {
+    const el = $('scanProg'); if (!el) return;
+    if (total > 0 && done < total) el.textContent = I18n.t('classScanProgress', { done, total });
+    else updateScanProg();
+  }
+  let classSweepBusy = false;   // a deleteClass sweep is reading the folder: the Delete buttons are disabled meanwhile
+  function setClassSweepBusy(on) {
+    classSweepBusy = on;
+    const box = $('classMgr'); if (!box) return;
+    box.querySelectorAll('.cls-del').forEach(b => { b.disabled = on; });
+  }
   async function deleteClass(idx) {
-    const used = await usedClassSet();                                   // slow: re-reads every unit from disk
-    if (used.has(idx) || State.usedClasses().includes(idx)) { setBanner('classInUse', { idx }, 'warn'); return; }   // re-check in-memory too, in case the class was assigned during the disk scan
+    if (classSweepBusy) return;             // one sweep at a time — a second Delete would answer from a half-read folder
+    if (!confirmClassOverwrite()) return;   // an unreadable classes.json would be REPLACED by this edit
+    // The sweep reads the whole folder. Capture the dataset identity AND the folder handle: without them the
+    // question ("is class {idx} still in use?") is answered from THIS dataset's files and then applied to
+    // whichever dataset is open when the reading finishes — measured live as "A keeps the class, B loses it".
+    const tok = dsToken, root = rootHandle;
+    setClassSweepBusy(true);
+    let r;
+    try { r = await usedClassSet(setSweepProg); }
+    finally { setClassSweepBusy(false); setSweepProg(0, 0); }
+    if (tok !== dsToken || root !== rootHandle) { setBanner('classDeleteAborted', { idx }, 'warn'); return; }   // another folder was opened while we read: this answer describes a folder we no longer have
+    if (r.unread) { setBanner('classDeleteUnsure', { idx, n: r.unread }, 'warn'); return; }                     // some frames could not be read: deleting on partial evidence could orphan their marks
+    if (r.used.has(idx) || State.usedClasses().includes(idx)) { setBanner('classInUse', { idx }, 'warn'); return; }   // re-check in-memory too, in case the class was assigned during the disk scan
     classes = classes.filter(c => c.index !== idx);
     ensureActiveClass(); buildClassMgr(); buildClassPicker();
     if (cur) refreshCanvasSelection();
@@ -945,7 +1061,8 @@
       const idx = document.createElement('span'); idx.className = 'cls-idx'; idx.textContent = c.index;
       const inp = document.createElement('input'); inp.type = 'text'; inp.value = c.name; inp.className = 'cls-name-inp';
       inp.onchange = () => renameClass(c.index, inp.value.trim() || I18n.t('classFallbackName', { idx: c.index }));
-      const del = document.createElement('button'); del.className = 'btn sm'; del.textContent = I18n.t('btnDelete');
+      const del = document.createElement('button'); del.className = 'btn sm cls-del'; del.textContent = I18n.t('btnDelete');
+      del.disabled = classSweepBusy;   // a rebuild during the sweep must not hand back an enabled button
       del.onclick = () => deleteClass(c.index);
       row.appendChild(idx); row.appendChild(inp); row.appendChild(del); box.appendChild(row);
     });
@@ -1177,6 +1294,7 @@
     // showUnit advances BEFORE its await, so during a slow load it names the frame being navigated TO —
     // saveNote then wrote THIS frame's annotation.json and note.json into the NEXT frame's folder.
     const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u);
+    if (!sessionLoaded.has(k)) { setBanner('frameNotSeeded', { id: u }, 'warn'); return; }   // same rule as writeUnit: never overwrite an annotation.json this session could not read
     State.setNote(c, u, $('note').value);
     try {
       const seq = State.getDirtySeq(c, u);                    // an edit landing during the writes below must stay dirty (same guard as writeUnit)
@@ -1185,8 +1303,9 @@
       await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(c, u), null, 2));
       corruptUnits.delete(k);                                 // the file on disk is valid JSON again
-      ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now());
-      State.markClean(c, u, seq); updateDirtyUI();
+      const fileMs = (await annFileMtime(unit)) || Date.now();
+      ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(c, u, fileMs);
+      State.markClean(c, u, seq, fileMs); updateDirtyUI();
       setSaveStatus('noteSaved', { time: hhmm() });
     } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
   }
@@ -1232,7 +1351,7 @@
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
     if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
-      try { setSaveStatus('saving'); await writeUnit(c.id, u); setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); }
+      try { setSaveStatus('saving'); await writeUnit(c.id, u); setSavedStatus(); updateDirtyUI(); }
       catch (e) { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: u.id }, 'warn'); }
     }
   }
@@ -1626,7 +1745,7 @@
     // an abort is NOT a write failure: nothing was written for the remaining frames and they are still dirty
     if (aborted) { setBanner('saveAborted', { n }, 'warn'); setSaveStatus(null); return; }
     if (failed) setBanner('savedPartial', { n, failed }, 'warn'); else setBanner('savedAllFmt', { n }, 'ok');
-    setSaveStatus('saved', { time: hhmm() });
+    setSavedStatus();
   }
 
   // ---- debounced auto-write-to-disk (toggle in Settings; default on) ----
@@ -1659,6 +1778,72 @@
       await FS.writeText(unit.handle, 'annotation.json.corrupt', await (await fh.getFile()).text());
     } catch (e) { /* best effort — never block the real write */ }
   }
+  // ---- failed writes: retry queue ------------------------------------------------------------------
+  // Today a failed write is NEVER retried: the frame stays dirty, the accurate "write FAILED" banner is
+  // replaced by the next per-frame warning, the header inherits "Saved" from some other frame's success, and
+  // the work survives only in localStorage. Failures are re-queued here and retried with backoff.
+  // The dataset identity is stamped at ENQUEUE time — exactly as writeUnit does it — so a retry that comes
+  // due after the doctor opened another folder is DROPPED, never written into whatever is open by then.
+  const RETRY_DELAYS = [2000, 5000, 15000, 60000];   // after the last attempt we stop; the unit stays dirty and the warning stays up
+  // Errors a retry cannot fix: permission withdrawn, the folder/file is gone. Retrying those forever would
+  // only bury the real problem — report them instead.
+  const permanentWriteError = e => !!e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError' || e.name === 'SecurityError');
+  function retryLater(caseId, unit, tok, err) {
+    const k = State.key(caseId, unit.id);
+    if (permanentWriteError(err)) { retryQ.delete(k); return false; }
+    const e = retryQ.get(k) || { caseId, unit, tok, tries: 0 };
+    e.unit = unit; e.tok = tok; e.tries++;
+    if (e.tries > RETRY_DELAYS.length) { retryQ.delete(k); return false; }   // give up quietly: the banner + dirty flag already say the work is not on disk
+    retryQ.set(k, e);
+    setSaveStatus('retryPending', { n: retryQ.size }, true);
+    armRetry(RETRY_DELAYS[e.tries - 1]);
+    return true;
+  }
+  function armRetry(ms) {
+    if (retryTimer) return;                    // one timer for the whole queue — the earliest due entry drives it
+    retryTimer = setTimeout(() => { retryTimer = null; runRetries(); }, ms);
+  }
+  async function runRetries() {
+    let recovered = false;
+    for (const e of [...retryQ.values()]) {
+      const k = State.key(e.caseId, e.unit.id);
+      if (e.tok !== dsToken) { retryQ.delete(k); continue; }                          // queued against a dataset that is no longer open
+      const c = cases.find(x => x.id === e.caseId);
+      if (!c || !State.isDirty(e.caseId, e.unit.id)) { retryQ.delete(k); continue; }  // gone, or a later write already carried this unit to disk
+      let st; try { st = await ensureSeeded(c, e.unit); } catch (err) { st = 'unreadable'; }
+      if (st !== 'seeded' && st !== 'already') { retryLater(e.caseId, e.unit, e.tok, null); continue; }   // still cannot verify the file: count it as one more attempt
+      try { await writeUnit(e.caseId, e.unit); retryQ.delete(k); recovered = true; }
+      catch (err) { }                          // writeUnit's own hook has already re-queued (or dropped) it
+    }
+    if (retryQ.size) { setSaveStatus('retryPending', { n: retryQ.size }, true); armRetry(RETRY_DELAYS[RETRY_DELAYS.length - 1]); }
+    else if (recovered) {
+      if (lastBanner && lastBanner.key === 'writeFailedBanner') setBanner(null);      // it did reach the disk after all — that warning is no longer true
+      setSaveStatus('saved', { time: hhmm() });
+    }
+    updateDirtyUI();
+  }
+  // "Saved HH:MM" must never be claimed while a write is still waiting to be retried.
+  function setSavedStatus() {
+    if (retryQ.size) setSaveStatus('retryPending', { n: retryQ.size }, true);
+    else setSaveStatus('saved', { time: hhmm() });
+  }
+  // Turning auto-save back ON must write EVERY frame that is still dirty: scheduleAutoSave only ever queues
+  // the frame on screen, so everything edited while the checkbox was off stayed unwritten until a manual Save.
+  async function sweepDirty() {
+    if (!rootHandle) return;
+    const tok = dsToken;
+    const map = new Map();
+    cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
+    for (const k of State.unitsWithData()) {
+      if (tok !== dsToken) return;                                       // another folder was opened: the remaining units belong to it, not to us
+      const ref = map.get(k); if (!ref || ref.u.virtual || ref.u.mismatch) continue;
+      if (!State.isDirty(ref.c.id, ref.u.id)) continue;                  // only work that is NOT on disk
+      let st; try { st = await ensureSeeded(ref.c, ref.u); } catch (e) { st = 'unreadable'; }
+      if (st !== 'seeded' && st !== 'already') continue;                 // unverifiable file: leave it untouched (Save reports it; the retry queue keeps trying)
+      try { await writeUnit(ref.c.id, ref.u); } catch (e) { }            // failures land in the retry queue through writeUnit's hook
+    }
+    updateDirtyUI();
+  }
   const writeBegin = k => writingUnits.set(k, (writingUnits.get(k) || 0) + 1);
   const writeEnd = k => { const n = (writingUnits.get(k) || 1) - 1; if (n > 0) writingUnits.set(k, n); else writingUnits.delete(k); };
   // ONE writer per unit, in CALL order. Two writes of the same unit (autosave + star, undo + autosave, …)
@@ -1674,11 +1859,16 @@
     writeChain.set(k, p);
     const done = () => { writeEnd(k); if (writeChain.get(k) === p) writeChain.delete(k); };
     p.then(done, done);                               // NOT .finally(): the promise it derives adopts p's rejection and nobody would handle THAT one
+    p.catch(err => { retryLater(caseId, unit, tok, err); });   // every failed write is re-queued against the dataset it was queued for — never silently dropped
     return p;                                         // the caller's own catch still sees the failure
   }
   async function writeUnitInner(caseId, unit, tok, k) {
     const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
     if (tok !== dsToken) return;                      // a folder switch happened before our turn came — State now belongs to ANOTHER dataset; writing would clobber the old folder with foreign/empty content
+    // ensureSeeded()/loadCur() deliberately leave a unit OUT of sessionLoaded when its annotation.json could
+    // not be read. Building the file from that State would replace real annotations with an empty document,
+    // so refuse: the throw surfaces the write-failure banner and puts the unit in the retry queue.
+    if (!sessionLoaded.has(k)) throw new Error('refusing to write ' + k + ': its annotation.json was never read this session');
     let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
     if (tok !== dsToken) return;                      // …or during the load
     if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
@@ -1687,14 +1877,15 @@
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
     corruptUnits.delete(k);   // the file on disk is valid JSON again
-    if (tok === dsToken) { ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now()); }   // a reconcile must never mistake OUR write for an externally-newer file (and a cross-open write must not pollute the new dataset's maps)
-    State.markClean(caseId, unit.id, seq);
+    const fileMs = (await annFileMtime(unit)) || Date.now();   // the FILE's own clock, not ours
+    if (tok === dsToken) { ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs); }   // a reconcile must never mistake OUR write for an externally-newer file — this session OR after a reload (and a cross-open write must not pollute the new dataset's maps)
+    State.markClean(caseId, unit.id, seq, fileMs);
   }
   async function runAutoSave() {
     saveTimer = null;
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
-    try { setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSaveStatus('saved', { time: hhmm() }); }
+    try { setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSavedStatus(); }
     catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
   }
 
@@ -1739,7 +1930,7 @@
       const oc = cases.find(c => c.id === e.c), ou = oc && oc.units.find(u => u.id === e.u);
       if (ou && rootHandle && State.getAutoSave()) {
         setSaveStatus('saving');
-        writeUnit(e.c, ou).then(() => { setSaveStatus('saved', { time: hhmm() }); updateDirtyUI(); })
+        writeUnit(e.c, ou).then(() => { setSavedStatus(); updateDirtyUI(); })
           .catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
       }
       return;
@@ -1812,7 +2003,7 @@
     $('autoSave').checked = State.getAutoSave();
     $('autoSave').onchange = e => {
       State.setAutoSave(e.target.checked);
-      if (e.target.checked) scheduleAutoSave();
+      if (e.target.checked) { scheduleAutoSave(); sweepDirty(); }   // …and catch up on everything edited while the checkbox was off
       else { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } setSaveStatus(null); }
     };
     $('opacity').oninput = e => { view.setOpacity(e.target.value / 100); view.render(); };
