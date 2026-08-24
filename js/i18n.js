@@ -179,9 +179,13 @@
       unsavedBackedUp: 'Unsaved edits on {n} frame(s) were superseded by newer files in the folder. Your edits were saved to annotation.unsaved-backup.json in each of those frames — recover them if the newer files were unexpected.',
       annCorrupt: '{id}: annotation.json is unreadable and was left as-is (it will be backed up to annotation.json.corrupt before any save). This frame shows no marks until the file is fixed.',
       classesCorrupt: 'classes.json is unreadable and was left untouched (class names not regenerated). Fix the file to restore your class names.',
+      errStrokeAborted: 'That stroke was too large to record and was cancelled — nothing was changed. Try a smaller brush or a shorter drag.',
       maskBad: '{id}: mask.npy is present but unreadable — the vessel-mask overlay and the brush “foreground only” limit are off for this frame.',
       paintSizeBad: '{id}: this frame’s saved brush paint was recorded at a different size — it is hidden, and painting here will replace it.',
-      savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.'
+      savedPartial: 'Saved {n} units; {failed} failed (unreadable or missing files) — those were left untouched.',
+      saveAborted: 'Saving stopped after {n} units because another folder was opened — the remaining frames were NOT written and are still marked unsaved.',
+      frameNotSeeded: '{id}: could not read that frame’s annotation.json just now, so nothing was changed or written for it. Try again.',
+      navLoading: 'loading frame…'
     },
     zh: {
       pageTitle: '血管标注器',
@@ -354,9 +358,13 @@
       unsavedBackedUp: '{n} 帧的未保存改动被文件夹里更新的文件取代了。你的改动已备份到每帧的 annotation.unsaved-backup.json —— 如果那些“更新的文件”出乎意料，可从备份恢复。',
       annCorrupt: '{id}：annotation.json 无法解析，已原样保留（保存前会先备份为 annotation.json.corrupt）。修好文件前本帧不显示标注。',
       classesCorrupt: 'classes.json 无法解析，已原样保留（未重新生成类别名）。修好文件即可恢复你的类别名称。',
+      errStrokeAborted: '这一笔涉及的像素过多、无法记录，已取消 —— 未做任何改动。请用更小的笔刷或更短的拖拽。',
       maskBad: '{id}：mask.npy 存在但无法解析 —— 本帧的血管 mask 叠加层和笔刷“仅前景”限制已关闭。',
       paintSizeBad: '{id}：本帧保存的笔刷涂抹是按其它尺寸记录的 —— 已隐藏,在此涂抹会替换掉它。',
-      savedPartial: '已保存 {n} 个单元；{failed} 个失败（文件损坏或缺失）—— 这些未被改动。'
+      savedPartial: '已保存 {n} 个单元；{failed} 个失败（文件损坏或缺失）—— 这些未被改动。',
+      saveAborted: '因为打开了另一个文件夹,保存在写完 {n} 个单元后停止 —— 其余帧【未写入】,仍标记为未保存。',
+      frameNotSeeded: '{id}：刚才读不到该帧的 annotation.json,因此没有对它做任何改动,也没有写入。请重试。',
+      navLoading: '正在载入帧…'
     }
   };
 

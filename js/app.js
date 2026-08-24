@@ -13,11 +13,14 @@
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
   let lastScanStaleBackups = 0;               // # frames whose unsaved local edits were sidecar-backed-up during the last open (disk was newer)
-  let openGen = 0;                            // bumped per openFolder: stale async work (background scan / prefetch / late reads) must never touch the new dataset
+  let openGen = 0;                            // bumped per COMMITTED openFolder: stale async work (background scan / prefetch / late reads) must never touch the new dataset
+  let dsToken = {};                           // identity of the dataset currently open. Replaced ONLY at the commit point in openFolderTxn(), so a cancelled/failed/empty Open aborts nothing that is already running.
+  let openBusy = false;                       // an Open is between the picker and its commit: navigation must not resurrect the dataset being replaced, and a second Open must not interleave with this one
   let scanTotal = 0, scanDone = 0;            // background-scan progress (rendered into #scanProg, NOT the banner)
   const sessionLoaded = new Set();            // State.key() of units already disk-reconciled THIS session by loadCur — the background scan skips them (re-resetting would wipe the user's undo history)
   const inflightLoads = new Map();            // State.key() -> Promise<data>: dedups pixel reads between loadCur / prefetch / writeUnit
-  const writingUnits = new Set();             // State.key() of units with an annotation write in flight — the stale-dirty reconcile must not race a save
+  const writingUnits = new Map();             // State.key() -> number of writes QUEUED OR IN FLIGHT for that unit — the stale-dirty reconcile must not race a save (.has() reads unchanged; counted so a write waiting its turn is visible too, not just the one running)
+  const writeChain = new Map();               // State.key() -> promise of the last queued write for that unit: ONE writer per unit, in call order
   const ownWriteAt = new Map();               // State.key() -> ms of OUR last successful annotation write: a file mtime ≤ this+margin is our own write, never "externally newer"
   const lastSeenMtime = new Map();            // State.key() -> annotation.json mtime at our last reconcile: unchanged mtime on a clean revisit ⇒ skip the reset (preserves undo history)
   const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
@@ -97,43 +100,48 @@
     catch (e) { return 'name:' + (root.name || 'unknown'); }
   }
 
-  async function openFolder() {
-    flushAutoSave(); flushGeomWrite(true);   // persist any pending edits to the CURRENT dataset before we switch away
+  // Opening a folder is a TRANSACTION. Everything is read and validated into LOCALS first; the module
+  // state (rootHandle / cases / classes / dsToken / openGen / State) is replaced in ONE synchronous commit
+  // block at the end. A cancelled, failed or case-less pick therefore changes NOTHING: no half-switched
+  // rootHandle whose classes.json writes land in the wrong folder, no empty `cases` behind a still-clickable
+  // frame list, and no generation bump that would abort a Save / class deletion the doctor started earlier.
+  // Never throws. Returns the deferred UI action for openFolder(): null | { restore } | { show, sw }.
+  async function openFolderTxn() {
+    let prevView = null, sw = null, committed = false;
     try {
       const newRoot = await FS.pickDirectory();
-      // Committed to switching. Freeze annotation NOW: the old frame stays visible through the (slow, async)
-      // scan below, and a click landing after switchDataset() wipes State would autosave a near-empty file
+      // Considering the switch. Freeze annotation NOW: the old frame stays visible through the (slow, async)
+      // reads below, and a click landing after switchDataset() wipes State would autosave a near-empty file
       // over the OLD dataset's annotation.json via the captured handle — and leak stray marks into the new one.
       commitActiveStroke();
       await flushAutoSave();                 // write any just-committed stroke to the OLD folder before the wipe
-      const prevView = { had: !!cur, ci, ui };
-      // Invalidate any in-flight showUnit BEFORE the async scan below: a slow (Google-Drive) loadCur that
-      // resolves during the scan would otherwise pass its `gen === navGen` gate and resurrect the OLD unit
-      // (with the OLD folder handle) into `cur`, re-enabling edits that then autosave into the wrong folder.
-      // openGen bumps HERE too — before rootHandle changes — so the OLD dataset's background scan/prefetch/
-      // late reconciles go inert immediately (a scan tail must never saveClasses into the NEW folder).
-      cur = null; navGen++; openGen++; exitCopyPick(); exitMarkerArm();
-      scanTotal = 0; scanDone = 0; updateScanProg();   // the old scan is dead — its progress text must not linger
+      prevView = { had: !!cur, ci, ui };
+      // Invalidate any in-flight showUnit: a slow (Google-Drive) loadCur resolving during the reads below
+      // would otherwise pass its `gen === navGen` gate and resurrect the OLD unit into `cur`. The openBusy
+      // gate our caller set (synchronously, before any await) keeps NEW navigation from un-freezing it.
+      cur = null; navGen++; exitCopyPick(); exitMarkerArm();
       $('note').disabled = true; updateCopyBtn();
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
       const newId = await ensureDatasetId(newRoot);
       if (newId !== State.getDatasetId() && State.dirtyCount() > 0 &&
-          !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) {
-        if (prevView.had) await showUnit(prevView.ci, prevView.ui);   // un-freeze: back to the old dataset
-        startBackgroundScan();                                         // the early openGen++ killed the old scan — restart it
-        return;
-      }
-      rootHandle = newRoot;
-      cases = await Loader.discover(rootHandle);
-      if (!cases.length) { setBanner('errNoCases', null, 'warn'); return; }
-      for (const c of cases) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
-      perfCache.clear(); perfInflight.clear();
-      const cls = await Loader.loadClasses(rootHandle);
+          !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) return { restore: prevView };
+      const found = await Loader.discover(newRoot);
+      // Nothing is committed yet, so an unusable pick leaves the dataset that IS open fully alive: its rows
+      // still navigate, its classes.json is still the one that gets written.
+      if (!found.length) { setBanner('errNoCases', null, 'warn'); return { restore: prevView }; }
+      const cls = await Loader.loadClasses(newRoot);
+      // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
+      for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
+      rootHandle = newRoot; cases = found;
       classes = cls.list; classesFileCorrupt = !cls.ok;
+      dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
+      openGen++;                                // bumped WITH rootHandle, never before it: the old dataset's scan/prefetch/late reconciles go inert, and a cancelled Open now aborts nothing
+      committed = true;
+      scanTotal = 0; scanDone = 0; updateScanProg();   // the old scan is dead — its progress text must not linger
+      perfCache.clear(); perfInflight.clear();
       corruptUnits.clear(); corruptBackedUp.clear();
-      const sw = State.switchDataset(newId);   // wipe any carryover from a different dataset
-      openGen++;                                // second bump: also kills anything started between pick and here
+      sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
       cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear();
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
@@ -142,14 +150,33 @@
       ensureActiveClass();                      // classes.json is already loaded; the scan may ADD missing ones when it finishes
       buildClassMgr(); buildClassPicker();
       setBanner(null);
-      const okUnit = await showUnit(0, 0);      // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
-      // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
-      if (okUnit) {
-        if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
-        else if (sw.switched && sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
-      }
-      startBackgroundScan();                    // badges / copy-sources / class auto-add fill in behind the first frame
-    } catch (e) { if (e && e.name === 'AbortError') return; scanTotal = 0; scanDone = 0; updateScanProg(); setBanner('errOpenFailed', { msg: e.message }, 'warn'); }
+      // ---------------------------------- end COMMIT ----------------------------------
+      return { show: true, sw };
+    } catch (e) {
+      if (committed) return { show: true, sw };                     // the synchronous commit already ran: the new dataset IS open
+      if (!(e && e.name === 'AbortError')) setBanner('errOpenFailed', { msg: e.message }, 'warn');   // AbortError = the doctor closed the picker
+      return prevView ? { restore: prevView } : null;               // nothing was committed — put the frozen view back
+    }
+  }
+  async function openFolder() {
+    if (openBusy) return;                       // re-entrancy: set synchronously below, BEFORE the first await, so a second click (or a second Open from anywhere) cannot start a competing transaction whose late completion would decide which dataset is open
+    openBusy = true; $('btnOpen').disabled = true;
+    flushAutoSave(); flushGeomWrite(true);      // persist any pending edits to the CURRENT dataset before we switch away
+    let act;
+    try { act = await openFolderTxn(); }
+    finally { openBusy = false; $('btnOpen').disabled = !FS.supported; }   // release the gate BEFORE the showUnit calls below — they must not be blocked by it
+    if (!act) return;                           // picker cancelled and nothing was open — nothing to restore
+    if (act.restore) {
+      if (act.restore.had) await showUnit(act.restore.ci, act.restore.ui);   // un-freeze: back to the dataset that is still open
+      return;                                   // openGen never moved, so that dataset's background scan is still running — do NOT start a second one
+    }
+    const okUnit = await showUnit(0, 0);        // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
+    // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
+    if (okUnit) {
+      if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+      else if (act.sw && act.sw.switched && act.sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
+    }
+    startBackgroundScan();                      // badges / copy-sources / class auto-add fill in behind the first frame
   }
 
   // ---- bounded LRU over `cache` (PIXEL data only: decoded image + label + mask; ~2.5MB/frame at 800²).
@@ -214,11 +241,17 @@
     return JSON.stringify({ t: typeof n.text === 'string' ? n.text : '', m: mks });
   }
   // Reconcile ONE unit's State from its on-disk annotation. Shared by loadCur (the frame being shown) and
-  // the background scan (unvisited frames). Returns 'stale-backed-up' when unsaved local edits were
-  // superseded by a provably-newer disk file and stashed to sidecar backups first. NEVER discards silently:
-  // if a needed sidecar write fails, the local (dirty) copy is kept.
+  // the background scan (unvisited frames). NEVER discards silently: if a needed sidecar write fails, the
+  // local (dirty) copy is kept. Returns exactly one of:
+  //   'clean'            State was not dirty and now mirrors the file
+  //   'kept-dirty'       the local copy wins (it is newer, or a save of this unit is in flight)
+  //   'stale-clean' /    the local copy was provably superseded by the file and was replaced; '-backed-up'
+  //   'stale-backed-up'  means differing local content was stashed to the sidecar backups first
+  //   'raced'            the unit changed under us while we were writing sidecars — nothing was replaced
+  //   'aborted'          a DIFFERENT dataset was opened meanwhile — State is foreign now, nothing was touched
+  // Only 'clean' / 'stale-*' / 'kept-dirty' mean "State is authoritative for this unit"; 'aborted' does not.
   async function reconcileUnitFromDisk(c, u, ann, note, annMtime) {
-    const gen = openGen, k = State.key(c.id, u.id);
+    const tok = dsToken, k = State.key(c.id, u.id);
     if (!State.isDirty(c.id, u.id)) {
       State.resetUnit(c.id, u.id);
       try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the load
@@ -246,26 +279,38 @@
       }
     } catch (e) { return 'kept-dirty'; }   // sidecar write FAILED — never proceed to a discard we couldn't back up
     // the backup writes yielded: bail if the world moved on (dataset switched, user edited, a save cleaned it)
-    if (gen !== openGen || !State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
+    if (tok !== dsToken) return 'aborted';                    // a different dataset is open now: this State is foreign, never import into it
+    if (!State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
     State.resetUnit(c.id, u.id);
     try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
     State.markClean(c.id, u.id);
     return backedUp ? 'stale-backed-up' : 'stale-clean';
   }
-  // seed a unit's State from disk if this session never did (star-click / Save reaching a frame the
+  // Seed a unit's State from disk if this session never did (star-click / Save reaching a frame the
   // background scan hasn't touched yet, on a browser with no localStorage for this dataset — building
-  // from unseeded State would overwrite the on-disk annotation with an EMPTY one)
+  // from unseeded State would overwrite the on-disk annotation with an EMPTY one).
+  //
+  // CONTRACT — returns exactly one of:
+  //   'already'     this session had already reconciled the unit; State is authoritative
+  //   'seeded'      just read from disk and reconciled; State is authoritative
+  //   'aborted'     a different dataset was opened during the read; State is NOT authoritative
+  //   'unreadable'  the annotation could not be read at all; State is NOT authoritative
+  // ONLY 'already' and 'seeded' permit a caller to write this unit. The two failure states deliberately do
+  // NOT add the unit to sessionLoaded, so a later attempt (or the background scan) still seeds it properly.
   async function ensureSeeded(c, u) {
-    const k = State.key(c.id, u.id);
-    if (sessionLoaded.has(k)) return;
-    try {
-      const r = await Loader.loadAnnotation(u);
-      if (r.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the unparseable original
-      const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
-      if (rec === 'stale-backed-up') setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // never sidecar-and-revert silently
-      lastSeenMtime.set(k, r.mtime || 0);
-    } catch (e) { }
+    const k = State.key(c.id, u.id), tok = dsToken;
+    if (sessionLoaded.has(k)) return 'already';
+    let r;
+    try { r = await Loader.loadAnnotation(u); }
+    catch (e) { return 'unreadable'; }                                     // I/O failure: never let the caller build over a file we could not read
+    if (tok !== dsToken) return 'aborted';                                 // folder switched during the read — this unit belongs to the OLD dataset
+    if (r.annCorrupt) corruptUnits.add(k); else corruptUnits.delete(k);    // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the unparseable original
+    const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
+    if (rec === 'aborted') return 'aborted';
+    if (rec === 'stale-backed-up') setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // never sidecar-and-revert silently
+    lastSeenMtime.set(k, r.mtime || 0);
     sessionLoaded.add(k);
+    return 'seeded';
   }
 
   async function loadCur() {
@@ -285,6 +330,7 @@
     if (!unchanged) {
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
       const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
+      if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       data.staleBackedUp = rec === 'stale-backed-up';
     }
     lastSeenMtime.set(k, m);
@@ -382,22 +428,36 @@
   }
 
   // brush-select: process one brush dab — select (or deselect) every segment under the circle, once per stroke
+  // Append every element of `src` onto `dst` WITHOUT spreading it into an argument list. A brush-select
+  // stroke over a large painted segment produces one change record per cleared pixel, and `push(...src)`
+  // throws RangeError past ~124k arguments (measured on V8) — which happened AFTER clearPaintInSegment had
+  // already zeroed those pixels, leaving the canvas edited with no undo record so the next stroke persisted
+  // the loss. 1432² needs only ~6% of the frame painted inside one segment to reach that limit.
+  function appendAll(dst, src) { for (let i = 0; i < src.length; i++) dst.push(src[i]); }
   function selDab(x, y) {
     const sb = State.getSelBrush();
-    if (sb.mode === 'erase') {                              // deselect brush also sweeps up background red dots under the circle
-      const rm = State.removePointsInCircle(cur.caseId, cur.unitId, x, y, sb.radius);
-      if (rm.length) selPointChanges.push(...rm);
-    }
-    for (const [seg, xy] of view.segsInBrush(x, y, sb.radius)) {
-      if (!segVisible(seg)) continue;                       // honor the geometry filter: never select/deselect a hidden vessel
-      if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
-      selStrokeSegs.add(seg);
-      if (sb.mode === 'add' && State.hasPaint(cur.caseId, cur.unitId)) {   // paint ⟂ selection: wipe paint under a newly-selected segment
-        const pc = view.clearPaintInSegment(seg);
-        if (pc.length) selPaintChanges.push(...pc);
+    try {
+      if (sb.mode === 'erase') {                              // deselect brush also sweeps up background red dots under the circle
+        const rm = State.removePointsInCircle(cur.caseId, cur.unitId, x, y, sb.radius);
+        if (rm.length) appendAll(selPointChanges, rm);
       }
-      const ch = State.brushSeg(cur.caseId, cur.unitId, seg, xy, State.getActiveClass(), sb.mode === 'erase');
-      if (ch) selChanges.push(ch);
+      for (const [seg, xy] of view.segsInBrush(x, y, sb.radius)) {
+        if (!segVisible(seg)) continue;                       // honor the geometry filter: never select/deselect a hidden vessel
+        if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
+        selStrokeSegs.add(seg);
+        if (sb.mode === 'add' && State.hasPaint(cur.caseId, cur.unitId)) {   // paint ⟂ selection: wipe paint under a newly-selected segment
+          const pc = view.clearPaintInSegment(seg);
+          if (pc.length) appendAll(selPaintChanges, pc);
+        }
+        const ch = State.brushSeg(cur.caseId, cur.unitId, seg, xy, State.getActiveClass(), sb.mode === 'erase');
+        if (ch) selChanges.push(ch);
+      }
+    } catch (e) {
+      // Never leave the canvas edited without a matching undo record: restore the view's paint from State
+      // (the authoritative copy) and abort the stroke loudly instead of failing silently.
+      try { view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H)); view.render(); } catch (e2) { }
+      selecting = false; selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null;
+      setBanner('errStrokeAborted', null, 'warn');
     }
   }
   function finalizeSelectStroke() {
@@ -425,6 +485,9 @@
     ci = nc; ui = nu; return true;
   }
   async function showUnit(nci, nui) {
+    if (openBusy) return false;   // a folder switch is in flight: navigating now would un-freeze the dataset being replaced (its State is about to be wiped), and the next edit would autosave an EMPTY annotation into the OLD folder
+    const tc = cases[nci], tu = tc && tc.units[nui];
+    if (!tc || !tu) return false;   // no dataset, or a row left over from one: never index into an empty cases array (that used to throw on every click after a case-less Open)
     commitActiveStroke();     // never let a live stroke bleed onto the frame we're switching to
     exitCopyPick();           // leaving a frame cancels an in-progress copy-from-frame pick
     flushAutoSave();          // persist the outgoing unit before we move off it
@@ -437,7 +500,7 @@
     ensureCasePerfusion(c);   // kick off (cached) perfusion compute on entering a case, so it's ready to view / pin
     if (u.virtual) return await showPerfusionUnit(c, u, gen, prevCi, prevUi);
     let data;
-    navBusy = true;
+    navBusy = true; setNavBusy(true);
     try { data = await loadCur(); }
     catch (e) {
       if (gen !== navGen) return false;          // a newer navigation superseded this one — stay silent
@@ -445,7 +508,7 @@
       setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
       return false;
     }
-    finally { navBusy = false; }
+    finally { navBusy = false; if (gen === navGen) setNavBusy(false); }   // a superseded load must leave the NEWEST navigation's busy hint alone
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
@@ -485,8 +548,8 @@
   }
   // the computed, view-only perfusion unit: colour image, no label/mask/annotation
   async function showPerfusionUnit(c, u, gen, prevCi, prevUi) {
-    navBusy = true;
-    let perf; try { perf = await ensureCasePerfusion(c); } finally { navBusy = false; }
+    navBusy = true; setNavBusy(true);
+    let perf; try { perf = await ensureCasePerfusion(c); } finally { navBusy = false; if (gen === navGen) setNavBusy(false); }
     if (gen !== navGen) return false;                       // superseded by a newer navigation
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
     cur = { W: perf.W, H: perf.H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
@@ -537,6 +600,14 @@
     updateDirtyUI(); updateCopyBtn();
     setBanner('shapeMismatchBanner', { id: u.id }, 'warn');
     return true;
+  }
+
+  // Now that the header follows `cur`, a frame change shows NOTHING until the file has loaded — on a cold
+  // Google-Drive folder that is seconds of silence. This is the feedback that the keypress/click registered.
+  function setNavBusy(on) {
+    const el = $('progress'); if (!el) return;
+    if (on) el.textContent = I18n.t('navLoading');
+    else if (cur) refreshMeta(); else el.textContent = '';
   }
 
   function refreshDots() {
@@ -789,6 +860,7 @@
           lastSeenMtime.set(uk, annMtime);
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
+        if (curCase() && c.id === curCase().id) updateFrameStar(c.id, u.id);   // the row was built before this unit was read: a stale hollow ☆ that the doctor clicks DELETES the star on disk
         collectAnnClasses(ann, diskUsed);                      // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
         scanDone++;
         if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();
@@ -808,7 +880,9 @@
       // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
       if (!classesFileCorrupt) await saveClasses();
     }
-    highlightNav();                                            // frame badges are complete now
+    // Star glyphs and the case dropdown's ★ suffix are produced ONLY by these two builders — the old tail
+    // called highlightNav(), which updates .active/.done/the annotated dot but never a star.
+    if (cases.length && curCase()) { buildCaseOptions(); buildFrameList(); } else highlightNav();
     if (stale) setBanner('unsavedBackedUp', { n: stale }, 'warn');
   }
   function updateScanProg() {
@@ -925,11 +999,14 @@
     updateCopyBtn();
   }
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
-  async function pickCopySource(uidx) {
-    const c = curCase(), src = c.units[uidx];
+  async function pickCopySource(caseId, unitId) {
+    const c = cases.find(x => x.id === caseId), src = c && c.units.find(x => x.id === unitId);
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
-    if (!src || uidx === ui || !cur) return;
-    if (!src.virtual && !src.mismatch) await ensureSeeded(c, src);   // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
+    if (!c || !src || !cur || cur.caseId !== caseId || cur.unitId === unitId) return;   // the source must be another frame of the case that is actually displayed
+    if (!src.virtual && !src.mismatch) {                             // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
+      const st = await ensureSeeded(c, src);
+      if (st !== 'seeded' && st !== 'already') { setBanner('frameNotSeeded', { id: src.id }, 'warn'); return; }   // we could not read the source: say so instead of copying "nothing"
+    }
     if (!cur || copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started: say so, don't silently no-op
     doCopyFrom(c.id, src);
   }
@@ -1096,7 +1173,10 @@
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
     if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
-    const c = cur.caseId, u = cur.unitId, unit = curUnit(), k = State.key(c, u);
+    // The handle MUST come from the unit captured atomically in `cur`. curUnit() resolves ci/ui, which
+    // showUnit advances BEFORE its await, so during a slow load it names the frame being navigated TO —
+    // saveNote then wrote THIS frame's annotation.json and note.json into the NEXT frame's folder.
+    const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u);
     State.setNote(c, u, $('note').value);
     try {
       const seq = State.getDirtySeq(c, u);                    // an edit landing during the writes below must stay dirty (same guard as writeUnit)
@@ -1112,10 +1192,16 @@
   }
   function toggleRPanel() { document.body.classList.toggle('rpanel-collapsed'); onResize(); }
 
+  // Describes the frame that is ON SCREEN (cur) — never the one a slow navigation is heading for. ci/ui
+  // advance before showUnit's await, so reading them here relabelled the header (and its mark count) to the
+  // incoming frame the instant a click landed, while the doctor was still looking at the previous one.
   function refreshMeta() {
-    const c = curCase(), u = curUnit();
+    if (!cur) return;
+    const cIdx = cases.findIndex(x => x.id === cur.caseId); if (cIdx < 0) return;
+    const c = cases[cIdx], uIdx = c.units.findIndex(x => x.id === cur.unitId); if (uIdx < 0) return;
+    const u = c.units[uIdx];
     $('curLabel').textContent = c.id + ' / ' + u.id + '  (' + u.kind + ')';
-    $('unitIndicator').textContent = I18n.t('unitIndicatorFmt', { ui: ui + 1, uc: curCase().units.length, ci: ci + 1, cc: cases.length });
+    $('unitIndicator').textContent = I18n.t('unitIndicatorFmt', { ui: uIdx + 1, uc: c.units.length, ci: cIdx + 1, cc: cases.length });
     const ids = State.selectedIds(c.id, u.id);
     $('chips').innerHTML = ids.length ? ids.map(i => '<span class="chip">' + i + '</span>').join('') : '<span class="muted">' + I18n.t('none') + '</span>';
     $('progress').textContent = I18n.t('progressFmt', { segs: ids.length, pts: State.pointCount(c.id, u.id) });
@@ -1130,13 +1216,18 @@
       sel.appendChild(o);
     });
   }
-  async function toggleStar(uidx) {
-    const c = curCase(); if (!c) return;
-    const u = c.units[uidx];
+  async function toggleStar(caseId, unitId) {
+    const c = cases.find(x => x.id === caseId), u = c && c.units.find(x => x.id === unitId);
+    if (!c || !u) return;                  // the row belongs to a case/unit that is no longer part of this dataset
     if (u.virtual || u.mismatch) return;   // view-only units can't be starred (no file to persist it to)
     // CRITICAL guard: this frame may never have been seeded this session (fresh browser + background scan
-    // hasn't reached it) — starring would then autosave an EMPTY annotation over its real file. Seed first.
-    await ensureSeeded(c, u);
+    // hasn't reached it) — starring would then autosave an EMPTY annotation over its real file. Seed first,
+    // and honour the contract: only 'seeded'/'already' mean State matches the file on disk.
+    const st = await ensureSeeded(c, u);
+    if (st !== 'seeded' && st !== 'already') {                 // 'aborted' (folder switched) or 'unreadable' (I/O): changing the star now would write a State we never reconciled
+      if (st === 'unreadable') setBanner('frameNotSeeded', { id: u.id }, 'warn');
+      return;
+    }
     State.setStarred(c.id, u.id, !State.isStarred(c.id, u.id));
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
@@ -1148,7 +1239,12 @@
   function buildFrameList() {
     const c = curCase(), list = $('frameList'); list.innerHTML = '';
     if (!c) return;
+    // A row outlives the case it was built for: showUnit advances ci BEFORE its (slow) await, so a click that
+    // lands during a case switch used to be applied to the INCOMING case's frame of the same index. Bind each
+    // row to its own case/unit ID and re-resolve at click time instead.
+    const cid = c.id;
     c.units.forEach((u, uidx) => {
+      const uid = u.id;
       const el = document.createElement('div');
       el.className = 'frm' + (u.virtual ? ' frm-virtual' : ''); el.dataset.k = State.key(c.id, u.id); el.dataset.base = u.id;
       const name = document.createElement('span'); name.className = 'frm-name'; name.textContent = u.id;
@@ -1157,21 +1253,27 @@
       if (!u.virtual) {   // perfusion is view-only: no star / no annotation badge
         const on = State.isStarred(c.id, u.id);
         const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t('starThisFrame');
-        star.onclick = (e) => { e.stopPropagation(); toggleStar(uidx); };
+        star.onclick = (e) => { e.stopPropagation(); toggleStar(cid, uid); };
         el.appendChild(star);
       }
-      el.onclick = () => { if (copyPickMode) { if (!u.virtual) pickCopySource(uidx); } else showUnit(ci, uidx); };
+      el.onclick = () => {
+        if (copyPickMode) { if (!u.virtual) pickCopySource(cid, uid); return; }
+        const nci = cases.findIndex(x => x.id === cid); if (nci < 0) return;                     // this row's case is gone (folder switched)
+        const nui = cases[nci].units.findIndex(x => x.id === uid); if (nui < 0) return;
+        showUnit(nci, nui);
+      };
       list.appendChild(el);
     });
     highlightNav();
   }
   function highlightNav() {
-    if (!curCase()) return;
-    $('caseSelect').value = ci;
-    const k = State.key(curCase().id, curUnit().id);
+    // the ACTIVE row is the frame on screen (cur), not the one ci/ui already point at mid-navigation
+    const cIdx = cur ? cases.findIndex(x => x.id === cur.caseId) : -1;
+    if (cIdx >= 0) $('caseSelect').value = cIdx;
+    const k = cur ? State.key(cur.caseId, cur.unitId) : null;
     document.querySelectorAll('#frameList .frm').forEach(el => {
       const [cc, uu] = el.dataset.k.split('/');
-      const active = el.dataset.k === k;
+      const active = k !== null && el.dataset.k === k;
       el.classList.toggle('active', active);
       el.classList.toggle('done', State.isVisited(cc, uu));
       el.querySelector('.frm-b').classList.toggle('on', State.unitAnnotated(cc, uu));
@@ -1184,6 +1286,17 @@
     const k = State.key(c, u);
     document.querySelectorAll('#frameList .frm').forEach(el => {
       if (el.dataset.k === k) el.querySelector('.frm-b').classList.toggle('on', State.unitAnnotated(c, u));
+    });
+  }
+
+  // refresh ONE row's star glyph (sibling of updateFrameDot). The background scan learns the on-disk stars
+  // long after the rows were built, and a row still showing a hollow ☆ DELETES the star when clicked.
+  function updateFrameStar(c, u) {
+    const k = State.key(c, u), on = State.isStarred(c, u);
+    document.querySelectorAll('#frameList .frm').forEach(el => {
+      if (el.dataset.k !== k) return;
+      const st = el.querySelector('.frm-star'); if (!st) return;
+      st.className = 'frm-star' + (on ? ' on' : ''); st.textContent = on ? '★' : '☆';
     });
   }
 
@@ -1492,20 +1605,26 @@
     flushGeomWrite(true);     // persist the current unit's radius window on an explicit save, even if auto-save is off
     const map = new Map();
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
-    let n = 0, failed = 0;
+    const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
+    let n = 0, failed = 0, aborted = false;
     for (const k of State.unitsWithData()) {
+      if (tok !== dsToken) { aborted = true; break; }   // a different dataset was opened while we were writing — stop, and say so (the rest stay unsaved)
       const ref = map.get(k);
       if (!ref) { const [cc, uu] = k.split('/'); if (State.isDirty(cc, uu)) failed++; continue; }   // unit's folder no longer discoverable — surface it, don't silently skip
       if (ref.u.virtual || ref.u.mismatch) continue;                                     // perfusion / shape-mismatch units are never written
       // a unit the background scan hasn't reached yet must be seeded from disk BEFORE we serialize it,
       // or a star-only/dirty-only entry would write an EMPTY annotation over its real file
-      try { await ensureSeeded(ref.c, ref.u); } catch (e) { }
+      let st; try { st = await ensureSeeded(ref.c, ref.u); } catch (e) { st = 'unreadable'; }
+      if (st === 'aborted') { aborted = true; break; }
+      if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
       // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
       if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
       try { await writeUnit(ref.c.id, ref.u); n++; }
       catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
     }
     updateDirtyUI();
+    // an abort is NOT a write failure: nothing was written for the remaining frames and they are still dirty
+    if (aborted) { setBanner('saveAborted', { n }, 'warn'); setSaveStatus(null); return; }
     if (failed) setBanner('savedPartial', { n, failed }, 'warn'); else setBanner('savedAllFmt', { n }, 'ok');
     setSaveStatus('saved', { time: hhmm() });
   }
@@ -1540,22 +1659,36 @@
       await FS.writeText(unit.handle, 'annotation.json.corrupt', await (await fh.getFile()).text());
     } catch (e) { /* best effort — never block the real write */ }
   }
-  async function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
-    const k = State.key(caseId, unit.id), gen = openGen;
+  const writeBegin = k => writingUnits.set(k, (writingUnits.get(k) || 0) + 1);
+  const writeEnd = k => { const n = (writingUnits.get(k) || 1) - 1; if (n > 0) writingUnits.set(k, n); else writingUnits.delete(k); };
+  // ONE writer per unit, in CALL order. Two writes of the same unit (autosave + star, undo + autosave, …)
+  // used to race through their awaits, so the SLOWER-started one could land last and leave OLDER content on
+  // disk under a "Synced" UI. The dataset identity is captured HERE, at ENQUEUE time, and passed in: reading
+  // it inside the queued body would pick up whatever dataset is open when the turn finally comes, which is
+  // exactly the cross-dataset write the guard exists to prevent.
+  function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
+    const k = State.key(caseId, unit.id), tok = dsToken;
+    writeBegin(k);                                    // the stale-dirty reconcile must not race a save — from the moment it is QUEUED, not just while it runs
+    const prev = writeChain.get(k) || Promise.resolve();
+    const p = prev.catch(() => { }).then(() => writeUnitInner(caseId, unit, tok, k));   // a failed predecessor must not cancel the writes queued behind it
+    writeChain.set(k, p);
+    const done = () => { writeEnd(k); if (writeChain.get(k) === p) writeChain.delete(k); };
+    p.then(done, done);                               // NOT .finally(): the promise it derives adopts p's rejection and nobody would handle THAT one
+    return p;                                         // the caller's own catch still sees the failure
+  }
+  async function writeUnitInner(caseId, unit, tok, k) {
     const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
-    writingUnits.add(k);                              // the stale-dirty reconcile must never race an in-flight save of the same unit
-    try {
-      let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
-      if (gen !== openGen) return;                    // a folder switch happened during the load — State now belongs to ANOTHER dataset; writing would clobber the old folder with foreign/empty content
-      if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
-      await backupCorruptOnce(k, unit);
-      if (gen !== openGen) return;
-      await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
-      if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
-      corruptUnits.delete(k);   // the file on disk is valid JSON again
-      if (gen === openGen) { ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now()); }   // a reconcile must never mistake OUR write for an externally-newer file (and a cross-open write must not pollute the new dataset's maps)
-      State.markClean(caseId, unit.id, seq);
-    } finally { writingUnits.delete(k); }
+    if (tok !== dsToken) return;                      // a folder switch happened before our turn came — State now belongs to ANOTHER dataset; writing would clobber the old folder with foreign/empty content
+    let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
+    if (tok !== dsToken) return;                      // …or during the load
+    if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
+    await backupCorruptOnce(k, unit);
+    if (tok !== dsToken) return;
+    await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+    if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+    corruptUnits.delete(k);   // the file on disk is valid JSON again
+    if (tok === dsToken) { ownWriteAt.set(k, Date.now()); lastSeenMtime.set(k, Date.now()); }   // a reconcile must never mistake OUR write for an externally-newer file (and a cross-open write must not pollute the new dataset's maps)
+    State.markClean(caseId, unit.id, seq);
   }
   async function runAutoSave() {
     saveTimer = null;
