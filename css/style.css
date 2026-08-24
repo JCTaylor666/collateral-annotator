@@ -80,6 +80,18 @@ body.copy-picking .frm{cursor:copy}
 .grp .chev{color:var(--muted);transition:transform .15s;display:inline-block;font-size:11px}
 .grp[open]>summary .chev{transform:rotate(90deg)}
 .grp-body{padding-bottom:10px}
+
+/* drag-to-reorder handle on each collapsible rail panel (js/raillayout.js).
+   The handle lives INSIDE <summary>, so its click is cancelled there — otherwise finishing a
+   drag would also toggle the panel open/closed. */
+.grip{margin-left:auto;flex:none;width:20px;height:18px;padding:0;border:0;border-radius:4px;background:transparent;cursor:grab;position:relative;touch-action:none}
+.grip::before{content:'';position:absolute;left:4px;right:4px;top:4px;height:10px;background:linear-gradient(var(--muted) 0 2px,transparent 2px 4px) 0 0/100% 4px repeat}
+.grp>summary:hover .grip::before,.grip:hover::before{background:linear-gradient(var(--ink) 0 2px,transparent 2px 4px) 0 0/100% 4px repeat}
+.grip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.grp.dragging{opacity:.6;border-color:var(--accent)}
+.grp.dragging .grip{cursor:grabbing}
+body.rail-dragging{cursor:grabbing;user-select:none}
+body.rail-dragging .grp>summary{cursor:grabbing}
 .add-class{display:flex;gap:6px;margin-bottom:8px}
 .add-class input{flex:1;min-width:0}
 .cls-mgr{display:flex;flex-direction:column;gap:5px}

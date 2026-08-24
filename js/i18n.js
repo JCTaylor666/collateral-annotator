@@ -73,6 +73,8 @@
       grpSettings: 'Settings',
       coordOrderLabel: 'Coordinate order',
       autoSaveLabel: 'Auto-save (write to disk on change)',
+      btnResetLayout: 'Reset panel order',
+      gripTitle: 'Drag to reorder this panel (Alt+↑/↓). Order is kept in this browser only — no files are written.',
 
       grpHelp: 'Help / Legend',
       helpText: 'Click a vessel segment to mark it as collateral (click again to remove). Every click leaves a red dot marking its coordinate; clicking background (no vessel) also leaves a red dot — click near an existing red dot to delete it. Zoom: wheel/pinch; pan: left-drag/two-finger. Colors: vessel mask = bright blue, selected = green, hover = orange, red dot = click location.',
@@ -262,6 +264,8 @@
       grpSettings: '设置',
       coordOrderLabel: '坐标顺序',
       autoSaveLabel: '自动保存（改动后自动写盘）',
+      btnResetLayout: '恢复默认面板顺序',
+      gripTitle: '拖动可调整此面板的上下位置（Alt+↑/↓）。顺序只存在本浏览器里，不写入任何文件。',
 
       grpHelp: '帮助 / 图例',
       helpText: '点击血管段即标为侧支（再点取消）。点击处会留红点记录坐标；点背景（无血管）也会留红点，在红点附近再点即删除。缩放：滚轮/捷合；平移：左键拖动/双指。颜色：血管mask=亮蓝，选中=绿，悬停=橙，红点=点击坐标。',
