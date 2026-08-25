@@ -150,6 +150,10 @@ body.sel-brush-mode .single-opts{display:none}
 .modal{background:var(--panel);border-radius:12px;padding:26px 30px;max-width:440px;box-shadow:0 12px 44px rgba(0,0,0,.28);text-align:center}
 .modal-warn{color:#dc2626;font-size:17px;font-weight:700;margin:0 0 22px;line-height:1.7}
 .modal-actions{display:flex;align-items:center;justify-content:center;gap:20px}
+.modal-title{font-size:16px;font-weight:700;margin:0 0 16px}
+.saveprog{height:10px;border-radius:5px;background:var(--bg);overflow:hidden;margin:0 0 10px;min-width:300px}
+#saveProgFill{height:100%;width:0%;background:var(--accent);border-radius:5px;transition:width .15s}
+.saveprog-text{font-size:12px;color:var(--muted);margin-bottom:18px;min-height:16px;font-variant-numeric:tabular-nums}
 .btn-danger{font-size:12px;padding:6px 12px;color:var(--warn);border-color:var(--border)}
 .btn-danger:hover:not(:disabled){border-color:var(--warn)}
 .btn-cancel{font-size:18px;font-weight:700;padding:13px 34px;border-radius:10px;border-color:var(--accent);background:var(--accent);color:#fff}

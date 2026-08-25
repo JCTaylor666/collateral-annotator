@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vessel Annotator</title>
-<link rel="stylesheet" href="./css/style.css?v=65">
+<link rel="stylesheet" href="./css/style.css?v=66">
 <!-- GoatCounter privacy-friendly page-visit analytics (no cookies; counts page loads of this site only, never touches the user's local data files) -->
 <script data-goatcounter="https://jctaylor666.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
@@ -36,7 +36,12 @@
   <nav id="rail" class="rail">
     <div class="rail-files">
       <button id="btnOpen" class="btn wide" data-i18n="btnOpen">Open data folder</button>
-      <button id="btnSave" class="btn wide" data-i18n="btnSave">Save to folder</button>
+      <!-- two save scopes, labelled with WHAT they save (case id / unsaved count) so the split is
+           self-explanatory: left = the case being annotated now, right = the whole dataset -->
+      <div class="btn-row">
+        <button id="btnSaveCase" class="btn grow" data-i18n-title="saveCaseTitle" title="Write every annotated frame of the CURRENT case to the folder">Save case</button>
+        <button id="btnSave" class="btn grow" data-i18n-title="saveAllTitle" title="Write every annotated frame of the WHOLE dataset to the folder (end-of-day save)">Save all</button>
+      </div>
     </div>
 
     <div>
@@ -204,6 +209,18 @@
   <canvas id="loupeCurve" class="loupe-curve"></canvas>
 </div>
 
+<div id="saveModal" class="modal-overlay hidden">
+  <div class="modal">
+    <p class="modal-title" id="saveModalTitle">Saving…</p>
+    <div class="saveprog"><div id="saveProgFill"></div></div>
+    <div id="saveProgText" class="saveprog-text"></div>
+    <div class="modal-actions">
+      <button id="btnSaveCancel" class="btn btn-cancel" data-i18n="btnCancel">Cancel</button>
+      <button id="btnSaveClose" class="btn hidden" data-i18n="btnClose">Close</button>
+    </div>
+  </div>
+</div>
+
 <div id="confirmClear" class="modal-overlay hidden">
   <div class="modal">
     <p class="modal-warn" data-i18n-html="clearConfirmHtml">Really clear?<br>This removes the CURRENT LAYER’s annotations (segments, points, paint). Other layers, the note, markers and star are kept.</p>
@@ -214,16 +231,16 @@
   </div>
 </div>
 
-<script src="./js/i18n.js?v=65"></script>
-<script src="./js/npy.js?v=65"></script>
-<script src="./js/fs.js?v=65"></script>
-<script src="./js/loader.js?v=65"></script>
-<script src="./js/canvas.js?v=65"></script>
-<script src="./js/state.js?v=65"></script>
-<script src="./js/loupe.js?v=65"></script>
-<script src="./js/perfusion.js?v=65"></script>
-<script src="./js/dataformat.js?v=65"></script>
-<script src="./js/app.js?v=65"></script>
-<script src="./js/raillayout.js?v=65"></script>
+<script src="./js/i18n.js?v=66"></script>
+<script src="./js/npy.js?v=66"></script>
+<script src="./js/fs.js?v=66"></script>
+<script src="./js/loader.js?v=66"></script>
+<script src="./js/canvas.js?v=66"></script>
+<script src="./js/state.js?v=66"></script>
+<script src="./js/loupe.js?v=66"></script>
+<script src="./js/perfusion.js?v=66"></script>
+<script src="./js/dataformat.js?v=66"></script>
+<script src="./js/app.js?v=66"></script>
+<script src="./js/raillayout.js?v=66"></script>
 </body>
 </html>

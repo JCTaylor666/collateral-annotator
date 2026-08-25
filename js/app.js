@@ -1732,7 +1732,43 @@
     if (dragMoved) suppressClick = true;                    // swallow the click that follows a real drag
   }
 
-  async function save() {
+  // ---- explicit save: two scopes sharing one engine ------------------------------------------------
+  // "Save case" writes the case being annotated now; "Save all" is the end-of-day full write. Both run
+  // through runSave(), which shows a progress modal (total is known up front, so the doctor can see how
+  // long the full save actually is) with a Cancel that stops BETWEEN frames: everything already written
+  // stays written, everything else keeps its unsaved mark. The modal is a .modal-overlay, so the v63
+  // hotkey guard automatically blocks navigation/undo behind it while a save runs.
+  let saveCancel = false, saveRunning = false;
+  function saveModalOpen(titleKey, vars) {
+    saveCancel = false;
+    $('saveModalTitle').textContent = I18n.t(titleKey, vars);
+    $('saveProgFill').style.width = '0%';
+    $('saveProgText').textContent = '';
+    $('btnSaveCancel').classList.remove('hidden'); $('btnSaveCancel').disabled = false;
+    $('btnSaveClose').classList.add('hidden');
+    $('saveModal').classList.remove('hidden');
+  }
+  function saveModalStep(done, total, file) {
+    $('saveProgFill').style.width = (total ? Math.round(done * 100 / total) : 100) + '%';
+    $('saveProgText').textContent = I18n.t('saveProgFmt', { done, total, file });
+  }
+  function saveModalFinish(text) {
+    $('saveProgText').textContent = text;
+    $('btnSaveCancel').classList.add('hidden');
+    $('btnSaveClose').classList.remove('hidden');
+  }
+  // The save buttons carry their scope in the label — "Save s_12" / "Save all · 3 unsaved" — so which
+  // button writes what is readable at a glance, and the unsaved count doubles as the missing global
+  // unsaved indicator. Dynamic text, so these two carry no data-i18n (langchange re-renders them here).
+  function updateSaveButtons() {
+    const dn = State.dirtyCount();
+    $('btnSave').textContent = dn ? I18n.t('saveAllUnsavedFmt', { n: dn }) : I18n.t('btnSaveAll');
+    $('btnSaveCase').textContent = (cur && !cur.virtual) ? I18n.t('saveCaseFmt', { id: cur.caseId }) : I18n.t('btnSaveCaseLabel');
+    if (!FS.supported) { $('btnSave').disabled = true; $('btnSaveCase').disabled = true; return; }
+    if (!saveRunning) { $('btnSave').disabled = false; $('btnSaveCase').disabled = !cur; }
+  }
+  async function runSave(caseId) {
+    if (saveRunning) return;
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
     try { if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; } }
@@ -1740,29 +1776,46 @@
     flushGeomWrite(true);     // persist the current unit's radius window on an explicit save, even if auto-save is off
     const map = new Map();
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
+    // scope filter: a case id is a folder name, it can never contain '/', so prefix+'/' is exact
+    const keys = State.unitsWithData().filter(k => !caseId || k.slice(0, caseId.length + 1) === caseId + '/');
     const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
-    let n = 0, failed = 0, aborted = false;
-    for (const k of State.unitsWithData()) {
-      if (tok !== dsToken) { aborted = true; break; }   // a different dataset was opened while we were writing — stop, and say so (the rest stay unsaved)
-      const ref = map.get(k);
-      if (!ref) { const [cc, uu] = k.split('/'); if (State.isDirty(cc, uu)) failed++; continue; }   // unit's folder no longer discoverable — surface it, don't silently skip
-      if (ref.u.virtual || ref.u.mismatch) continue;                                     // perfusion / shape-mismatch units are never written
-      // a unit the background scan hasn't reached yet must be seeded from disk BEFORE we serialize it,
-      // or a star-only/dirty-only entry would write an EMPTY annotation over its real file
-      let st; try { st = await ensureSeeded(ref.c, ref.u); } catch (e) { st = 'unreadable'; }
-      if (st === 'aborted') { aborted = true; break; }
-      if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
-      // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
-      if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
-      try { await writeUnit(ref.c.id, ref.u); n++; }
-      catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
+    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0;
+    saveRunning = true;
+    saveModalOpen(caseId ? 'savingCaseFmt' : 'savingAllTitle', caseId ? { id: caseId } : null);
+    $('btnSave').disabled = true; $('btnSaveCase').disabled = true; $('btnOpen').disabled = true;
+    try {
+      for (const k of keys) {
+        if (saveCancel) { cancelled = true; break; }     // between frames only: the frame being written always completes
+        if (tok !== dsToken) { aborted = true; break; }   // a different dataset was opened while we were writing — stop, and say so (the rest stay unsaved)
+        done++; saveModalStep(done, keys.length, k);
+        const ref = map.get(k);
+        if (!ref) { const [cc, uu] = k.split('/'); if (State.isDirty(cc, uu)) failed++; continue; }   // unit's folder no longer discoverable — surface it, don't silently skip
+        if (ref.u.virtual || ref.u.mismatch) continue;                                     // perfusion / shape-mismatch units are never written
+        // a unit the background scan hasn't reached yet must be seeded from disk BEFORE we serialize it,
+        // or a star-only/dirty-only entry would write an EMPTY annotation over its real file
+        let st; try { st = await ensureSeeded(ref.c, ref.u); } catch (e) { st = 'unreadable'; }
+        if (st === 'aborted') { aborted = true; break; }
+        if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
+        // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
+        if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
+        try { await writeUnit(ref.c.id, ref.u); n++; }
+        catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
+      }
+    } finally {
+      saveRunning = false;
+      $('btnOpen').disabled = openBusy || !FS.supported;   // never re-enable Open underneath a still-running openFolder
     }
     updateDirtyUI();
     // an abort is NOT a write failure: nothing was written for the remaining frames and they are still dirty
-    if (aborted) { setBanner('saveAborted', { n }, 'warn'); setSaveStatus(null); return; }
-    if (failed) setBanner('savedPartial', { n, failed }, 'warn'); else setBanner('savedAllFmt', { n }, 'ok');
+    if (aborted) { saveModalFinish(I18n.t('saveDoneAbortedFmt', { n })); setBanner('saveAborted', { n }, 'warn'); setSaveStatus(null); return; }
+    if (cancelled) { saveModalFinish(I18n.t('saveCancelledFmt', { n })); setSaveStatus(null); return; }   // frames are still unsaved — the header must not claim Saved
+    saveModalStep(keys.length, keys.length, '');
+    if (failed) { saveModalFinish(I18n.t('saveDonePartialFmt', { n, failed })); setBanner('savedPartial', { n, failed }, 'warn'); }
+    else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner('savedAllFmt', { n }, 'ok'); }
     setSavedStatus();
   }
+  function save() { return runSave(null); }
+  function saveCase() { if (cur && !cur.virtual) return runSave(cur.caseId); }
 
   // ---- debounced auto-write-to-disk (toggle in Settings; default on) ----
   function hhmm() { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); }
@@ -1777,6 +1830,7 @@
     const el = $('dirtyState'); if (!el) return;
     if (cur && State.isDirty(cur.caseId, cur.unitId)) { el.textContent = I18n.t('unsavedDot'); el.className = 'ro warn-text'; }
     else { el.textContent = cur ? I18n.t('synced') : ''; el.className = 'ro'; }
+    updateSaveButtons();   // the Save-all label carries the global unsaved count — keep it live
   }
   function scheduleAutoSave() {
     if (!$('autoSave').checked || !rootHandle || !cur) return;
@@ -1977,7 +2031,7 @@
   function onLangChange() {
     if (cur) refreshMeta();
     else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
-    updateCopyBtn(); updateDirtyUI();
+    updateCopyBtn(); updateDirtyUI();   // updateDirtyUI also re-renders the dynamic save-button labels
     buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips(); buildLayerBar(); updateScanProg();
     if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
     if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
@@ -2009,6 +2063,10 @@
     applyLoupeSize();
     $('btnOpen').onclick = openFolder;
     $('btnSave').onclick = save;
+    $('btnSaveCase').onclick = saveCase;
+    $('btnSaveCancel').onclick = () => { saveCancel = true; $('btnSaveCancel').disabled = true; };
+    $('btnSaveClose').onclick = () => $('saveModal').classList.add('hidden');
+    updateSaveButtons();
     $('btnUndo').onclick = undo;
     $('btnClear').onclick = askClear;
     $('btnAddLayer').onclick = addLayerAction;
@@ -2181,7 +2239,7 @@
     view.setMaskOpacity($('maskOpacity').value / 100);
     if (!FS.supported) {
       setBanner('errUnsupportedBrowser', null, 'warn');
-      $('btnOpen').disabled = true; $('btnSave').disabled = true;
+      $('btnOpen').disabled = true; $('btnSave').disabled = true; $('btnSaveCase').disabled = true;
     }
     view.layout(); view.render(); updateZoomReadout();
   }
