@@ -76,25 +76,41 @@
   const PERSIST_MS = 400;
   let persistTimer = 0, staleUnits = new Set(), metaStale = false;
   const stripLayer = kk => kk.replace(/#\d+$/, '');
-  // one frame's complete mirror record, or null when the frame holds nothing worth keeping.
-  // Key-EXISTENCE is preserved for selections/points/notes/markers ("cleared" is different from "absent":
-  // an empty note still rewrites note.json, hasLocal() tests bucket existence), so the maps are copied
-  // verbatim under their full (layer-suffixed) keys.
+  // One frame's mirror record, or null when the frame holds nothing worth keeping.
+  //
+  // The mirror is a CRASH COPY, not a second database: a frame whose edits are already saved has its
+  // authoritative backup in annotation.json / note.json on disk. So only DIRTY frames carry their full
+  // content here; clean frames keep just the bookkeeping that is NOT derivable from their files —
+  // visited (pure UI history), the writtenAt reload-reconcile stamp, editedAt, and the active-layer
+  // view preference. That keeps the whole mirror at a few hundred KB no matter how much of the dataset
+  // is annotated. Mirroring every clean frame's content is exactly what used to blow the quota: a fully
+  // annotated V1 needs ~20+ MB of RLE against the ~5-10 MB localStorage limit of a normal https origin
+  // — the "Browser local backup is FAILING" banner the user hit on GitHub Pages. It also made the v1→v2
+  // migration transiently DOUBLE that footprint (new records written before the old blob is deleted);
+  // with skinny clean records the migration total is small enough to fit under any quota.
+  //
+  // The dirty→clean transition self-heals: markClean marks the frame stale, so the next write replaces
+  // its fat record with the skinny one (and markDirty does the reverse). For dirty frames key-EXISTENCE
+  // is preserved for selections/points/notes/markers ("cleared" is different from "absent": an empty
+  // note still rewrites note.json), so the maps are copied verbatim under their full layer-suffixed keys.
   function unitSlice(k) {
-    const pfx = k + '#', rec = {};
-    let sm = null, pm = null, prm = null;
-    for (const kk in selections) if (kk === k || kk.startsWith(pfx)) (sm || (sm = {}))[kk] = selections[kk];
-    for (const kk in points) if (kk === k || kk.startsWith(pfx)) (pm || (pm = {}))[kk] = points[kk];
-    for (const kk in paintR) if (kk === k || kk.startsWith(pfx)) (prm || (prm = {}))[kk] = paintR[kk];
-    if (sm) rec.s = sm; if (pm) rec.p = pm; if (prm) rec.pr = prm;
+    const rec = {};
+    if (dirty[k]) {
+      const pfx = k + '#';
+      let sm = null, pm = null, prm = null;
+      for (const kk in selections) if (kk === k || kk.startsWith(pfx)) (sm || (sm = {}))[kk] = selections[kk];
+      for (const kk in points) if (kk === k || kk.startsWith(pfx)) (pm || (pm = {}))[kk] = points[kk];
+      for (const kk in paintR) if (kk === k || kk.startsWith(pfx)) (prm || (prm = {}))[kk] = paintR[kk];
+      if (sm) rec.s = sm; if (pm) rec.p = pm; if (prm) rec.pr = prm;
+      rec.d = 1;
+      if (starred[k]) rec.st = 1;
+      if (k in notes) rec.n = notes[k];
+      if (k in noteMarkers) rec.m = noteMarkers[k];
+      if (unitLayers[k]) rec.ly = unitLayers[k];
+    }
     if (visited[k]) rec.v = 1;
-    if (dirty[k]) rec.d = 1;
     if (editedAt[k]) rec.e = editedAt[k];
-    if (starred[k]) rec.st = 1;
     if (writtenAt[k]) rec.w = writtenAt[k];
-    if (k in notes) rec.n = notes[k];
-    if (k in noteMarkers) rec.m = noteMarkers[k];
-    if (unitLayers[k]) rec.ly = unitLayers[k];
     if (Number.isFinite(activeLayerByUnit[k])) rec.al = activeLayerByUnit[k];
     return Object.keys(rec).length ? rec : null;
   }
