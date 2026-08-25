@@ -2157,7 +2157,7 @@
       exitInspect();
     }
     window.addEventListener('blur', resetTransientInput);
-    document.addEventListener('visibilitychange', () => { if (document.hidden) resetTransientInput(); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) { resetTransientInput(); State.flushPersist(); } });   // hidden tabs can be killed without pagehide (mobile, OOM): sync the mirror on the way out
     // Closing / reloading the tab: flush the debounced write immediately and, if any frame is still
     // unsaved, show the browser's leave-confirmation. Staying gives the in-flight write time to land;
     // leaving anyway is still safe for the SAME browser (localStorage has every edit) — the dialog exists
@@ -2165,9 +2165,10 @@
     window.addEventListener('beforeunload', e => {
       commitActiveStroke();
       flushGeomWrite(true); flushAutoSave();
+      State.flushPersist();                      // persist() is throttled — the crash-recovery mirror must be current before the page can go away
       if (State.dirtyCount() > 0) { e.preventDefault(); e.returnValue = ''; }
     });
-    window.addEventListener('pagehide', () => { commitActiveStroke(); flushGeomWrite(true); flushAutoSave(); });   // bfcache / mobile: no dialog possible, just flush
+    window.addEventListener('pagehide', () => { commitActiveStroke(); flushGeomWrite(true); flushAutoSave(); State.flushPersist(); });   // bfcache / mobile: no dialog possible, just flush
     // A second tab on the same origin shares (and overwrites) the ONE localStorage backup blob — the
     // folder files stay safe per-frame, but crash recovery breaks. Warn once when another tab writes it.
     let multiTabWarned = false;

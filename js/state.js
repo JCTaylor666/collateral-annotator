@@ -45,12 +45,41 @@
   const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
   const segXY = v => Array.isArray(v) ? v : (v && v.xy) || [-1, -1];
   const segCls = v => (Array.isArray(v) || !v || v.cls == null) ? null : v.cls;
-  function persist() {
+  // ---- the localStorage mirror ---------------------------------------------------------------------
+  // JSON.stringify walks EVERY annotated frame in the dataset and the whole string is rewritten, so the
+  // cost is proportional to how much has been annotated, NOT to the size of the edit. Measured in a
+  // browser on a realistic payload (~4.5 KB per annotated frame): 1 ms at 50 frames, 4 ms at 200,
+  // 24 ms at 1000, ~36 ms at 1687 (V1's annotated count today) and 145 ms at 6052 (V1 fully annotated).
+  // persist() is called from all 42 mutations — every segment click, every point, every paint stroke,
+  // every keystroke in the note box, every slider tick — and localStorage.setItem is synchronous, so
+  // that whole cost sat in the interaction path and froze the UI on each one. The background scan at
+  // folder-open pays it thousands of times over.
+  //
+  // It is now THROTTLED: a mutation only marks the mirror stale, and at most one write happens per
+  // window. A throttle and not a debounce on purpose — a debounce would postpone the write for as long
+  // as a slider keeps being dragged, so the mirror could go arbitrarily stale under continuous input.
+  // flushPersist() forces the write out synchronously wherever losing up to one window of edits would
+  // matter (tab closing, tab hidden, dataset switch).
+  //
+  // The disk files are unaffected by any of this: auto-save writes annotation.json on its own 1 s timer
+  // and a stale-by-≤400 ms mirror only costs a re-write of an already-identical file after a crash,
+  // which reconcileUnitFromDisk's content-signature check already recognises as a no-op.
+  const PERSIST_MS = 400;
+  let persistTimer = 0, persistDue = false;
+  function persistNow() {
+    persistDue = false;
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = 0; }
     try { localStorage.setItem(LSKEY, JSON.stringify({ datasetId, selections, visited, points, notes, noteMarkers, dirty, editedAt, starred, writtenAt, paint: paintR, unitLayers, activeLayerByUnit, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, perfMask, coordOrder, window: win, loupe, autoSave, classColors, activeClass })); quotaWarned = false; }
     // warn on ANY persist failure (quota, blocked storage, …) — from here on the localStorage backup is
     // stale, so the user must rely on save-to-folder; the open-time mtime check guards the reload path.
     catch (e) { if (!quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); } }
   }
+  function persist() {
+    persistDue = true;
+    if (persistTimer) return;                    // a later edit inside the window must NOT push the write back
+    persistTimer = setTimeout(() => { persistTimer = 0; if (persistDue) persistNow(); }, PERSIST_MS);
+  }
+  function flushPersist() { if (persistDue) persistNow(); }
   function setPersistFailHandler(fn) { onPersistFail = fn; }
   function load() {
     try {
@@ -87,7 +116,7 @@
     const hadDirty = Object.keys(dirty).length > 0;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
     dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
-    datasetId = newId; persist();
+    datasetId = newId; persistNow();   // the datasetId guard must hit the store immediately — never leave the OLD dataset's blob live behind a pending timer
     return { switched: true, hadDirty };
   }
 
@@ -326,14 +355,19 @@
   // more than the ±2 s margin the reconcile allows. Called on every successful write, NOT only when the unit
   // ends up clean: an edit that landed mid-write leaves the unit dirty, and that is exactly the case the
   // after-reload comparison used to get wrong.
-  function noteWritten(c, u, ms) { writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now(); persist(); }
+  // noteWritten/markClean are the reload-correctness contract: they record "the disk file as of ms IS
+  // ours / IS what State holds". They fire once per completed disk write (auto-save is 1 s-debounced),
+  // never per keystroke, so they keep the SYNCHRONOUS persist the mirror had before the throttle —
+  // a crash may lose the last ≤400 ms of content edits, but never the stamp that stops a reload from
+  // mistaking our own annotation.json for an external change and reverting the doctor's local edits.
+  function noteWritten(c, u, ms) { writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now(); persistNow(); }
   // seq (optional): only clean if no new edit landed since the caller snapshotted its file content
   // ms (optional): the mtime of the file this state now matches. Returns true when the unit was cleaned.
   function markClean(c, u, seq, ms) {
     if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return false;
     delete dirty[key(c, u)];
     writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now();   // State and the file agree as of ms
-    persist();
+    persistNow();                                // see noteWritten: the write stamp must never sit in a pending timer
     return true;
   }
 
@@ -576,5 +610,5 @@
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, annotationDropped, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
-    getDatasetId, switchDataset, setPersistFailHandler };
+    getDatasetId, switchDataset, setPersistFailHandler, flushPersist };
 })(typeof window !== 'undefined' ? window : globalThis);
