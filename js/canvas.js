@@ -137,6 +137,10 @@
           const i = base + x, lab = label[i];
           if (lab && selAll.has(lab)) continue;                       // never paint on a selected segment — including one the geometry filter is hiding (4.5)
           if (!erase && onmask && maskData && !maskData[i]) continue; // add: foreground-only when onmask
+          // "foreground only" + geometry filter: a vessel the filter hides is not part of the working
+          // foreground — its pixels must not take paint while onmask is active (they still can with the
+          // constraint off, and erasing is never blocked). visibleSegs===null means the filter is off.
+          if (!erase && onmask && visibleSegs && lab && !visibleSegs.has(lab)) continue;
           const nv = erase ? 0 : cls;
           if (paint[i] === nv) continue;
           if (strokeChanges && !strokeChanges.has(i)) strokeChanges.set(i, paint[i]);
