@@ -2169,11 +2169,12 @@
       if (State.dirtyCount() > 0) { e.preventDefault(); e.returnValue = ''; }
     });
     window.addEventListener('pagehide', () => { commitActiveStroke(); flushGeomWrite(true); flushAutoSave(); State.flushPersist(); });   // bfcache / mobile: no dialog possible, just flush
-    // A second tab on the same origin shares (and overwrites) the ONE localStorage backup blob — the
-    // folder files stay safe per-frame, but crash recovery breaks. Warn once when another tab writes it.
+    // The mirror is sharded per dataset (v65), so a second tab on a DIFFERENT folder no longer clobbers
+    // this one's crash-recovery records — only a tab on the SAME dataset writes the same keys (last
+    // writer wins per frame). Warn once when that actually happens.
     let multiTabWarned = false;
     window.addEventListener('storage', ev => {
-      if (ev.key !== State.storageKey || multiTabWarned || !rootHandle) return;
+      if (!State.isMirrorKey(ev.key) || multiTabWarned || !rootHandle) return;
       multiTabWarned = true; setBanner('multiTabWarn', null, 'warn');
     });
     view.setOpacity($('opacity').value / 100);
