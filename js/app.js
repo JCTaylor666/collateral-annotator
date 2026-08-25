@@ -44,6 +44,10 @@
   // inspect (Cmd/Ctrl loupe) state — the loupe is a side panel only; annotation
   // and hover keep working normally while inspecting.
   let inspect = false, overCanvas = false;
+  // Controls that legitimately consume a space keypress. A range slider and a checkbox do not type,
+  // so Space over the canvas must still arm the pan even when one of them holds focus (ui-3).
+  const isTextEntry = t => !!t && (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable ||
+    (t.tagName === 'INPUT' && !/^(range|checkbox|radio|button|submit|reset|file|color|image)$/.test((t.type || 'text').toLowerCase())));
   let lastCX = 0, lastCY = 0, loupeRAF = false, stripSig = '';
   const tileEls = new Map();  // unit index -> { wrap, canvas, cap }
   const isInspectMod = e => e.metaKey || e.ctrlKey;
@@ -65,11 +69,23 @@
   const curUnit = () => curCase() && curCase().units[ui];
 
   let lastBanner = null;   // { key, vars, kind } | null — replayed on language switch
+  // #banner is an in-flow block between the header and .body, so showing it (or hiding it, or a message
+  // wrapping onto a second line) changes the height of .stage and therefore of #view. layout() is what
+  // sizes the canvas backing store and the dpr transform; without it the backing store keeps the OLD
+  // height while eventToImage() maps the pointer through the NEW bounding rect, so every click and hover
+  // resolves to an image row above the one under the cursor (~35 image px on a 1432² frame).
+  // Re-layout only when the height ACTUALLY changed: calling onResize() on every banner text change would
+  // re-clamp the pan and make the image visibly jump while the doctor is working.
   function setBanner(key, vars, kind) {
     const b = $('banner');
+    const txt = key ? I18n.t(key, vars) : '';
+    const cls = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
     lastBanner = key ? { key, vars, kind } : null;
-    b.textContent = key ? I18n.t(key, vars) : '';
-    b.className = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
+    if (b.textContent === txt && b.className === cls) return;   // nothing visible changes: no forced reflow, no re-layout
+    const h0 = view ? $('view').clientHeight : 0;
+    b.textContent = txt;
+    b.className = cls;
+    if (view && $('view').clientHeight !== h0) onResize();
   }
   // Per-unit warnings (shape mismatch / corrupt annotation / broken mask) describe ONE frame — they
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
@@ -2099,11 +2115,25 @@
       if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
-      // while the clear-confirm modal is open, swallow every other hotkey so navigation/undo can't
-      // silently change which frame "Continue clearing" will wipe
-      if (!$('confirmClear').classList.contains('hidden')) return;
+      // While ANY full-screen overlay is up, swallow every other hotkey. #confirmClear was already
+      // handled; dataformat.js's #dfModal was not, so arrows loaded another frame, digits changed the
+      // active class, C/B/P switched the annotation tool and Ctrl+Z popped an undo entry - all invisible
+      // behind the overlay, and the next canvas click then painted with a tool the doctor never chose.
+      // Matching on .modal-overlay rather than on ids also covers overlays added later.
+      if (document.querySelector('.modal-overlay:not(.hidden)')) return;
       if (isInspectMod(e) && !e.repeat && overCanvas && cur && !inspect) { enterInspect(); return; }
-      if (e.key === ' ' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'SELECT') { spaceHeld = true; if (State.getTool() === 'brush') e.preventDefault(); }
+      // Space is the documented pan modifier and belongs to the viewport, not to whatever control the
+      // mouse last clicked. The canvas is not focusable, so focus stays on the last slider/checkbox and
+      // the old "any INPUT" test dropped Space entirely: holding it and dragging PAINTED a real stroke
+      // (auto-saved to disk) instead of panning. Only text entry may keep Space for itself.
+      if (e.key === ' ' && !isTextEntry(e.target)) {
+        spaceHeld = true;
+        // Swallow it only while the pointer is over the canvas - there the doctor means to pan, and
+        // letting it through would scroll the page, toggle a focused checkbox, or re-fire a focused
+        // BUTTON on keyup (#btnUndo undoing a second time, #btnOpen re-opening the folder picker).
+        // Away from the canvas Space keeps activating controls, so keyboard use is unchanged.
+        if (overCanvas) e.preventDefault();
+      }
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA') return;   // don't hijack typing (notes, class names)
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
