@@ -9,9 +9,25 @@
   let view = null, cur = null, hovRAF = false;
   const cache = new Map();
   const perfCache = new Map();                 // caseId -> { fields, rendered, radius } | 'failed' (arrival-time fields cached once; coloured on demand at the current smoothness)
+  // Decision 4.3-A: the cache is BOUNDED now (it kept every visited case's fields forever — ~27 MB per
+  // case, ~8.7 GB across a fully browsed V1). Map insertion order is the recency order: reads re-insert,
+  // and after every store the oldest entries beyond the cap are dropped (never the case on screen —
+  // evicting the map the doctor is looking at would force a 1-3 s recompute on their next slider move).
+  const PERF_CACHE_MAX = 4;
+  function perfTouch(id) { const v = perfCache.get(id); if (v !== undefined) { perfCache.delete(id); perfCache.set(id, v); } return v; }
+  function perfPut(id, v) {
+    perfCache.delete(id); perfCache.set(id, v);
+    const keep = curCase() && curCase().id;
+    for (const k of perfCache.keys()) {
+      if (perfCache.size <= PERF_CACHE_MAX) break;
+      if (k === id || k === keep) continue;
+      perfCache.delete(k);
+    }
+  }
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
+  let classesIndexBad = false, classesBadCount = 0;   // 4.7: parseable but with index<1 entries (dropped; same no-auto-rewrite protection, its own banner)
   let lastScanConflicts = 0;                  // # frames the last open found conflicted (newer differing file on disk)
   // Decision 4.2: frames whose file on disk is NEWER than this session's dirty copy AND differs in content.
   // Nothing is auto-resolved any more: the frame keeps BOTH versions (local in State, disk untouched),
@@ -158,7 +174,14 @@
       // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
       for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
       rootHandle = newRoot; cases = found;
-      classes = cls.list; classesFileCorrupt = !cls.ok; classesBackedUp = false; classesOverwriteOK = false;
+      // Decision 4.7-B: class indices must be >= 1. Index 0 is the paint layer's "unpainted" value, so a
+      // class 0 brush is a silent no-op on empty pixels and a silent ERASER over existing paint. Offending
+      // entries are dropped with a banner, and the file is treated like a corrupt one: nothing rewrites it
+      // automatically — fixing it is the user's (pipeline's) call.
+      const badIdx = cls.list.filter(x => !(Number.isFinite(x.index) && x.index >= 1));
+      classes = cls.list.filter(x => Number.isFinite(x.index) && x.index >= 1);
+      classesFileCorrupt = !cls.ok || badIdx.length > 0; classesBackedUp = false; classesOverwriteOK = false;
+      classesIndexBad = cls.ok && badIdx.length > 0; classesBadCount = badIdx.length;   // parseable but with index<1 entries: same protection, its own (accurate) banner
       dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
       openGen++;                                // bumped WITH rootHandle, never before it: the old dataset's scan/prefetch/late reconciles go inert, and a cancelled Open now aborts nothing
       committed = true;
@@ -198,7 +221,8 @@
     const okUnit = await showUnit(0, 0);        // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
     // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
     if (okUnit) {
-      if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+      if (classesIndexBad) setBanner('classesIndexZero', { n: classesBadCount }, 'warn');
+      else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
       else if (act.sw && act.sw.switched && act.sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
     }
     startBackgroundScan();                      // badges / copy-sources / class auto-add fill in behind the first frame
@@ -379,7 +403,7 @@
   const perfInflight = new Map();   // caseId -> Promise (so concurrent callers share one computation)
   // rendered perfusion map at the CURRENT smoothness (lazy re-colour when the slider moved). null if not ready/failed.
   function perfView(c) {
-    const e = perfCache.get(c && c.id);
+    const e = perfTouch(c && c.id);
     if (!e || e === 'failed' || !e.fields) return null;
     const maskOn = State.getPerfMask();
     const m = (maskOn && e.minipMask && e.minipMask.mask && e.minipMask.W === e.fields.W && e.minipMask.H === e.fields.H) ? e.minipMask.mask : null;
@@ -390,7 +414,7 @@
   }
   // lazily read the CASE's minip mask.npy (light: no PNG decode) for the perfusion filter; repaint on arrival
   function ensureMinipMask(c) {
-    const e = perfCache.get(c && c.id);
+    const e = perfTouch(c && c.id);
     if (!c || !e || e === 'failed' || e.minipMask !== undefined) return;   // undefined = never tried
     const minip = c.units.find(un => un.kind === 'minip');
     if (!minip) { e.minipMask = null; maybeWarnPerfMask(c); return; }
@@ -398,7 +422,7 @@
     const gen = openGen;
     Loader.loadMask(minip).then(m => {
       if (gen !== openGen) return;
-      const e2 = perfCache.get(c.id); if (!e2 || e2 === 'failed') return;
+      const e2 = perfTouch(c.id); if (!e2 || e2 === 'failed') return;
       e2.minipMask = m;                                        // null = absent/unreadable
       if (cur && cur.virtual && cur.caseId === c.id) { const pv = perfView(c); if (pv) paintPerfIntoView(pv); maybeWarnPerfMask(c); }
       if (inspect) { stripSig = ''; scheduleLoupe(); }
@@ -408,14 +432,14 @@
     if (!cur || !cur.virtual || !c || cur.caseId !== c.id || !State.getPerfMask()) return;
     // a cosmetic per-unit hint must never replace a data-safety banner (failed write / backed-up edits / quota)
     if (lastBanner && ['writeFailedBanner', 'unsavedBackedUp', 'errQuotaFull', 'multiTabWarn', 'savedPartial'].indexOf(lastBanner.key) >= 0) return;
-    const e = perfCache.get(c.id);
+    const e = perfTouch(c.id);
     const m = e && e !== 'failed' && e.minipMask;
     const usable = m && m.mask && e.fields && m.W === e.fields.W && m.H === e.fields.H;
     if (m !== undefined && m !== 'pending' && !usable) setBanner('perfMaskUnavailable', null, 'warn');
   }
   function ensureCasePerfusion(c) {
     if (!c) return Promise.resolve(null);
-    const got = perfCache.get(c.id);
+    const got = perfTouch(c.id);
     if (got === 'failed') return Promise.resolve(null);
     if (got && got.fields) return Promise.resolve(perfView(c));   // cached fields -> colour at current smoothness
     if (perfInflight.has(c.id)) return perfInflight.get(c.id);
@@ -423,28 +447,28 @@
     const p = (async () => {
       try {
         const frames = c.units.filter(u => u.kind === 'frame');
-        if (frames.length < 2) { perfCache.set(c.id, 'failed'); return null; }
+        if (frames.length < 2) { perfPut(c.id, 'failed'); return null; }
         const grays = []; let W = 0, H = 0;
         for (const u of frames) {
           const g = await Loader.loadGray(u);
           if (!W) { W = g.W; H = g.H; }
-          if (g.W !== W || g.H !== H) { perfCache.set(c.id, 'failed'); return null; }   // frames must share dimensions
+          if (g.W !== W || g.H !== H) { perfPut(c.id, 'failed'); return null; }   // frames must share dimensions
           grays.push(g.gray);
         }
         const fields = window.Perfusion.analyze(grays, W, H);
         if (pGen !== openGen) return null;                    // dataset switched while computing — a reused case id must not show the OLD dataset's map
-        if (!fields) { perfCache.set(c.id, 'failed'); return null; }
-        perfCache.set(c.id, { fields, rendered: null, renderedKey: '' });
+        if (!fields) { perfPut(c.id, 'failed'); return null; }
+        perfPut(c.id, { fields, rendered: null, renderedKey: '' });
         const view = perfView(c);   // colour at the current smoothness
         if (inspect) scheduleLoupe();   // a pinned perfusion tile can now render
         return view;
-      } catch (e) { perfCache.set(c.id, 'failed'); return null; }
+      } catch (e) { perfPut(c.id, 'failed'); return null; }
       finally { perfInflight.delete(c.id); }
     })();
     perfInflight.set(c.id, p);
     return p;
   }
-  const perfState = c => { const v = perfCache.get(c && c.id); return v === 'failed' ? 'error' : (v && v.fields) ? 'ok' : 'loading'; };
+  const perfState = c => { const v = perfTouch(c && c.id); return v === 'failed' ? 'error' : (v && v.fields) ? 'ok' : 'loading'; };
 
   // commit an in-progress stroke (pixel-paint OR brush-select) to the CURRENT unit before we navigate
   // away, so its pixels/selection/undo can never be misattributed to (or lost by) the unit we switch to.
@@ -532,7 +556,11 @@
     ci = nci; ui = nui;
     const c = curCase(), u = curUnit();
     clearUnitBanner();        // drop any stale per-unit warning from the frame we're leaving
-    ensureCasePerfusion(c);   // kick off (cached) perfusion compute on entering a case, so it's ready to view / pin
+    // Decision 4.3-A: perfusion is LAZY now. Entering a case no longer decodes every frame for a map
+    // that may never be looked at (~18 full-frame decodes and ~27 MB per case; ~8.7 GB across V1).
+    // It is computed on the three paths that actually SHOW it: opening the perfusion row, opening the
+    // inspect loupe (whose pinned tile displays it), and exporting the PNG. First view waits 1-3 s
+    // behind the existing nav-busy indicator; after that the (bounded) cache answers.
     if (u.virtual) return await showPerfusionUnit(c, u, gen, prevCi, prevUi);
     let data;
     navBusy = true; setNavBusy(true);
@@ -976,7 +1004,7 @@
     const used = new Set([...diskUsed, ...State.usedClasses()]);   // disk truth + live memory AT THE TAIL — no stale start-snapshot (deleteClass mid-scan must stay deleted)
     const have = new Set(classes.map(cl => cl.index));
     let added = 0;
-    for (const idx of [...used].sort((a, b) => a - b)) if (!have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }
+    for (const idx of [...used].sort((a, b) => a - b)) if (idx >= 1 && !have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }   // 4.7: never auto-add class 0 — it is the paint layer's \"unpainted\" value
     if (added && scanRoot === rootHandle) {
       classes.sort((a, b) => a.index - b.index);
       ensureActiveClass(); buildClassMgr(); buildClassPicker();
@@ -1264,7 +1292,7 @@
       ensureMinipMask(c);
       const t0 = Date.now();
       while (Date.now() - t0 < 4000) {
-        const e = perfCache.get(c.id);
+        const e = perfTouch(c.id);
         if (!e || e === 'failed' || (e.minipMask !== undefined && e.minipMask !== 'pending')) break;
         await new Promise(r => setTimeout(r, 60));
       }

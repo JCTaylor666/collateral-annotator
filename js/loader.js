@@ -76,7 +76,11 @@
     // If any disagree, don't hard-fail the whole frame — return a placeholder descriptor so the UI can
     // show a grey panel listing the three shapes for diagnosis (view-only, never annotated or saved).
     const imgOk = (imgW === W && imgH === H);
-    const maskOk = !maskPresent || mask !== null;             // absent, or present AND exactly matching
+    // Decision 4.6-A: an UNREADABLE mask.npy (corrupt / truncated / not 2-D) no longer turns the whole
+    // frame into a read-only placeholder — the frame loads normally with mask=null (overlay and the
+    // brush's foreground-only limit are simply off) and maskBad makes app.js say why. Only a PARSEABLE
+    // mask with the WRONG SHAPE still fails the shape contract below (image/label/mask must agree).
+    const maskOk = !maskPresent || mask !== null || maskUnreadable;
     if (!imgOk || !maskOk) {
       return {                                                 // (blob URL already revoked on decode)
         shapeMismatch: true,
@@ -91,7 +95,7 @@
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
-    return { W, H, img, label: parsed.data, mask, maskBad: false, annotation: a.annotation, annCorrupt: a.corrupt,
+    return { W, H, img, label: parsed.data, mask, maskBad: maskUnreadable, annotation: a.annotation, annCorrupt: a.corrupt,
              annDropped: a.dropped || 0, annUnreadable: !!(a.unreadable || n.unreadable), annMtime: a.mtime || 0, note: n.note, geometry };
   }
 
