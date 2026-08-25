@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vessel Annotator</title>
-<link rel="stylesheet" href="./css/style.css?v=67">
+<link rel="stylesheet" href="./css/style.css?v=68">
 <!-- GoatCounter privacy-friendly page-visit analytics (no cookies; counts page loads of this site only, never touches the user's local data files) -->
 <script data-goatcounter="https://jctaylor666.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
@@ -209,6 +209,27 @@
   <canvas id="loupeCurve" class="loupe-curve"></canvas>
 </div>
 
+<div id="conflictModal" class="modal-overlay hidden">
+  <div class="modal conflict-modal">
+    <p class="modal-title" id="conflictTitle">Two versions of this frame</p>
+    <div class="conflict-cols">
+      <div class="conflict-col">
+        <div class="conflict-head" data-i18n="conflictDiskHead">In the folder</div>
+        <canvas id="conflictThumbDisk" class="conflict-thumb"></canvas>
+        <div id="conflictSumDisk" class="conflict-sum"></div>
+        <button id="btnConflictDisk" class="btn" data-i18n="conflictUseDisk">Keep folder version</button>
+      </div>
+      <div class="conflict-col">
+        <div class="conflict-head" data-i18n="conflictSessionHead">This session</div>
+        <canvas id="conflictThumbLocal" class="conflict-thumb"></canvas>
+        <div id="conflictSumLocal" class="conflict-sum"></div>
+        <button id="btnConflictLocal" class="btn" data-i18n="conflictUseLocal">Keep session version</button>
+      </div>
+    </div>
+    <div class="modal-actions"><button id="btnConflictLater" class="btn btn-cancel" data-i18n="conflictLater">Decide later</button></div>
+  </div>
+</div>
+
 <div id="saveModal" class="modal-overlay hidden">
   <div class="modal">
     <p class="modal-title" id="saveModalTitle">Saving…</p>
@@ -231,16 +252,16 @@
   </div>
 </div>
 
-<script src="./js/i18n.js?v=67"></script>
-<script src="./js/npy.js?v=67"></script>
-<script src="./js/fs.js?v=67"></script>
-<script src="./js/loader.js?v=67"></script>
-<script src="./js/canvas.js?v=67"></script>
-<script src="./js/state.js?v=67"></script>
-<script src="./js/loupe.js?v=67"></script>
-<script src="./js/perfusion.js?v=67"></script>
-<script src="./js/dataformat.js?v=67"></script>
-<script src="./js/app.js?v=67"></script>
-<script src="./js/raillayout.js?v=67"></script>
+<script src="./js/i18n.js?v=68"></script>
+<script src="./js/npy.js?v=68"></script>
+<script src="./js/fs.js?v=68"></script>
+<script src="./js/loader.js?v=68"></script>
+<script src="./js/canvas.js?v=68"></script>
+<script src="./js/state.js?v=68"></script>
+<script src="./js/loupe.js?v=68"></script>
+<script src="./js/perfusion.js?v=68"></script>
+<script src="./js/dataformat.js?v=68"></script>
+<script src="./js/app.js?v=68"></script>
+<script src="./js/raillayout.js?v=68"></script>
 </body>
 </html>

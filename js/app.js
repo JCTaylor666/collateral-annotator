@@ -12,7 +12,13 @@
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
-  let lastScanStaleBackups = 0;               // # frames whose unsaved local edits were sidecar-backed-up during the last open (disk was newer)
+  let lastScanConflicts = 0;                  // # frames the last open found conflicted (newer differing file on disk)
+  // Decision 4.2: frames whose file on disk is NEWER than this session's dirty copy AND differs in content.
+  // Nothing is auto-resolved any more: the frame keeps BOTH versions (local in State, disk untouched),
+  // every write path refuses to touch its annotation.json, and OPENING the frame shows a two-thumbnail
+  // chooser. value = { ann, note, annMtime } parsed at detection, or null when detected by the write path
+  // (the dialog re-reads lazily).
+  const conflictedUnits = new Map();          // State.key() -> {ann, note, annMtime} | null
   let openGen = 0;                            // bumped per COMMITTED openFolder: stale async work (background scan / prefetch / late reads) must never touch the new dataset
   let dsToken = {};                           // identity of the dataset currently open. Replaced ONLY at the commit point in openFolderTxn(), so a cancelled/failed/empty Open aborts nothing that is already running.
   let openBusy = false;                       // an Open is between the picker and its commit: navigation must not resurrect the dataset being replaced, and a second Open must not interleave with this one
@@ -160,7 +166,7 @@
       perfCache.clear(); perfInflight.clear();
       corruptUnits.clear(); corruptBackedUp.clear();
       sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
-      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear();
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear();
       retryQ.clear(); if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }   // pending retries belong to the dataset we just closed (State for it is wiped below): they can never be written
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
@@ -274,11 +280,9 @@
   // local (dirty) copy is kept. Returns exactly one of:
   //   'clean'            State was not dirty and now mirrors the file
   //   'kept-dirty'       the local copy wins (it is newer, or a save of this unit is in flight)
-  //   'stale-clean' /    the local copy was provably superseded by the file and was replaced; '-backed-up'
-  //   'stale-backed-up'  means differing local content was stashed to the sidecar backups first
-  //   'stale-empty-     the local copy was empty (a Clear / un-star / the last mark removed) and the file was
-  //    reverted'         put back: there is nothing to stash in a sidecar, so the doctor must be TOLD instead
-  //   'raced'            the unit changed under us while we were writing sidecars — nothing was replaced
+  //   'stale-clean'      the file is newer but its CONTENT equals the local copy — adopted silently
+  //   'conflict'         the file is newer AND differs: recorded in conflictedUnits, NOTHING auto-resolved —
+  //                      writers refuse the unit and opening the frame shows the two-version chooser (4.2)
   //   'aborted'          a DIFFERENT dataset was opened meanwhile — State is foreign now, nothing was touched
   // Only 'clean' / 'stale-*' / 'kept-dirty' mean "State is authoritative for this unit"; 'aborted' does not.
   async function reconcileUnitFromDisk(c, u, ann, note, annMtime) {
@@ -293,30 +297,27 @@
     if (annMtime <= ownWriteMs(c.id, u.id, k) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale (persisted, so this still holds after a reload)
     if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
     // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
-    // cloud re-sync), so never destroy silently: stash differing local content (ANNOTATION and NOTE —
-    // notes/markers are unsaved content too) to sidecars first. A failed backup keeps the local copy.
-    let backedUp = false, emptyReverted = false;
+    // cloud re-sync), so compare CONTENT first: an identical file is adopted silently — no dialog noise
+    // for a Drive re-sync that only touched the timestamp.
+    let same = true;
     try {
       const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
       const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
-      const annDiffers = annContentSig(localAnn) !== annContentSig(ann);
-      if (State.unitHasContent(c.id, u.id) && annDiffers) {
-        await FS.writeText(u.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2));
-        backedUp = true;
-      } else if (annDiffers) emptyReverted = true;   // nothing to stash — the local copy IS the deletion. Undoing it silently is the one revert the doctor can never notice.
-      const localNote = State.buildNote(c.id, u.id);
-      if (State.hasNoteData(c.id, u.id) && noteContentSig(localNote) !== noteContentSig(note)) {
-        await FS.writeText(u.handle, 'note.unsaved-backup.json', JSON.stringify(localNote, null, 2));
-        backedUp = true;
-      }
-    } catch (e) { return 'kept-dirty'; }   // sidecar write FAILED — never proceed to a discard we couldn't back up
-    // the backup writes yielded: bail if the world moved on (dataset switched, user edited, a save cleaned it)
-    if (tok !== dsToken) return 'aborted';                    // a different dataset is open now: this State is foreign, never import into it
-    if (!State.isDirty(c.id, u.id) || State.getEditedAt(c.id, u.id) !== ea || writingUnits.has(k)) return 'raced';
-    State.resetUnit(c.id, u.id);
-    try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
-    State.markClean(c.id, u.id, undefined, annMtime);   // State mirrors the file as of annMtime
-    return backedUp ? 'stale-backed-up' : (emptyReverted ? 'stale-empty-reverted' : 'stale-clean');
+      if (annContentSig(localAnn) !== annContentSig(ann)) same = false;
+      if (State.hasNoteData(c.id, u.id) && noteContentSig(State.buildNote(c.id, u.id)) !== noteContentSig(note)) same = false;
+    } catch (e) { return 'kept-dirty'; }
+    if (same) {
+      State.resetUnit(c.id, u.id);
+      try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
+      State.markClean(c.id, u.id, undefined, annMtime);   // State mirrors the file as of annMtime
+      return 'stale-clean';
+    }
+    // Decision 4.2: genuinely different versions are NEVER auto-resolved. Both survive — local stays in
+    // State (and in the dirty-frame mirror), the file stays untouched on disk, every writer refuses this
+    // unit — and opening the frame shows the two-version chooser. Backups are written at RESOLUTION time,
+    // for whichever side the doctor does not keep.
+    conflictedUnits.set(k, { ann, note, annMtime });
+    return 'conflict';
   }
   // Seed a unit's State from disk if this session never did (star-click / Save reaching a frame the
   // background scan hasn't touched yet, on a browser with no localStorage for this dataset — building
@@ -341,9 +342,7 @@
     if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
     const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
     if (rec === 'aborted') return 'aborted';
-    if (rec === 'stale-backed-up') setBanner('unsavedBackedUp', { n: 1 }, 'warn');   // never sidecar-and-revert silently
-    else if (rec === 'stale-empty-reverted') setBanner('localEmptyReverted', { n: 1 }, 'warn');
-    else if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
+    if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
     lastSeenMtime.set(k, r.mtime || 0);
     sessionLoaded.add(k);
     return 'seeded';
@@ -368,8 +367,6 @@
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
       const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
-      data.staleBackedUp = rec === 'stale-backed-up';
-      data.staleEmptyReverted = rec === 'stale-empty-reverted';
     }
     lastSeenMtime.set(k, m);
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
@@ -562,8 +559,7 @@
     refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
-    if (data.staleBackedUp) { setBanner('unsavedBackedUp', { n: 1 }, 'warn'); data.staleBackedUp = false; }   // one-shot: the backup happened once — a cached flag must not re-alarm on every revisit
-    else if (data.staleEmptyReverted) { setBanner('localEmptyReverted', { n: 1 }, 'warn'); data.staleEmptyReverted = false; }   // one-shot, same reason
+    if (conflictedUnits.has(State.key(c.id, u.id))) showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
     else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.annDropped) setBanner('annLayersDropped', { id: u.id, n: data.annDropped }, 'warn');   // parts of the file cannot be represented by this build
@@ -941,10 +937,10 @@
     const gen = openGen, scanRoot = rootHandle;   // saveClasses at the tail must never target a folder opened later
     const units = [];
     for (const c of cases) for (const u of c.units) if (!u.virtual) units.push({ c, u });
-    scanTotal = units.length; scanDone = 0; lastScanStaleBackups = 0;
+    scanTotal = units.length; scanDone = 0; lastScanConflicts = 0;
     updateScanProg();
     const diskUsed = new Set();          // classes seen in FILES this scan (authoritative even if the user deletes a class mid-scan)
-    let next = 0, stale = 0, reverted = 0;
+    let next = 0, conflicts = 0;   // conflicted frames found by the scan (the chooser appears when each is opened)
     const worker = async () => {
       while (next < units.length) {
         if (gen !== openGen) return;
@@ -963,8 +959,7 @@
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
           if (gen !== openGen) return;
-          if (rec === 'stale-backed-up') stale++;
-          else if (rec === 'stale-empty-reverted') reverted++;
+          if (rec === 'conflict') conflicts++;
           lastSeenMtime.set(uk, annMtime);
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
@@ -977,7 +972,7 @@
     await Promise.all(Array.from({ length: Math.min(8, Math.max(1, units.length)) }, worker));
     if (gen !== openGen) return;
     scanDone = scanTotal; updateScanProg();
-    lastScanStaleBackups = stale;
+    lastScanConflicts = conflicts;
     const used = new Set([...diskUsed, ...State.usedClasses()]);   // disk truth + live memory AT THE TAIL — no stale start-snapshot (deleteClass mid-scan must stay deleted)
     const have = new Set(classes.map(cl => cl.index));
     let added = 0;
@@ -991,8 +986,9 @@
     // Star glyphs and the case dropdown's ★ suffix are produced ONLY by these two builders — the old tail
     // called highlightNav(), which updates .active/.done/the annotated dot but never a star.
     if (cases.length && curCase()) { buildCaseOptions(); buildFrameList(); } else highlightNav();
-    if (stale) setBanner('unsavedBackedUp', { n: stale }, 'warn');
-    else if (reverted) setBanner('localEmptyReverted', { n: reverted }, 'warn');
+    // conflicts are never auto-resolved (4.2): a quiet count now, the actual chooser only when a
+    // conflicted frame is OPENED — no upfront dialog storm.
+    if (conflicts) setBanner('conflictScanFmt', { n: conflicts }, 'warn');
     // A reload (or a crash) leaves units marked unsaved that nothing would ever write again: auto-save only
     // ever queues the frame on screen. Every unit is seeded by now, so this costs NO extra reads — it skips
     // everything that is already clean.
@@ -1739,6 +1735,149 @@
     if (dragMoved) suppressClick = true;                    // swallow the click that follows a real drag
   }
 
+  // ---- decision 4.2: the two-version conflict chooser ----------------------------------------------
+  // Everything here renders or resolves; DETECTION lives in reconcileUnitFromDisk (open path) and
+  // writeUnitInner (write path). The dialog appears only for the frame on screen.
+  let conflictShownFor = null;   // key currently in the dialog (guards double-open + wires the buttons)
+  function marksFromAnn(ann) {   // one annotation.json (v5 flat or v6 layers) -> flat overlay marks
+    const out = { segs: new Set(), pts: [], paintRles: [], starred: false, note: '' };
+    if (!ann || typeof ann !== 'object') return out;
+    const order = ann.coord_order === 'yx' ? 'yx' : 'xy';
+    const conv = a => order === 'xy' ? [a[0], a[1]] : [a[1], a[0]];
+    const one = o => {
+      if (Array.isArray(o.collaterals)) for (const it of o.collaterals) { const id = Number(it && it.id); if (Number.isFinite(id)) out.segs.add(id); }
+      if (Array.isArray(o.points)) for (const it of o.points) { const c2 = Array.isArray(it) ? it : (it && it.click); if (Array.isArray(c2) && c2.length === 2) out.pts.push(conv(c2)); }
+      if (o.paint && o.paint.classes) out.paintRles.push(o.paint);
+    };
+    if (Array.isArray(ann.layers) && ann.layers.length) { for (const ly of ann.layers) if (ly && typeof ly === 'object') one(ly); }
+    else one(ann);
+    out.starred = ann.starred === true;
+    return out;
+  }
+  function marksFromLocal(c, u) {   // union of every layer in State
+    const out = { segs: new Set(), pts: [], paintRles: [], starred: State.isStarred(c, u), note: State.getNote(c, u) };
+    for (const ly of State.getLayers(c, u)) {
+      const d = State.readLayer(c, u, ly.id);
+      d.segs.forEach(x => out.segs.add(x.seg));
+      d.points.forEach(pt => out.pts.push([pt.xy[0], pt.xy[1]]));
+      if (d.paint && d.paint.classes) out.paintRles.push(d.paint);
+    }
+    return out;
+  }
+  function paintPx(rles, W, H) {   // total painted pixels across layers (for the summary line)
+    let mask = null;
+    for (const r of rles) { const d = State.decodeRLE(r, W, H); if (!mask) mask = new Uint8Array(W * H); for (let i = 0; i < d.length; i++) if (d[i]) mask[i] = 1; }
+    if (!mask) return { n: 0, mask: null };
+    let n = 0; for (let i = 0; i < mask.length; i++) n += mask[i];
+    return { n, mask };
+  }
+  // grayscale frame + green segment tint + orange paint tint + red point dots, scaled into `cnv`.
+  // Best-effort: in an environment without 2D canvas the dialog still works from the text summaries.
+  function renderConflictThumb(cnv, data, marks, paintMask) {
+    try {
+      const W = data.W, H = data.H;
+      const off = document.createElement('canvas'); off.width = W; off.height = H;
+      const g = off.getContext('2d');
+      if (data.img && typeof ImageData !== 'undefined' && data.img instanceof ImageData) g.putImageData(data.img, 0, 0);
+      else if (data.img) g.drawImage(data.img, 0, 0);
+      const id2 = g.getImageData(0, 0, W, H), px = id2.data, lab = data.label;
+      for (let i = 0; i < W * H; i++) {
+        const p4 = i * 4;
+        if (lab && marks.segs.has(lab[i])) { px[p4] = px[p4] * 0.3; px[p4 + 1] = Math.min(255, px[p4 + 1] * 0.4 + 150); px[p4 + 2] = px[p4 + 2] * 0.3; }
+        else if (paintMask && paintMask[i]) { px[p4] = Math.min(255, px[p4] * 0.4 + 150); px[p4 + 1] = Math.min(255, px[p4 + 1] * 0.4 + 90); px[p4 + 2] = px[p4 + 2] * 0.3; }
+      }
+      g.putImageData(id2, 0, 0);
+      g.fillStyle = '#e11d48';
+      const r0 = Math.max(2, Math.round(W / 70));
+      for (const [x, y] of marks.pts) { g.beginPath(); g.arc(x, y, r0, 0, 6.3); g.fill(); }
+      const sc = Math.min(230 / W, 230 / H, 1);
+      cnv.width = Math.max(1, Math.round(W * sc)); cnv.height = Math.max(1, Math.round(H * sc));
+      cnv.getContext('2d').drawImage(off, 0, 0, cnv.width, cnv.height);
+    } catch (e) { /* no canvas (tests) or decode hiccup: summaries still tell the story */ }
+  }
+  function conflictSummary(marks, px, whenMs) {
+    let t = I18n.t('conflictSumFmt', { segs: marks.segs.size, pts: marks.pts.length, px });
+    if (marks.starred) t += ' · ★';
+    if (marks.note) t += ' · 「' + (marks.note.length > 14 ? marks.note.slice(0, 14) + '…' : marks.note) + '」';
+    if (whenMs) { const d = new Date(whenMs); t += '\n' + I18n.t('conflictModFmt', { t: ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) }); }
+    return t;
+  }
+  async function showConflictDialog(k) {
+    if (conflictShownFor === k && !$('conflictModal').classList.contains('hidden')) return;
+    if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;   // only for the frame on screen
+    const c = cur.caseId, unit = cur.unit;
+    let rec = conflictedUnits.get(k);
+    if (!rec) {                                        // detected by the write path: parse the disk copy now
+      try { const r = await Loader.loadAnnotation(unit); rec = { ann: r.annotation, note: r.note, annMtime: r.mtime || 0 }; conflictedUnits.set(k, rec); }
+      catch (e) { return; }
+      if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;
+    }
+    const data = cacheTouch(k); if (!data) return;
+    const dm = marksFromAnn(rec.ann), lm = marksFromLocal(c, cur.unitId);
+    if (rec.note && typeof rec.note.text === 'string') dm.note = rec.note.text;
+    const dp = paintPx(dm.paintRles, data.W, data.H), lp = paintPx(lm.paintRles, data.W, data.H);
+    $('conflictTitle').textContent = I18n.t('conflictTitleFmt', { id: cur.unitId });
+    renderConflictThumb($('conflictThumbDisk'), data, dm, dp.mask);
+    renderConflictThumb($('conflictThumbLocal'), data, lm, lp.mask);
+    $('conflictSumDisk').textContent = conflictSummary(dm, dp.n, rec.annMtime);
+    $('conflictSumLocal').textContent = conflictSummary(lm, lp.n, State.getEditedAt(c, cur.unitId));
+    conflictShownFor = k;
+    $('conflictModal').classList.remove('hidden');
+  }
+  function hideConflictDialog() { $('conflictModal').classList.add('hidden'); conflictShownFor = null; }
+  // choice: 'disk' keeps the folder file (session copy sidecar-backed-up first);
+  //         'local' keeps the session copy (folder file backed up, then written over).
+  async function resolveConflict(k, choice) {
+    const rec = conflictedUnits.get(k);
+    const [cc, uu] = [k.slice(0, k.lastIndexOf('/')), k.slice(k.lastIndexOf('/') + 1)];
+    const cRef = cases.find(x => x.id === cc), unit = cRef && cRef.units.find(x => x.id === uu);
+    if (!unit) return;
+    const tok = dsToken;
+    let r = rec;
+    if (!r || !r.ann) { try { const rr = await Loader.loadAnnotation(unit); r = { ann: rr.annotation, note: rr.note, annMtime: rr.mtime || 0 }; } catch (e) { r = { ann: null, note: null, annMtime: 0 }; } }
+    if (tok !== dsToken) return;
+    if (choice === 'disk') {
+      let backedUp = false;
+      try {
+        const sz = (r.ann && Array.isArray(r.ann.image_size) && r.ann.image_size.length === 2) ? r.ann.image_size : [0, 0];
+        const localAnn = State.buildAnnotation(cc, uu, sz[0], sz[1]);
+        if (State.unitHasContent(cc, uu) && annContentSig(localAnn) !== annContentSig(r.ann)) {
+          await FS.writeText(unit.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2)); backedUp = true;
+        }
+        if (State.hasNoteData(cc, uu) && noteContentSig(State.buildNote(cc, uu)) !== noteContentSig(r.note)) {
+          await FS.writeText(unit.handle, 'note.unsaved-backup.json', JSON.stringify(State.buildNote(cc, uu), null, 2)); backedUp = true;
+        }
+      } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
+      if (tok !== dsToken) return;
+      State.resetUnit(cc, uu);
+      try { if (r.ann) State.importAnnotation(cc, uu, r.ann); if (r.note) State.importNoteJson(cc, uu, r.note); } catch (e) { }
+      State.markClean(cc, uu, undefined, r.annMtime);
+      lastSeenMtime.set(k, r.annMtime || 0);
+      conflictedUnits.delete(k);
+      hideConflictDialog();
+      if (cur && cur.caseId === cc && cur.unitId === uu) {                 // repaint the frame with the adopted version
+        view.setPaint(State.paintDense(cc, uu, cur.W, cur.H));
+        refreshCanvasSelection(); refreshMeta(); refreshMarkers(); buildLayerBar();
+        $('note').value = State.getNote(cc, uu);
+      }
+      highlightNav(); updateDirtyUI();
+      setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', null, 'ok');
+    } else {
+      try {
+        if (r.ann) await FS.writeText(unit.handle, 'annotation.external-backup.json', JSON.stringify(r.ann, null, 2));
+        if (r.note) await FS.writeText(unit.handle, 'note.external-backup.json', JSON.stringify(r.note, null, 2));
+      } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+      if (tok !== dsToken) return;
+      conflictedUnits.delete(k);
+      lastSeenMtime.set(k, (await annFileMtime(unit)) || 0);   // the file as it stands is KNOWN to us now — our write may proceed over it
+      hideConflictDialog();
+      try { await writeUnit(cc, unit); } catch (e) { }         // failures land in the retry queue like any write
+      highlightNav(); updateDirtyUI();
+      setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', null, 'ok');
+      if (!retryQ.size) setSavedStatus();
+    }
+  }
+
   // ---- explicit save: two scopes sharing one engine ------------------------------------------------
   // "Save case" writes the case being annotated now; "Save all" is the end-of-day full write. Both run
   // through runSave(), which shows a progress modal (total is known up front, so the doctor can see how
@@ -1786,7 +1925,7 @@
     // scope filter: a case id is a folder name, it can never contain '/', so prefix+'/' is exact
     const keys = State.unitsWithData().filter(k => !caseId || k.slice(0, caseId.length + 1) === caseId + '/');
     const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
-    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0;
+    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0;
     saveRunning = true;
     saveModalOpen(caseId ? 'savingCaseFmt' : 'savingAllTitle', caseId ? { id: caseId } : null);
     $('btnSave').disabled = true; $('btnSaveCase').disabled = true; $('btnOpen').disabled = true;
@@ -1805,7 +1944,8 @@
         if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
         // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
         if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
-        try { await writeUnit(ref.c.id, ref.u); n++; }
+        if (conflictedUnits.has(k)) { skippedConflicts++; continue; }   // chooser owns it — not written, not a failure
+        try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else n++; }   // the write itself may detect a fresh conflict and refuse
         catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
       }
     } finally {
@@ -1818,8 +1958,9 @@
     if (cancelled) { saveModalFinish(I18n.t('saveCancelledFmt', { n })); setSaveStatus(null); return; }   // frames are still unsaved — the header must not claim Saved
     saveModalStep(keys.length, keys.length, '');
     if (failed) { saveModalFinish(I18n.t('saveDonePartialFmt', { n, failed })); setBanner('savedPartial', { n, failed }, 'warn'); }
+    else if (skippedConflicts) { saveModalFinish(I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts })); setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn'); }
     else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner('savedAllFmt', { n }, 'ok'); }
-    setSavedStatus();
+    if (skippedConflicts) setSaveStatus(null); else setSavedStatus();   // conflicted frames are still unsaved — the header must not say Saved
   }
   function save() { return runSave(null); }
   function saveCase() { if (cur && !cur.virtual) return runSave(cur.caseId); }
@@ -1841,6 +1982,7 @@
   }
   function scheduleAutoSave() {
     if (!$('autoSave').checked || !rootHandle || !cur) return;
+    if (conflictedUnits.has(State.key(cur.caseId, cur.unitId))) return;   // unresolved conflict: nothing may write this frame; edits stay in State + mirror
     pendingSave = { c: cur.caseId, u: cur.unitId, unit: cur.unit };   // (case,unit,handle) captured atomically in cur — never mix ids with a different unit's handle
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(runAutoSave, 1000);
@@ -1946,9 +2088,20 @@
     // not be read. Building the file from that State would replace real annotations with an empty document,
     // so refuse: the throw surfaces the write-failure banner and puts the unit in the retry queue.
     if (!sessionLoaded.has(k)) throw new Error('refusing to write ' + k + ': its annotation.json was never read this session');
+    if (conflictedUnits.has(k)) return;               // the conflict chooser owns this frame: stays dirty, file stays untouched (4.2)
     let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
     if (tok !== dsToken) return;                      // …or during the load
     if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
+    // M4 / decision 4.2: never blind-overwrite a file that changed since this session last read or wrote
+    // it — that silently destroyed a colleague's (or another machine's) work with a stale in-memory copy
+    // while the banner reported success. A newer-but-changed file makes this frame CONFLICTED instead:
+    // the write is skipped, the frame stays dirty, and opening it shows the two-version chooser.
+    const diskMs = await annFileMtime(unit);
+    if (tok !== dsToken) return;
+    if (diskMs && diskMs > Math.max(ownWriteMs(caseId, unit.id, k), lastSeenMtime.get(k) || 0) + 2000) {
+      conflictedUnits.set(k, null);                   // parsed lazily when the chooser opens
+      return;
+    }
     await backupCorruptOnce(k, unit);
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
@@ -1962,7 +2115,15 @@
     saveTimer = null;
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
-    try { setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI(); setSavedStatus(); }
+    try {
+      setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI();
+      const k2 = State.key(p.c, p.unit.id);
+      if (conflictedUnits.has(k2)) {                  // the write refused: a newer differing file appeared on disk
+        setSaveStatus(null);                          // the frame is NOT saved — never claim it is
+        setBanner('conflictFoundFmt', { id: p.unit.id }, 'warn');
+        if (cur && cur.caseId === p.c && cur.unitId === p.unit.id) showConflictDialog(k2);
+      } else setSavedStatus();
+    }
     catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
   }
 
@@ -2078,6 +2239,9 @@
     $('btnSave').onclick = save;
     $('btnSaveCase').onclick = saveCase;
     $('btnSaveCancel').onclick = () => { saveCancel = true; $('btnSaveCancel').disabled = true; };
+    $('btnConflictDisk').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'disk'); };
+    $('btnConflictLocal').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'local'); };
+    $('btnConflictLater').onclick = hideConflictDialog;   // unresolved: frame stays dirty + protected; reopening the frame asks again
     $('btnSaveClose').onclick = () => $('saveModal').classList.add('hidden');
     updateSaveButtons();
     $('btnUndo').onclick = undo;
@@ -2185,6 +2349,7 @@
     window.addEventListener('keydown', e => {
       if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
+      if (e.key === 'Escape' && !$('conflictModal').classList.contains('hidden')) { hideConflictDialog(); return; }   // = "decide later"
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       // While ANY full-screen overlay is up, swallow every other hotkey. #confirmClear was already
       // handled; dataformat.js's #dfModal was not, so arrows loaded another frame, digits changed the
