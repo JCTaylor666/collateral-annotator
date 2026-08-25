@@ -337,18 +337,27 @@
     activeLayerByUnit[key(c, u)] = id;                        // switch to the fresh (empty) layer
     markDirty(c, u); return id;
   }
-  function deleteLayer(c, u, id) {
+  // UNDOABLE (decision 4.4-A): the deleted layer entry and its three buckets go onto the undo stack;
+  // Ctrl+Z re-inserts the layer at its old position with its content and (if it was active) re-activates
+  // it. Entries of the deleted layer are left on the stack: they sit BELOW the delete entry, and by the
+  // time Ctrl+Z reaches them the layer has been restored, so they apply to exactly the state they came
+  // from. `noUndo` is for programmatic collapses (copy-from-frame flattening an EMPTY target) where an
+  // undo entry would only be noise.
+  function deleteLayer(c, u, id, noUndo) {
     const k = key(c, u), list = layersMut(c, u);
     if (list.length <= 1) {                                   // min 1 layer: "delete the only layer" == clear its content
-      const L = list[0].id;
-      selections[lkey(c, u, L)] = {}; points[lkey(c, u, L)] = []; delete paintR[lkey(c, u, L)];
-      undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker'));
+      const L = list[0].id, lk = lkey(c, u, L);
+      if (!noUndo) undoStack.push({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
+      selections[lk] = {}; points[lk] = []; delete paintR[lk];
       markDirty(c, u); return;
     }
     const idx = list.findIndex(l => l.id === id); if (idx < 0) return;
+    const lk = lkey(c, u, id);
+    if (!noUndo) undoStack.push({ kind: 'layerdel', c, u, layer: id, name: list[idx].name, at: idx,
+      sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null,
+      wasActive: activeLayerId(c, u) === id });
     list.splice(idx, 1);
-    delete selections[lkey(c, u, id)]; delete points[lkey(c, u, id)]; delete paintR[lkey(c, u, id)];
-    undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker' && (e.layer || 0) === id));
+    delete selections[lk]; delete points[lk]; delete paintR[lk];
     if (activeLayerId(c, u) === id) activeLayerByUnit[k] = list[0].id;   // was active → fall back to the first remaining
     markDirty(c, u);
   }
@@ -473,6 +482,19 @@
     } else if (e.kind === 'pointbatch') {
       const a = ptsLW(e.c, e.u, L);
       for (let i = e.removed.length - 1; i >= 0; i--) a.splice(e.removed[i].index, 0, e.removed[i].item);   // re-insert ascending by original index
+    } else if (e.kind === 'layerclear') {
+      const lk = lkey(e.c, e.u, L);                           // put the snapshotted buckets back (null = the bucket did not exist)
+      if (e.sel) selections[lk] = e.sel; else delete selections[lk];
+      if (e.pts) points[lk] = e.pts; else delete points[lk];
+      if (e.paint) paintR[lk] = e.paint; else delete paintR[lk];
+    } else if (e.kind === 'layerdel') {
+      const list = layersMut(e.c, e.u);
+      if (!list.some(l => l.id === e.layer)) list.splice(Math.min(e.at, list.length), 0, { id: e.layer, name: e.name });
+      const lk = lkey(e.c, e.u, e.layer);
+      if (e.sel) selections[lk] = e.sel;
+      if (e.pts) points[lk] = e.pts;
+      if (e.paint) paintR[lk] = e.paint;
+      if (e.wasActive) activeLayerByUnit[key(e.c, e.u)] = e.layer;
     } else {
       const s = selLW(e.c, e.u, L);
       if (e.prev === null) delete s[e.ks]; else s[e.ks] = e.prev;
@@ -480,10 +502,14 @@
     persistUnit(e.c, e.u); return e;
   }
   // "Clear this unit" = clear the ACTIVE layer's content only (star / markers / note / other layers are kept).
+  // UNDOABLE (decision 4.4-A): the wiped buckets are moved onto the undo stack, not destroyed — the
+  // replacement objects are fresh, so the snapshot needs no copying. Older entries of this layer are NOT
+  // purged any more: undoing the clear restores the exact state they describe, so they stay valid, and
+  // Ctrl+Z after a clear now rescues the cleared content instead of silently mutating something else.
   function clearUnit(c, u) {
-    const L = activeLayerId(c, u);
-    selections[lkey(c, u, L)] = {}; points[lkey(c, u, L)] = []; delete paintR[lkey(c, u, L)];
-    undoStack = undoStack.filter(e => !(e.c === c && e.u === u && e.kind !== 'marker' && (e.layer || 0) === L));
+    const L = activeLayerId(c, u), lk = lkey(c, u, L);
+    undoStack.push({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
+    selections[lk] = {}; points[lk] = []; delete paintR[lk];
     persistUnit(c, u);
   }
   // wipe a unit's in-memory annotation (ALL layers + frame-level) so it can be re-seeded from disk (clean units on load)

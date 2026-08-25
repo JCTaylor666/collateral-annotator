@@ -103,7 +103,7 @@
       layerRenameTitle: 'Rename layer',
       layerDeleteTitle: 'Delete this layer',
       layerRenamePrompt: 'Layer name:',
-      layerDeleteConfirm: 'Delete layer “{name}” and all its annotations on this frame?',
+      layerDeleteConfirm: 'Delete layer “{name}” and all its annotations on this frame? (Ctrl+Z / ⌘Z brings it back.)',
       toolsLabel: 'Annotation tool',
       toolClick: 'Click',
       toolBrush: 'Paint',
@@ -141,7 +141,7 @@
       loupeMismatch: 'Size mismatch',
       loupeLoading: 'Loading…',
 
-      clearConfirmHtml: 'Really clear?<br>This removes the CURRENT LAYER\u2019s annotations (segments, points, paint). Other layers, the note, markers and star are kept.',
+      clearConfirmHtml: 'Really clear?<br>This removes the CURRENT LAYER\u2019s annotations (segments, points, paint). Other layers, the note, markers and star are kept. Ctrl+Z / \u2318Z undoes it.',
       btnClearContinue: 'Continue clearing',
       btnCancel: 'Cancel',
 
@@ -308,7 +308,7 @@
       layerRenameTitle: '图层改名',
       layerDeleteTitle: '删除此图层',
       layerRenamePrompt: '图层名称:',
-      layerDeleteConfirm: '删除图层“{name}”及其在本帧的所有标注?',
+      layerDeleteConfirm: '删除图层“{name}”及其在本帧的所有标注?(可用 Ctrl+Z / ⌘Z 撤销恢复)',
       toolsLabel: '标注工具',
       toolClick: '点选',
       toolBrush: '涂抹',
@@ -346,7 +346,7 @@
       loupeMismatch: '尺寸不符',
       loupeLoading: '加载中…',
 
-      clearConfirmHtml: '真的要清理么？<br>只清空<b>当前图层</b>的标注（选段、红点、涂抹）。其它图层、笔记、编号标记和星标都会保留。',
+      clearConfirmHtml: '真的要清理么？<br>只清空<b>当前图层</b>的标注（选段、红点、涂抹）。其它图层、笔记、编号标记和星标都会保留。可用 Ctrl+Z / ⌘Z 撤销。',
       btnClearContinue: '继续清理',
       btnCancel: '取消',
 

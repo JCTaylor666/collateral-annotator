@@ -554,7 +554,7 @@
     curGeom = data.geometry || null;                          // per-segment radius (drives the geometry stats + filter panel)
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setPerfLegend(0);
-    view.setSelected(selColorMap());
+    view.setSelected(selColorMap(), selFullSet());
     view.setPaint(State.paintDense(c.id, u.id, data.W, data.H));   // load brush paint layer
     refreshDots();
     exitMarkerArm(); refreshMarkers();
@@ -583,7 +583,7 @@
     const W = perf.W, H = perf.H;
     view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
     view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
-    view.setSelected(new Map()); view.setPaint(new Uint16Array(W * H));
+    view.setSelected(new Map(), new Set()); view.setPaint(new Uint16Array(W * H));
     view.setDots([]); view.setMarkers([]); view.setSnapPreview(0, 0, false); view.setHovered(0);
     view.layout(); view.render(); updateZoomReadout();
   }
@@ -659,7 +659,7 @@
     view.setDots(segDots.concat(State.pointList(cur.caseId, cur.unitId)));
   }
   function refreshCanvasSelection() {
-    view.setSelected(selColorMap());
+    view.setSelected(selColorMap(), selFullSet());
     refreshDots();
     view.render();
   }
@@ -727,6 +727,13 @@
     for (const it of State.selectedSegs(cur.caseId, cur.unitId)) { if (segVisible(it.seg)) m.set(it.seg, segRgb(it.cls)); }
     return m;
   }
+  // Decision 4.5: the DISPLAY map above hides filtered-out segments, but the paint-exclusion set must be
+  // the FULL selection — painting over a selected segment that the geometry filter merely hides would
+  // write "segment 5 is a collateral" AND "segment 5's pixels are painted" into the same annotation.json,
+  // the one break of the paint-⟂-selection invariant kept everywhere else.
+  function selFullSet() {
+    return cur ? new Set(State.selectedIds(cur.caseId, cur.unitId)) : new Set();
+  }
 
   // ---- geometry (per-segment named metrics) stats + filter ----
   const geomActive = () => !!(curGeom && State.getGeomFilter());
@@ -745,7 +752,7 @@
   function applyGeomFilter() {                                // push the current filter into the view + refresh dependent layers
     if (!cur || cur.virtual || cur.mismatch) { view.setVisibleSegs(null); return; }
     view.setVisibleSegs(computeVisibleSegs());
-    view.setSelected(selColorMap());                          // drop green highlight of hidden selected segs
+    view.setSelected(selColorMap(), selFullSet());            // drop green highlight of hidden selected segs — but keep them paint-excluded (4.5)
     refreshDots();                                            // drop red dots of hidden segs
     view.render();
     updateGeomCount();
@@ -1151,7 +1158,7 @@
       setBanner('copyNoAnnotations', { id: srcUnit.id }, 'warn'); return;
     }
     // target is empty per the gate, but may have empty extra layers the user added — collapse to a single layer 0
-    for (let tl = State.getLayers(tc, tu); tl.length > 1; tl = State.getLayers(tc, tu)) State.deleteLayer(tc, tu, tl[tl.length - 1].id);
+    for (let tl = State.getLayers(tc, tu); tl.length > 1; tl = State.getLayers(tc, tu)) State.deleteLayer(tc, tu, tl[tl.length - 1].id, true);   // noUndo: collapsing an EMPTY target is bookkeeping, not a doctor action
     // Mirror EVERY source layer onto the (empty) target: reuse the target's lone layer for the first source
     // layer, add a fresh one for each subsequent. Segments/points are re-resolved by coordinate against the
     // target's own label; paint copies 1:1 only at identical W×H. Each layer's writes go to that layer's bucket.
@@ -1983,6 +1990,12 @@
       buildLayerBar();
     }
     const isCurLayer = sameUnit && (e.layer || 0) === State.getActiveLayer(cur.caseId, cur.unitId);
+    // a restored clear/delete-layer changes bucket contents (and possibly the layer LIST) wholesale:
+    // reload the canvas paint from State and rebuild the layer bar. Offscreen units need nothing extra —
+    // their snapshots went straight back into State as stored RLE/objects.
+    if (e.kind === 'layerclear' || e.kind === 'layerdel') {
+      if (sameUnit) { view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H)); buildLayerBar(); }
+    }
     if (e.kind === 'paint') {
       if (isCurLayer) {
         view.applyPaintUndo(e.changes);                     // current unit+layer: apply via the view's dense array
@@ -2196,7 +2209,7 @@
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!painting && !selecting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record — paint AND select strokes)
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!e.repeat && !painting && !selecting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record — paint AND select strokes). !e.repeat = decision 4.9-A: HOLDING the key undoes ONE step, auto-repeats are dropped — a panicked hold after deleting the wrong thing must not machine-gun through the history
       else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         if (e.key >= '1' && e.key <= '9') { const n = +e.key; if (classes.some(c => c.index === n)) { State.setActiveClass(n); buildClassPicker(); } }   // number = activate class with that index
         else { const k = e.key.toLowerCase();                                                                                                             // C/B/P = single-select / brush-select / paint

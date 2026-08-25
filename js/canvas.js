@@ -15,7 +15,8 @@
     // live affine: screen = scale*image + off. fitScale = fit-to-viewport; needFit
     // re-fits on next layout (set when image dims change). User pan/zoom mutate scale/off.
     let scale = 1, offX = 0, offY = 0, fitScale = 1, needFit = true;
-    let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color)
+    let sel = new Map(), hov = 0, opacity = 0.55;   // segId -> [r,g,b] (per-class color) — the DISPLAYED selection (geometry filter applied)
+    let selAll = new Set();                          // every selected seg id, filter or not: the paint-exclusion set (4.5 — never paint on a selected segment, visible or hidden)
     let brushActive = false;   // when the brush tool is active, floor the paint-layer alpha so strokes are never invisible
     let maskData = null, maskOpacity = 0.45;
     let visibleSegs = null;   // geometry filter: a Set of segment ids to show (null = no filter, show full mask.npy)
@@ -134,7 +135,7 @@
         for (let x = x0; x <= x1; x++) {
           const dx = x - cx; if (dx * dx + dy * dy > r2) continue;
           const i = base + x, lab = label[i];
-          if (lab && sel.has(lab)) continue;                          // never paint on a selected segment
+          if (lab && selAll.has(lab)) continue;                       // never paint on a selected segment — including one the geometry filter is hiding (4.5)
           if (!erase && onmask && maskData && !maskData[i]) continue; // add: foreground-only when onmask
           const nv = erase ? 0 : cls;
           if (paint[i] === nv) continue;
@@ -166,7 +167,7 @@
     function setPaintColorFn(fn) { paintColorFn = fn; }
     function setBrushCursor(x, y, r, show) { brushCur = show ? { x, y, r } : null; }
 
-    function setSelected(s) { sel = (s instanceof Map) ? s : new Map(); if (W) buildSelLayer(); }
+    function setSelected(s, all) { sel = (s instanceof Map) ? s : new Map(); selAll = (all instanceof Set) ? all : new Set(sel.keys()); if (W) buildSelLayer(); }   // callers that pass no full set keep the old display==exclusion behaviour
     function setHovered(seg) { if (seg === hov) return false; hov = seg; buildHovLayer(); return true; }
     function setOpacity(o) { opacity = o; }
     function setBrushActive(b) { brushActive = !!b; }
