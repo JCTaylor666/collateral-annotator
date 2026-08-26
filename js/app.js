@@ -98,14 +98,39 @@
   // resolves to an image row above the one under the cursor (~35 image px on a 1432² frame).
   // Re-layout only when the height ACTUALLY changed: calling onResize() on every banner text change would
   // re-clamp the pan and make the image visibly jump while the doctor is working.
+  // Banner ARBITRATION (M7 / ORDER-5): the banner is a single slot, and before this ANY later message
+  // replaced whatever was showing — a doctor could lose "write FAILED" to a routine "Saved 3" two
+  // seconds later while looking at the image. Three priorities now:
+  //   2  critical warnings (write/save failures, conflicts, quota, permission, open failures, classes
+  //      trouble, a failed frame load) — sticky: only another critical message, an explicit
+  //      setBanner(null) (incl. clearUnitBanner on navigation for per-unit keys), or the doctor's own
+  //      ✕ can take the slot;
+  //   1  ordinary warnings;   0  'ok' confirmations.
+  // A lower-priority message arriving while a critical one is up is DROPPED (its information is either
+  // repeated elsewhere — save modal, status line — or strictly less important than what it would hide).
+  // The set also contains the RESOLUTION messages of critical situations (classesReplaced, conflictKept*):
+  // they must be able to take the slot from the warning they retire — P0-9's own gate caught that leaving
+  // them ordinary lets a stale "left untouched" banner keep lying after the file was in fact replaced.
+  const BANNER_CRITICAL = new Set(['writeFailedBanner', 'saveAborted', 'savedPartial', 'saveFailedMsg',
+    'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
+    'classesBackupFailed', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
+    'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
+    'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed']);
+  const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
     const b = $('banner');
+    if (key && lastBanner && bannerPrio(lastBanner.key, lastBanner.kind) === 2 && bannerPrio(key, kind) < 2) return;
     const txt = key ? I18n.t(key, vars) : '';
     const cls = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
     lastBanner = key ? { key, vars, kind } : null;
-    if (b.textContent === txt && b.className === cls) return;   // nothing visible changes: no forced reflow, no re-layout
     const h0 = view ? $('view').clientHeight : 0;
     b.textContent = txt;
+    if (key && bannerPrio(key, kind) === 2) {   // critical messages are dismissable by hand — sticky must never mean stuck
+      const x = document.createElement('span');
+      x.className = 'banner-x'; x.textContent = '✕'; x.title = I18n.t('bannerDismiss');
+      x.onclick = () => setBanner(null);
+      b.appendChild(x);
+    }
     b.className = cls;
     if (view && $('view').clientHeight !== h0) onResize();
   }
@@ -569,6 +594,7 @@
       if (gen !== navGen) return false;          // a newer navigation superseded this one — stay silent
       if (!syncNavToCur()) { ci = prevCi; ui = prevUi; }   // realign nav to the unit still on screen (fallback: previous)
       setBanner('errLoadUnitFailed', { id: u.id, msg: e.message }, 'warn');
+      highlightNav();   // ui-5: the case dropdown / frame-list highlight jumped to the failed target on click — snap them back to what is actually on screen
       return false;
     }
     finally { navBusy = false; if (gen === navGen) setNavBusy(false); }   // a superseded load must leave the NEWEST navigation's busy hint alone
@@ -1555,7 +1581,7 @@
     inspect = true; stripSig = '';
     document.body.classList.add('inspecting');
     $('loupePanel').classList.remove('hidden');
-    ensureCasePerfusion(curCase());   // so a pinned perfusion tile is ready
+    ensureCasePerfusion(cases.find(x => x.id === cur.caseId) || curCase());   // so a pinned perfusion tile is ready — for the DISPLAYED case (pl-4 family: curCase() is the nav target mid-load)
     preloadCase(); scheduleLoupe();
   }
   function exitInspect() {
@@ -1575,8 +1601,11 @@
   }
   // gray of a unit for the loupe: fresh snapshot for the current unit (never stored),
   // cache for neighbors. Returns { W, H, gray } or null (not yet loaded / failed).
-  function grayOf(c, i) {
-    if (i === ui) return view.getGray();
+  // pl-4: "current" here must be the DISPLAYED frame. During a slow load ui already points at the
+  // navigation TARGET while the canvas (and view.getGray()) still shows the previous frame — keying
+  // "current" on ui made the loupe label the on-screen pixels with the incoming frame's identity.
+  function grayOf(c, i, curIdx) {
+    if (i === curIdx) return view.getGray();
     return Loupe.get(State.key(c.id, c.units[i].id));
   }
   function sampleVal(g, x, y, mean) {
@@ -1595,13 +1624,13 @@
     const s = loupeSizePx();
     $('loupePanel').style.width = Math.max(320, Math.min(s * 3 + 34, Math.round(window.innerWidth * 0.55))) + 'px';
   }
-  function rebuildStrip(idxList, units) {
+  function rebuildStrip(idxList, units, curIdx) {
     const strip = $('loupeStrip'); strip.innerHTML = ''; tileEls.clear();
     const s = loupeSizePx();
     for (const i of idxList) {
       const u = units[i];
       const wrap = document.createElement('div');
-      wrap.className = 'loupe-tile' + (i === ui ? ' cur' : '') + (u.kind === 'perfusion' ? ' perf' : '');
+      wrap.className = 'loupe-tile' + (i === curIdx ? ' cur' : '') + (u.kind === 'perfusion' ? ' perf' : '');   // pl-4: highlight the DISPLAYED frame's tile, not the nav target's
       const cv = document.createElement('canvas');
       cv.style.width = cv.style.height = s + 'px';
       const cap = document.createElement('div'); cap.className = 'cap';
@@ -1612,7 +1641,14 @@
   }
   function renderLoupe() {
     if (!inspect || !cur) return;
-    const c = curCase(), units = c.units, n = units.length;
+    // pl-4: anchor everything on the DISPLAYED frame (cur), never on ci/ui — those move to the
+    // navigation target before the load resolves, and mid-load the loupe then reads/labels pixels
+    // of a frame that is not on screen.
+    const c = cases.find(x => x.id === cur.caseId) || curCase();
+    if (!c) return;
+    const units = c.units, n = units.length;
+    const curIdx = units.findIndex(x => x.id === cur.unitId);
+    if (curIdx < 0) return;
     const [x, y] = view.eventToImage({ clientX: lastCX, clientY: lastCY });
     const zoom = +$('loupeZoom').value, R = +$('loupeR').value, mean = $('loupeMean').checked, size = loupeSizePx();
     const lp = State.getLoupe();
@@ -1625,21 +1661,21 @@
     const minipIdx = units.findIndex(u => u.kind === 'minip');
     const perfIdx = units.findIndex(u => u.kind === 'perfusion');
     const idxSet = new Set();
-    units.forEach((u, i) => { if (u.kind === 'frame' && i >= ui - R && i <= ui + R) idxSet.add(i); });
-    idxSet.add(ui);                                                        // always include the current unit
+    units.forEach((u, i) => { if (u.kind === 'frame' && i >= curIdx - R && i <= curIdx + R) idxSet.add(i); });
+    idxSet.add(curIdx);                                                    // always include the DISPLAYED unit
     if (lp.pinMinip && minipIdx >= 0) idxSet.add(minipIdx);
     if (lp.pinPerfusion && perfIdx >= 0) idxSet.add(perfIdx);
     const idxList = [...idxSet].sort((a, b) => a - b);
 
-    const sig = idxList.join(',') + '@' + ui + 'x' + size;
-    if (sig !== stripSig) { rebuildStrip(idxList, units); stripSig = sig; }
+    const sig = idxList.join(',') + '@' + curIdx + 'x' + size;
+    if (sig !== stripSig) { rebuildStrip(idxList, units, curIdx); stripSig = sig; }
     for (const i of idxList) {
       const el = tileEls.get(i); if (!el) continue;
       if (units[i].kind === 'perfusion') {
         const st = perfState(c);
         Loupe.drawColorTile(el.canvas, st === 'ok' ? perfView(c) : null, x, y, S, st);   // coloured at the current smoothness
       } else {
-        const g = grayOf(c, i);
+        const g = grayOf(c, i, curIdx);
         let st = 'ok';
         if (!g) st = Loupe.state(State.key(c.id, units[i].id));
         else if (g.W !== W || g.H !== H) st = 'mismatch';
@@ -1651,8 +1687,8 @@
     const pts = []; let curveCur = -1;
     for (let i = 0; i < n; i++) {
       if (units[i].kind === 'perfusion') continue;
-      if (i === ui) curveCur = pts.length;
-      const g = grayOf(c, i);
+      if (i === curIdx) curveCur = pts.length;
+      const g = grayOf(c, i, curIdx);
       let val = null;
       if (g && g.W === W && g.H === H) val = sampleVal(g, x, y, mean);
       pts.push({ val, label: units[i].id, isMinip: units[i].kind === 'minip' });
@@ -1671,6 +1707,10 @@
   function onWheel(ev) {
     if (!cur) return;
     ev.preventDefault();
+    // m10: zooming/panning mid-stroke moves the image under a still-held button; the next mousemove
+    // then interpolates from the pre-zoom position and paints a long streak the doctor never drew
+    // (measured ~280 px). Commit the live stroke first — the wheel ends the stroke, never extends it.
+    if (painting || selecting) commitActiveStroke();
     const rect = $('view').getBoundingClientRect();
     const cx = ev.clientX - rect.left, cy = ev.clientY - rect.top;
     if (!ev.ctrlKey && !isMouseWheel(ev)) {
@@ -1987,7 +2027,7 @@
     saveModalStep(keys.length, keys.length, '');
     if (failed) { saveModalFinish(I18n.t('saveDonePartialFmt', { n, failed })); setBanner('savedPartial', { n, failed }, 'warn'); }
     else if (skippedConflicts) { saveModalFinish(I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts })); setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn'); }
-    else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner('savedAllFmt', { n }, 'ok'); }
+    else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner(null); setBanner('savedAllFmt', { n }, 'ok'); }   // a clean full save retires any stale critical warning first — every frame just reached disk
     if (skippedConflicts) setSaveStatus(null); else setSavedStatus();   // conflicted frames are still unsaved — the header must not say Saved
   }
   function save() { return runSave(null); }
@@ -2198,6 +2238,10 @@
     }
     State.markDirty(e.c, e.u);                              // dirty the unit the undo actually touched
     if (!sameUnit) {                                        // persist THAT unit directly, leave the displayed one alone
+      // dw-5: the screen does not change (the edit lives on another frame), so without this the doctor
+      // reads the silence as "nothing happened" and presses Ctrl+Z again — silently unpicking more
+      // history elsewhere. Name BOTH frames: what was undone, and where the doctor actually is.
+      setBanner('undoOtherFrameFmt', { id: (e.c === cur.caseId ? e.u : e.c + '/' + e.u), cur: cur.unitId }, 'warn');
       highlightNav(); updateDirtyUI();
       const oc = cases.find(c => c.id === e.c), ou = oc && oc.units.find(u => u.id === e.u);
       if (ou && rootHandle && State.getAutoSave()) {
