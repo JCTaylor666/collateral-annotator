@@ -63,7 +63,14 @@
   // (normalized convolution: result = blur(t*w) / blur(w)). `iters` box passes ≈ a Gaussian.
   function smoothArrival(fields, radius, iters, mask) {
     const { W, H, tstar, amp, thresh } = fields, N = W * H;
-    const num = new Float32Array(N), den = new Float32Array(N), tmpA = new Float32Array(N), tmpB = new Float32Array(N);
+    // sp-8: the four working buffers used to be allocated per call — dragging the smoothness slider
+    // allocated ~41 MB per notch (~100 ms, ~10 fps feel). They now live on the fields object and are
+    // reused across calls; fields is per-case, so a case switch naturally gets fresh buffers.
+    let S = fields._smoothScratch;
+    if (!S || S.num.length !== N) S = fields._smoothScratch = {
+      num: new Float32Array(N), den: new Float32Array(N), tmpA: new Float32Array(N), tmpB: new Float32Array(N), out: new Float32Array(N),
+    };
+    const num = S.num, den = S.den, tmpA = S.tmpA, tmpB = S.tmpB;
     // mask (optional, minip vessel mask): out-of-mask pixels get weight 0 so their (extra-vascular, often
     // noisy) arrival times can never bleed into the vessel tree through the normalized convolution
     for (let i = 0; i < N; i++) { const w = (amp[i] >= thresh && (!mask || mask[i])) ? amp[i] : 0; num[i] = tstar[i] * w; den[i] = w; }
@@ -71,7 +78,7 @@
       boxH(num, tmpA, W, H, radius); boxV(tmpA, num, W, H, radius);
       boxH(den, tmpB, W, H, radius); boxV(tmpB, den, W, H, radius);
     }
-    const out = new Float32Array(N);
+    const out = S.out;
     for (let i = 0; i < N; i++) out[i] = den[i] > 0 ? num[i] / den[i] : tstar[i];
     return out;
   }

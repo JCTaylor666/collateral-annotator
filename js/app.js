@@ -82,6 +82,7 @@
   // brush-select (click tool, drag to select segments) stroke state
   let selecting = false, selRAF = false, selLastX = 0, selLastY = 0;
   let selStrokeSegs = null, selChanges = null, selPaintChanges = null, selPointChanges = null;
+  let selPendingDeltas = null;   // sp-5: this drag's not-yet-painted membership changes, flushed once per rAF via view.selApplyDelta
   let markerArm = false;   // true while waiting for the user to click the image to place a note marker
   let navGen = 0;          // bumped each showUnit; a stale (slow) load must not clobber a newer navigation
   let navBusy = false;     // a frame load is in flight: block new strokes (they'd straddle the old/new frame)
@@ -277,16 +278,20 @@
     if (data && data.W && data.H && data.W * data.H > maxPxSeen) { maxPxSeen = data.W * data.H; recomputeCacheCap(); }   // big real frames shrink the cap
     evictOver();
   }
+  // M11: eviction is PURE RECENCY now. The old cold-first policy ("evict unviewed prefetches before
+  // anything the user looked at") sounded protective but measured pathological: the cold tier is
+  // precisely the freshly-prefetched next frames, so prefetching frame N+3 evicted the just-prefetched
+  // N+1/N+2 while long-abandoned viewed frames survived — 237 of 297 loads in a 60-frame walk were
+  // redundant re-reads of evicted prefetches. Map insertion order IS the recency order (cacheTouch
+  // re-inserts on use), so evicting from the front drops the genuinely least-recent entry, whatever its
+  // tier; a fresh prefetch is at the back and survives. The displayed frame is never evicted.
   function evictOver() {
     if (cache.size <= cacheCap) return;
     const curKey = cur ? State.key(cur.caseId, cur.unitId) : null;
-    for (const coldPass of [true, false]) {                   // pass 1: unviewed prefetches, oldest first; pass 2: oldest of the rest
-      for (const k of cache.keys()) {
-        if (cache.size <= cacheCap) return;
-        if (k === curKey) continue;
-        if (coldPass && !prefetchCold.has(k)) continue;
-        cache.delete(k); prefetchCold.delete(k);
-      }
+    for (const k of cache.keys()) {
+      if (cache.size <= cacheCap) return;
+      if (k === curKey) continue;
+      cache.delete(k); prefetchCold.delete(k);
     }
   }
   // one shared pixel-read path so loadCur / prefetch / writeUnit never double-read the same unit,
@@ -534,15 +539,22 @@
           if (pc.length) appendAll(selPaintChanges, pc);
         }
         const ch = State.brushSeg(cur.caseId, cur.unitId, seg, xy, State.getActiveClass(), sb.mode === 'erase');
-        if (ch) selChanges.push(ch);
+        if (ch) { selChanges.push(ch); if (selPendingDeltas) selPendingDeltas.push({ seg, rgb: sb.mode === 'erase' ? null : segRgb(State.getActiveClass()) }); }
       }
     } catch (e) {
       // Never leave the canvas edited without a matching undo record: restore the view's paint from State
       // (the authoritative copy) and abort the stroke loudly instead of failing silently.
       try { view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H)); view.render(); } catch (e2) { }
-      selecting = false; selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null;
+      selecting = false; selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null; selPendingDeltas = null;
       setBanner('errStrokeAborted', null, 'warn');
     }
+  }
+  // sp-5: paint ONLY the segments this drag changed since the last frame (no 8 MB ImageData allocation,
+  // no full-layer loop), then refresh the red dots (erase sweeps them) and composite.
+  function flushSelDeltas() {
+    if (selPendingDeltas && selPendingDeltas.length) view.selApplyDelta(selPendingDeltas.splice(0));
+    refreshDots();
+    view.render();
   }
   function finalizeSelectStroke() {
     if (!selecting) return;
@@ -557,7 +569,7 @@
       State.markDirty(cur.caseId, cur.unitId);
       refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
     }
-    selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null;
+    selStrokeSegs = null; selChanges = null; selPaintChanges = null; selPointChanges = null; selPendingDeltas = null;
   }
 
   // realign ci/ui to whatever unit is actually displayed (cur) — used after a load fails/is superseded so
@@ -1743,11 +1755,11 @@
       if (sb.mode === 'add' && State.getActiveClass() == null) { setBanner('errPickClassFirst', null, 'warn'); return; }
       const [x, y] = view.eventToImage(ev);
       selecting = true; suppressClick = true;
-      selStrokeSegs = new Set(); selChanges = []; selPaintChanges = []; selPointChanges = [];
+      selStrokeSegs = new Set(); selChanges = []; selPaintChanges = []; selPointChanges = []; selPendingDeltas = [];
       selLastX = x; selLastY = y;
       selDab(x, y);
       view.setBrushCursor(x, y, sb.radius, true);
-      refreshCanvasSelection();
+      flushSelDeltas();   // sp-5: incremental — the full selColorMap rebuild waits for the stroke to end
       return;
     }
     dragging = true; dragMoved = false; suppressClick = false;
@@ -1771,7 +1783,7 @@
       for (let k = 1; k <= n; k++) { const t = k / n; selDab(Math.round(selLastX + (p[0] - selLastX) * t), Math.round(selLastY + (p[1] - selLastY) * t)); }
       selLastX = p[0]; selLastY = p[1];
       view.setBrushCursor(p[0], p[1], sb.radius, true);
-      if (!selRAF) { selRAF = true; requestAnimationFrame(() => { selRAF = false; refreshCanvasSelection(); }); }
+      if (!selRAF) { selRAF = true; requestAnimationFrame(() => { selRAF = false; flushSelDeltas(); }); }
       return;
     }
     if (!dragging) return;

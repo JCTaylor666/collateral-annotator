@@ -79,11 +79,33 @@
       for (let k = 0; k < pixels.length; k++) { const p = pixels[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; }
       cx.putImageData(id, 0, 0);
     }
+    // sp-5: the selection layer's ImageData is PERSISTENT. Rebuilding used to allocate a fresh W×H×4
+    // buffer (8 MB at 1432²) on every refresh — during a brush-select drag that is one allocation per
+    // animation frame, ~0.5 GB/s of garbage, and the 0.3-1.6 s stutters the doctor felt were the GC.
+    let selImg = null;
+    const selImgEnsure = () => { if (!selImg || selImg.width !== W || selImg.height !== H) selImg = selCtx.createImageData(W, H); return selImg; };
+    function selWriteSeg(d, seg, rgb) {
+      const px = segPixels(seg);
+      if (rgb) { for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; } }
+      else { for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = 0; d[p + 1] = 0; d[p + 2] = 0; d[p + 3] = 0; } }
+    }
     function buildSelLayer() {
       if (!W || !H) return;
-      selCtx.clearRect(0, 0, W, H);
-      const id = selCtx.createImageData(W, H), d = id.data;
-      for (const [seg, rgb] of sel) { const px = segPixels(seg); for (let k = 0; k < px.length; k++) { const p = px[k] * 4; d[p] = rgb[0]; d[p + 1] = rgb[1]; d[p + 2] = rgb[2]; d[p + 3] = 255; } }
+      const id = selImgEnsure(); id.data.fill(0);
+      for (const [seg, rgb] of sel) selWriteSeg(id.data, seg, rgb);
+      selCtx.putImageData(id, 0, 0);
+    }
+    // one drag-frame's worth of membership changes, applied in place: [{seg, rgb}] with rgb=null meaning
+    // deselected. Keeps sel/selAll (display AND paint-exclusion) in sync, writes only those segments'
+    // pixels, and pushes the SAME persistent buffer back — no allocation on the hot path.
+    function selApplyDelta(list) {
+      if (!W || !H || !list || !list.length) return;
+      const id = selImgEnsure(), d = id.data;
+      for (const it of list) {
+        if (it.rgb) { sel.set(it.seg, it.rgb); selAll.add(it.seg); }
+        else { sel.delete(it.seg); selAll.delete(it.seg); }
+        selWriteSeg(d, it.seg, it.rgb || null);
+      }
       selCtx.putImageData(id, 0, 0);
     }
     function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) fillPixels(hovCtx, segPixels(hov), HOV_RGB); }
@@ -419,7 +441,7 @@
     // store it — setUnit reallocates gray on every unit switch.
     function getGray() { return { gray, W, H }; }
 
-    return { setUnit, setSelected, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
+    return { setUnit, setSelected, selApplyDelta, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
              layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,

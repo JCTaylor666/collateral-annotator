@@ -12,26 +12,39 @@
     return m ? parseInt(m[1], 10) : null;
   }
 
+  // sp-10: the root listing is one stream, but each CASE folder's listing used to run strictly after
+  // the previous one — 328 sequential directory reads before the first frame could show, and on Google
+  // Drive every one is a network round-trip. The per-case listings now run through an 8-wide pool; the
+  // result (order, filtering, sorting) is byte-identical to the serial version.
   async function discover(rootHandle) {
-    const cases = [];
+    const dirs = [];
     for await (const [name, handle] of rootHandle.entries()) {
       if (handle.kind !== 'directory' || name.startsWith('.')) continue;
       const cnum = folderNum(name);
       if (cnum === null) continue;                            // not a numbered case folder — ignore
-      const units = [];
-      for await (const [uname, uhandle] of handle.entries()) {
-        if (uhandle.kind !== 'directory' || uname.startsWith('.')) continue;
-        const isMinip = uname === 'minip';
-        const unum = folderNum(uname);
-        if (!isMinip && unum === null) continue;              // not a numbered frame folder (nor minip) — ignore
-        units.push({ id: uname, kind: isMinip ? 'minip' : 'frame',
-                     order: isMinip ? Infinity : unum, handle: uhandle });
-      }
-      units.sort((a, b) => a.order - b.order);
-      if (units.length) cases.push({ id: name, num: cnum, handle, units });
+      dirs.push({ name, handle, cnum });
     }
-    cases.sort((a, b) => a.num - b.num);
-    return cases;
+    const cases = new Array(dirs.length); let next = 0;
+    const worker = async () => {
+      while (next < dirs.length) {
+        const i = next++, d = dirs[i];
+        const units = [];
+        for await (const [uname, uhandle] of d.handle.entries()) {
+          if (uhandle.kind !== 'directory' || uname.startsWith('.')) continue;
+          const isMinip = uname === 'minip';
+          const unum = folderNum(uname);
+          if (!isMinip && unum === null) continue;            // not a numbered frame folder (nor minip) — ignore
+          units.push({ id: uname, kind: isMinip ? 'minip' : 'frame',
+                       order: isMinip ? Infinity : unum, handle: uhandle });
+        }
+        units.sort((a, b) => a.order - b.order);
+        cases[i] = units.length ? { id: d.name, num: d.cnum, handle: d.handle, units } : null;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(8, Math.max(1, dirs.length)) }, worker));
+    const out = cases.filter(Boolean);
+    out.sort((a, b) => a.num - b.num);
+    return out;
   }
 
   // Reads frames.png (as a decoded Image), label.npy (Uint16), and annotation.json if present.

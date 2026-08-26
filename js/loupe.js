@@ -6,14 +6,17 @@
   'use strict';
 
   const grayCache = new Map();   // key -> { W, H, gray } — bounded LRU (Map order = recency; get() touches)
-  const MAX_GRAY = 96;           // ~0.6MB per 800² frame -> ≤~60MB; oldest evicted, never grows unbounded
+  const MAX_GRAY = 512;          // belt only — the real cap is bytes (below); count alone let 1432² frames balloon to ~197MB
+  const MAX_GRAY_BYTES = 60 * 1048576;   // pl-7: budget in BYTES, honouring the ~60MB the count was originally sized for
+  let grayBytes = 0;
+  const graySize = g => (g && g.gray && g.gray.byteLength) ? g.gray.byteLength : ((g && g.W * g.H) || 0);
   const inflight = new Map();    // key -> Promise
   const failed = new Map();      // key -> failure timestamp (retryable after a cooldown, not permanent)
   const RETRY_MS = 5000;
   let epoch = 0;                 // dataset generation; bumped on reset()
   const readyCbs = [];
 
-  function reset() { grayCache.clear(); inflight.clear(); failed.clear(); epoch++; }
+  function reset() { grayCache.clear(); grayBytes = 0; inflight.clear(); failed.clear(); epoch++; }
   function onReady(fn) { readyCbs.push(fn); }
   function fireReady() { for (const fn of readyCbs) { try { fn(); } catch (e) { } } }
 
@@ -30,8 +33,11 @@
     const p = root.Loader.loadGray(unit).then(g => {
       inflight.delete(key);
       if (myEpoch !== epoch) return;      // dataset changed while loading — discard
-      grayCache.set(key, g);
-      while (grayCache.size > MAX_GRAY) grayCache.delete(grayCache.keys().next().value);   // evict oldest
+      grayCache.set(key, g); grayBytes += graySize(g);
+      while (grayCache.size > MAX_GRAY || grayBytes > MAX_GRAY_BYTES) {
+        const k0 = grayCache.keys().next().value;
+        grayBytes -= graySize(grayCache.get(k0)); grayCache.delete(k0);   // evict oldest until under BOTH caps
+      }
       fireReady();
     }).catch(() => {
       inflight.delete(key);
