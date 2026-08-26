@@ -5,6 +5,11 @@
   const LSKEY = 'vessel_annotator_v1';
   // selection value = { xy:[x,y], cls:classIndex|null }. Old data may be a bare [x,y] — normalized on read.
   let selections = {}, visited = {}, coordOrder = 'xy', undoStack = [];
+  // B3: the undo history is capped — paint entries carry per-pixel change lists (tens of KB each), and a
+  // full day of annotating used to accumulate thousands of them. 200 steps is far beyond any real
+  // "hold Ctrl+Z" journey; older entries fall off the front.
+  const UNDO_MAX = 200;
+  function pushU(e) { undoStack.push(e); if (undoStack.length > UNDO_MAX) undoStack.splice(0, undoStack.length - UNDO_MAX); }
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let notes = {};    // caseUnit -> note text (mirrors note.json on disk)
   let noteMarkers = {}; // caseUnit -> [{id, xy:[x,y]}] : numbered circle markers referenced from the note
@@ -347,13 +352,13 @@
     const k = key(c, u), list = layersMut(c, u);
     if (list.length <= 1) {                                   // min 1 layer: "delete the only layer" == clear its content
       const L = list[0].id, lk = lkey(c, u, L);
-      if (!noUndo) undoStack.push({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
+      if (!noUndo) pushU({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
       selections[lk] = {}; points[lk] = []; delete paintR[lk];
       markDirty(c, u); return;
     }
     const idx = list.findIndex(l => l.id === id); if (idx < 0) return;
     const lk = lkey(c, u, id);
-    if (!noUndo) undoStack.push({ kind: 'layerdel', c, u, layer: id, name: list[idx].name, at: idx,
+    if (!noUndo) pushU({ kind: 'layerdel', c, u, layer: id, name: list[idx].name, at: idx,
       sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null,
       wasActive: activeLayerId(c, u) === id });
     list.splice(idx, 1);
@@ -392,13 +397,13 @@
   function addMarker(c, u, xy) {
     const a = mksMut(c, u), id = nextMarkerId(c, u);
     a.push({ id, xy: [xy[0], xy[1]] });
-    undoStack.push({ kind: 'marker', c, u, op: 'add' });
+    pushU({ kind: 'marker', c, u, op: 'add' });
     persistUnit(c, u); return id;
   }
   function removeMarker(c, u, id) {
     const a = mksGet(c, u), i = a.findIndex(m => m.id === id); if (i < 0) return;
     const item = a.splice(i, 1)[0];
-    undoStack.push({ kind: 'marker', c, u, op: 'remove', index: i, item });
+    pushU({ kind: 'marker', c, u, op: 'remove', index: i, item });
     persistUnit(c, u);
   }
   // key-existence (not length) so deleting the LAST marker still rewrites note.json — otherwise the stale file resurrects it
@@ -430,12 +435,12 @@
     const s = sel(c, u), ks = String(seg), prev = (ks in s) ? s[ks] : null;
     if (prev !== null && segCls(prev) === (cls == null ? null : cls)) { delete s[ks]; }
     else { s[ks] = { xy: [clickXY[0], clickXY[1]], cls: cls == null ? null : cls }; }
-    undoStack.push({ kind: 'seg', c, u, layer: activeLayerId(c, u), ks, prev });
+    pushU({ kind: 'seg', c, u, layer: activeLayerId(c, u), ks, prev });
     persistUnit(c, u);
   }
-  function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); undoStack.push({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'add' }); persistUnit(c, u); }
-  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; undoStack.push({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'remove', index, item }); persistUnit(c, u); }
-  function pushPaintUndo(c, u, changes) { undoStack.push({ kind: 'paint', c, u, layer: activeLayerId(c, u), changes }); }
+  function addPoint(c, u, xy, cls) { pts(c, u).push({ xy: [xy[0], xy[1]], cls: cls == null ? null : cls }); pushU({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'add' }); persistUnit(c, u); }
+  function removePoint(c, u, index) { const a = pts(c, u); if (index < 0 || index >= a.length) return; const item = a.splice(index, 1)[0]; pushU({ kind: 'point', c, u, layer: activeLayerId(c, u), op: 'remove', index, item }); persistUnit(c, u); }
+  function pushPaintUndo(c, u, changes) { pushU({ kind: 'paint', c, u, layer: activeLayerId(c, u), changes }); }
   // brush-select: select (or deselect) a segment WITHOUT its own undo/persist entry — the caller
   // batches a whole drag into one undo via pushSegBatchUndo, and persists once via markDirty.
   // Returns { ks, prev } describing the change, or null if nothing changed (idempotent).
@@ -451,7 +456,7 @@
     s[ks] = { xy: [xy[0], xy[1]], cls: want };
     return { ks, prev };
   }
-  function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) undoStack.push({ kind: 'segbatch', c, u, layer: activeLayerId(c, u), changes }); }
+  function pushSegBatchUndo(c, u, changes) { if (changes && changes.length) pushU({ kind: 'segbatch', c, u, layer: activeLayerId(c, u), changes }); }
   // brush-select ERASE also clears background red dots: remove every point inside the circle WITHOUT its
   // own undo/persist (the whole drag is batched via pushPointBatchUndo). Returns [{index,item}] desc by index.
   function removePointsInCircle(c, u, cx, cy, r) {
@@ -463,7 +468,7 @@
     }
     return removed;
   }
-  function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) undoStack.push({ kind: 'pointbatch', c, u, layer: activeLayerId(c, u), removed }); }
+  function pushPointBatchUndo(c, u, removed) { if (removed && removed.length) pushU({ kind: 'pointbatch', c, u, layer: activeLayerId(c, u), removed }); }
   const peekUndo = () => undoStack.length ? undoStack[undoStack.length - 1] : null;   // read-only: lets the app pre-load an evicted unit's dims BEFORE popping a paint entry
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
@@ -508,7 +513,7 @@
   // Ctrl+Z after a clear now rescues the cleared content instead of silently mutating something else.
   function clearUnit(c, u) {
     const L = activeLayerId(c, u), lk = lkey(c, u, L);
-    undoStack.push({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
+    pushU({ kind: 'layerclear', c, u, layer: L, sel: selections[lk] || null, pts: points[lk] || null, paint: paintR[lk] || null });
     selections[lk] = {}; points[lk] = []; delete paintR[lk];
     persistUnit(c, u);
   }
@@ -632,6 +637,16 @@
     const rle = rleEncode(dense, W, H);
     if (Object.keys(rle.classes).length) paintR[lk] = rle; else delete paintR[lk];
     persistUnit(c, u); return true;
+  }
+  // A1: every paint blob whose encoding this build cannot decode (size mismatches are NOT this — they
+  // have their own banner and are preserved verbatim). Non-empty => the frame must become read-only.
+  function unknownPaintEncodings(c, u) {
+    const out = [];
+    for (const ly of layersOf(c, u)) {
+      const r = paintR[lkey(c, u, ly.id)];
+      if (r && r.encoding && r.encoding !== 'rle_rows_v1' && out.indexOf(r.encoding) < 0) out.push(r.encoding);
+    }
+    return out;
   }
   const usedClassesInPaint = () => { const s = new Set(); for (const kk in paintR) { const cl = paintR[kk] && paintR[kk].classes; for (const c in (cl || {})) { const n = +c; if (n) s.add(n); } } return [...s]; };
 
@@ -786,7 +801,7 @@
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
     isDirty, markDirty, markClean, getDirtySeq, getEditedAt, getWrittenAt, noteWritten, dirtyCount, isMirrorKey, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getPerfMask, setPerfMask, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
-    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, decodeRLE: rleDecode,
+    hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, unknownPaintEncodings, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, annotationDropped, buildAnnotation, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,
     getLayers, getActiveLayer, setActiveLayer, addLayer, deleteLayer, renameLayer, readLayer,
     getDatasetId, switchDataset, setPersistFailHandler, flushPersist };

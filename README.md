@@ -101,6 +101,22 @@ Each frame has its own note, saved to `note.json`.
 
 ---
 
+### 7. Saving, conflicts and recovery
+
+- **Save `s_N`** writes the case on screen; **Save all** is the end-of-day full
+  write, with a progress dialog and Cancel (its label carries the global
+  unsaved count). Auto-save (on by default) writes the current frame ~1 s
+  after each change.
+- If a frame's file on disk is **newer and different** (a colleague's save, a
+  copy from another machine), nothing is overwritten: opening the frame shows
+  a **two-thumbnail chooser** — keep the folder's or the session's version;
+  the losing side is preserved in a backup file either way.
+- Frames whose files contain content this app version cannot understand (a
+  newer `schema_version`, an unknown paint encoding) become **read-only** with
+  a copyable diagnostic instead of being silently rewritten.
+- Backup/rescue files in a frame's folder surface as a banner with **View**:
+  compare and **restore by swapping** — no choice ever destroys anything.
+
 ## Where your work is saved
 
 Everything is written **inside your data folder**, per frame:
@@ -276,12 +292,20 @@ note.json
   this id so two datasets that both use case_1/frame_0 never bleed together. Safe
   to delete (resets browser state only) and safe to omit from an archive.
 
-RECOVERY FILES -- written only when something is wrong, never read back:
-  annotation.json.corrupt / classes.json.corrupt -- an unparseable file is copied
-    here ONCE before anything overwrites it.
-  annotation.unsaved-backup.json / note.unsaved-backup.json -- if the browser
-    holds unsaved edits and the file on disk turns out to be NEWER, the edits go
-    here rather than being dropped or overwriting the newer file.
+RECOVERY FILES -- written only when something needs protecting; the app can
+show and RESTORE them from the UI (opening the frame offers a "View" banner;
+restoring is a swap, nothing is destroyed):
+  annotation.json.corrupt / note.json.corrupt / classes.json.corrupt -- an
+    unparseable file is copied here ONCE before anything overwrites it.
+  annotation.unsaved-backup.json / note.unsaved-backup.json -- the session's
+    side of a resolved conflict (you kept the folder's version).
+  annotation.external-backup.json / note.external-backup.json -- the folder's
+    side of a resolved conflict (you kept the session's version).
+CONFLICTS: a file on disk NEWER than the session's copy and different in
+content is never auto-resolved -- the frame goes write-protected and opening
+it shows a two-thumbnail chooser. A file with a schema_version above the app's
+own, or an unknown paint.encoding, makes the frame READ-ONLY (never blindly
+rewritten by an older app).
 
 ========================================
 HOW TO PREPARE A DATASET -- STEP BY STEP
@@ -437,6 +461,9 @@ CHECKLIST
 [ ] (label > 0) equals mask.npy pixel for pixel.
 [ ] geometry.json keys equal the label.npy ids, as strings; values are objects of
     numeric metrics; "filter" names a metric that exists.
+[ ] NO frame folder name ends in "#" + digits (e.g. f_3#1 is FORBIDDEN: the tool
+    keys per-layer content as case/frame#layerId and such a name cross-wires
+    annotations between frames). Class indices in classes.json are all >= 1.
 [ ] Case and unit folder names contain a number; a unit named exactly "minip" is
     allowed and sorts last.
 [ ] classes.json ships WITH the data and declares every class index used.

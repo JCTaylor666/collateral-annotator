@@ -35,6 +35,41 @@
   // chooser. value = { ann, note, annMtime } parsed at detection, or null when detected by the write path
   // (the dialog re-reads lazily).
   const conflictedUnits = new Map();          // State.key() -> {ann, note, annMtime} | null
+  // A1: frames whose FILE contains content this build cannot understand — a schema_version newer than
+  // ours, or a paint encoding we cannot decode. Reading it "as far as we get" and then saving would
+  // silently strip whatever we could not represent, so these frames are READ-ONLY: every edit entry
+  // point and every write path refuses them. The banner offers a copyable diagnostic for an agent.
+  const SCHEMA_MAX = 6;                       // highest annotation.json schema_version this build writes/understands
+  const protectedUnits = new Map();           // State.key() -> {what} (human-readable reason fragment)
+  function evalImportProtection(c, u, ann, versionAhead) {
+    const k = State.key(c.id, u.id), why = [];
+    if (versionAhead) why.push('schema_version ' + versionAhead + ' > ' + SCHEMA_MAX);
+    if (ann && Number.isFinite(Number(ann.schema_version)) && Number(ann.schema_version) > SCHEMA_MAX)
+      why.push('schema_version ' + ann.schema_version + ' > ' + SCHEMA_MAX);
+    const enc = State.unknownPaintEncodings(c.id, u.id);
+    if (enc.length) why.push('paint.encoding "' + enc.join('", "') + '"');
+    if (why.length) protectedUnits.set(k, { what: why.join('; ') });
+    else protectedUnits.delete(k);
+  }
+  async function copyProtectedDiag(k) {
+    try {
+      const [cc, uu] = [k.slice(0, k.lastIndexOf('/')), k.slice(k.lastIndexOf('/') + 1)];
+      const cRef = cases.find(x => x.id === cc), unit = cRef && cRef.units.find(x => x.id === uu);
+      const info = protectedUnits.get(k) || { what: '?' };
+      let head = '';
+      try { head = (await (await (await unit.handle.getFileHandle('annotation.json')).getFile()).text()).slice(0, 400); } catch (e) { }
+      const build = (document.querySelector('script[src*="app.js"]') || { src: '' }).src.match(/v=\d+/);
+      const txt = 'Vessel Annotator ' + (build ? build[0] : '?') + ' cannot fully understand ' + k + '/annotation.json.\n'
+        + 'Problem: ' + info.what + '\n'
+        + 'This build reads schema_version <= ' + SCHEMA_MAX + ' and paint encoding "rle_rows_v1" only.\n'
+        + 'First 400 bytes of the file:\n' + head + '\n'
+        + 'Please determine: was this written by a NEWER app version? If so, how should this build read it, '
+        + 'or should the user update the app? Do not modify the file.';
+      await navigator.clipboard.writeText(txt);
+      return true;
+    } catch (e) { return false; }
+  }
+
   let openGen = 0;                            // bumped per COMMITTED openFolder: stale async work (background scan / prefetch / late reads) must never touch the new dataset
   let dsToken = {};                           // identity of the dataset currently open. Replaced ONLY at the commit point in openFolderTxn(), so a cancelled/failed/empty Open aborts nothing that is already running.
   let openBusy = false;                       // an Open is between the picker and its commit: navigation must not resurrect the dataset being replaced, and a second Open must not interleave with this one
@@ -116,7 +151,7 @@
     'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
     'classesBackupFailed', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
     'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
-    'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed']);
+    'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed', 'protectedFrameFmt']);
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
     const b = $('banner');
@@ -139,7 +174,7 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable'];
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
@@ -215,7 +250,7 @@
       perfCache.clear(); perfInflight.clear();
       corruptUnits.clear(); corruptBackedUp.clear();
       sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
-      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear(); rescueFound.clear();
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear(); rescueFound.clear(); protectedUnits.clear(); noteCorruptUnits.clear(); noteCorruptBackedUp.clear();
       retryQ.clear(); if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }   // pending retries belong to the dataset we just closed (State for it is wiped below): they can never be written
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
@@ -396,6 +431,8 @@
     if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
     const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
     if (rec === 'aborted') return 'aborted';
+    evalImportProtection(c, u, r.annotation, r.versionAhead); // A1: unreadable-by-this-version content => the frame goes read-only
+    if (r.noteCorrupt) noteCorruptUnits.add(k);               // A2: back the original up before any write replaces it
     if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
     lastSeenMtime.set(k, r.mtime || 0);
     sessionLoaded.add(k);
@@ -407,7 +444,7 @@
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cacheTouch(k);
     if (data === undefined) data = await loadUnitCached(u, k, false);
-    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.annDropped = fresh.annDropped || 0; data.annUnreadable = !!fresh.unreadable; data.note = fresh.note; data.annMtime = fresh.mtime || 0; }
+    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.annDropped = fresh.annDropped || 0; data.versionAhead = fresh.versionAhead || 0; data.annUnreadable = !!fresh.unreadable; data.note = fresh.note; data.annMtime = fresh.mtime || 0; data.noteCorrupt = !!fresh.noteCorrupt; }
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
     if (data.annUnreadable) return data;   // this frame's annotation.json exists but could not be read: do NOT reset State from it and do NOT mark the unit seeded — every write path re-reads first (and refuses meanwhile)
@@ -421,6 +458,8 @@
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
       const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
+      evalImportProtection(c, u, data.annotation, data.versionAhead);
+      if (data.noteCorrupt) noteCorruptUnits.add(k);
     }
     lastSeenMtime.set(k, m);
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
@@ -613,7 +652,7 @@
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
-    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u };
+    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u, protected: protectedUnits.has(State.key(c.id, u.id)) };
     curGeom = data.geometry || null;                          // per-segment radius (drives the geometry stats + filter panel)
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setPerfLegend(0);
@@ -626,6 +665,14 @@
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
     updateDirtyUI(); updateCopyBtn();
     if (conflictedUnits.has(State.key(c.id, u.id))) showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
+    else if (cur.protected) {                                  // A1: read-only frame — say why, and offer a copyable diagnostic for an agent
+      const k2 = State.key(c.id, u.id);
+      setBanner('protectedFrameFmt', { id: u.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
+      const b2 = $('banner'), act2 = document.createElement('span');
+      act2.className = 'banner-act'; act2.textContent = I18n.t('copyDiagBtn');
+      act2.onclick = async () => { if (await copyProtectedDiag(k2)) act2.textContent = I18n.t('copyDiagDone'); };
+      b2.appendChild(act2);
+    }
     else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.annDropped) setBanner('annLayersDropped', { id: u.id, n: data.annDropped }, 'warn');   // parts of the file cannot be represented by this build
@@ -730,7 +777,7 @@
   // ---- layers (per-frame): switch / add / rename / delete ----
   function buildLayerBar() {
     const bar = $('layerBar'), sec = $('layerSec'); if (!bar || !sec) return;
-    if (!cur || cur.virtual || cur.mismatch) { sec.classList.add('hidden'); bar.innerHTML = ''; return; }
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) { sec.classList.add('hidden'); bar.innerHTML = ''; return; }
     sec.classList.remove('hidden');
     const layers = State.getLayers(cur.caseId, cur.unitId), active = State.getActiveLayer(cur.caseId, cur.unitId);
     bar.innerHTML = '';
@@ -748,7 +795,7 @@
     }
   }
   function renderActiveLayer() {   // re-render the canvas for the current unit's ACTIVE layer (selection/paint/dots)
-    if (!cur || cur.virtual || cur.mismatch) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
     view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));
     refreshCanvasSelection();   // setSelected(selColorMap) + refreshDots + render
     refreshMeta();
@@ -760,7 +807,7 @@
     renderActiveLayer(); buildLayerBar(); updateDirtyUI(); updateCopyBtn();
   }
   function addLayerAction() {
-    if (!cur || cur.virtual || cur.mismatch) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
     commitActiveStroke();
     State.addLayer(cur.caseId, cur.unitId);   // creates an empty layer + switches active to it
     renderActiveLayer(); buildLayerBar(); updateDirtyUI(); highlightNav(); scheduleAutoSave();
@@ -813,7 +860,7 @@
     return set;
   }
   function applyGeomFilter() {                                // push the current filter into the view + refresh dependent layers
-    if (!cur || cur.virtual || cur.mismatch) { view.setVisibleSegs(null); return; }
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) { view.setVisibleSegs(null); return; }
     view.setVisibleSegs(computeVisibleSegs());
     view.setSelected(selColorMap(), selFullSet());            // drop green highlight of hidden selected segs — but keep them paint-excluded (4.5)
     refreshDots();                                            // drop red dots of hidden segs
@@ -829,7 +876,7 @@
   }
   function refreshGeomPanel() {                               // show/populate the panel for the current unit (or hide it)
     const panel = $('geomPanel'); if (!panel) return;
-    const okUnit = !!(cur && !cur.virtual && !cur.mismatch && curGeom && curGeom.metrics && curGeom.metrics.length);
+    const okUnit = !!(cur && !cur.virtual && !cur.mismatch && !cur.protected && curGeom && curGeom.metrics && curGeom.metrics.length);
     // only offer metrics that actually have a value on THIS frame's segments (a metric may be defined only
     // for ids absent from this label) — prevents selecting a valueless metric and saving a stale window.
     const segs = okUnit ? view.labelSegs() : [];
@@ -1012,8 +1059,8 @@
       while (next < units.length) {
         if (gen !== openGen) return;
         const { c, u } = units[next++];
-        let ann = null, note = null, annCorrupt = false, annMtime = 0, annDropped = 0, unreadable = false;
-        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; annMtime = r.mtime || 0; annDropped = r.annDropped || 0; unreadable = !!r.unreadable; }
+        let ann = null, note = null, annCorrupt = false, noteCorrupt = false, versionAhead = 0, annMtime = 0, annDropped = 0, unreadable = false;
+        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; noteCorrupt = !!r.noteCorrupt; versionAhead = r.versionAhead || 0; annMtime = r.mtime || 0; annDropped = r.annDropped || 0; unreadable = !!r.unreadable; }
         catch (e) { unreadable = true; }
         if (gen !== openGen) return;
         const uk = State.key(c.id, u.id);
@@ -1026,6 +1073,8 @@
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
           if (gen !== openGen) return;
+          evalImportProtection(c, u, ann, versionAhead);    // A1: the SCAN seeds most frames first — without this the loadCur fast path never re-evaluates
+          if (noteCorrupt) noteCorruptUnits.add(uk);        // A2
           if (rec === 'conflict') conflicts++;
           lastSeenMtime.set(uk, annMtime);
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
@@ -1072,7 +1121,7 @@
   let prefetchGen = 0;
   function schedulePrefetch() {
     const gen = ++prefetchGen, oGen = openGen;
-    const c0 = curCase(); if (!c0 || !cur || cur.virtual || cur.mismatch || !rootHandle) return;
+    const c0 = curCase(); if (!c0 || !cur || cur.virtual || cur.mismatch || cur.protected || !rootHandle) return;
     const curLen = c0.units.filter(un => !un.virtual).length;
     const maxCount = Math.max(0, cacheCap - curLen - 8);       // headroom so prefetch can never push the live sequence out
     const list = [];
@@ -1181,7 +1230,7 @@
   }
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
-    b.disabled = !cur || cur.virtual || cur.mismatch || copyTargetBusy(cur.caseId, cur.unitId);
+    b.disabled = !cur || cur.virtual || cur.mismatch || cur.protected || copyTargetBusy(cur.caseId, cur.unitId);
     b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
@@ -1301,7 +1350,7 @@
     }
   }
   function enterMarkerArm() {
-    if (!cur || cur.virtual || cur.mismatch || markerArm) return;   // perfusion / shape-mismatch units are view-only
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || markerArm) return;   // perfusion / shape-mismatch units are view-only
     exitCopyPick();                                         // the two click-capturing modes are mutually exclusive
     markerArm = true;
     document.body.classList.add('marker-arming');
@@ -1322,7 +1371,7 @@
     refreshMarkers(); view.render(); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave();
   }
 
-  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch || cur.protected) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -1374,7 +1423,7 @@
     repaintPerfusionNow();   // discrete toggle: repaint immediately, never queued behind a paused rAF
   }
   async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
-    if (!cur || cur.virtual || cur.mismatch) return;   // view-only units have no editable files
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     // The handle MUST come from the unit captured atomically in `cur`. curUnit() resolves ci/ui, which
     // showUnit advances BEFORE its await, so during a slow load it names the frame being navigated TO —
@@ -1425,6 +1474,7 @@
     const c = cases.find(x => x.id === caseId), u = c && c.units.find(x => x.id === unitId);
     if (!c || !u) return;                  // the row belongs to a case/unit that is no longer part of this dataset
     if (u.virtual || u.mismatch) return;   // view-only units can't be starred (no file to persist it to)
+    if (protectedUnits.has(State.key(caseId, unitId))) return;   // A1: read-only frame — the star lives in annotation.json
     // CRITICAL guard: this frame may never have been seeded this session (fresh browser + background scan
     // hasn't reached it) — starring would then autosave an EMPTY annotation over its real file. Seed first,
     // and honour the contract: only 'seeded'/'already' mean State matches the file on disk.
@@ -1457,7 +1507,7 @@
       el.appendChild(name); el.appendChild(badge);
       if (!u.virtual) {   // perfusion is view-only: no star / no annotation badge
         const on = State.isStarred(c.id, u.id);
-        const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t('starThisFrame');
+        const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t(on ? 'unstarThisFrame' : 'starThisFrame');
         star.onclick = (e) => { e.stopPropagation(); toggleStar(cid, uid); };
         el.appendChild(star);
       }
@@ -1501,7 +1551,7 @@
     document.querySelectorAll('#frameList .frm').forEach(el => {
       if (el.dataset.k !== k) return;
       const st = el.querySelector('.frm-star'); if (!st) return;
-      st.className = 'frm-star' + (on ? ' on' : ''); st.textContent = on ? '★' : '☆';
+      st.className = 'frm-star' + (on ? ' on' : ''); st.textContent = on ? '★' : '☆'; st.title = I18n.t(on ? 'unstarThisFrame' : 'starThisFrame');
     });
   }
 
@@ -1521,7 +1571,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
-    if (cur && (cur.virtual || cur.mismatch)) return;       // perfusion / shape-mismatch units are view-only
+    if (cur && (cur.virtual || cur.mismatch || cur.protected)) return;   // perfusion / shape-mismatch / read-only-protected units take no annotation
     if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // paint mode: clicks paint, not select
@@ -1739,7 +1789,7 @@
     // view-only situations where a drag may pan but must never paint/select: perfusion & shape-mismatch
     // units, a frame load in flight (the stroke would straddle two frames), and copy-source picking
     // (painting here would make the copy target busy and the pick then fails)
-    const viewOnly = cur.virtual || cur.mismatch || navBusy || copyPickMode;
+    const viewOnly = cur.virtual || cur.mismatch || cur.protected || navBusy || copyPickMode;
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
     if (!viewOnly && !markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
@@ -1968,7 +2018,7 @@
   // the version being replaced is written into the same rescue file first, so no choice ever destroys
   // anything — the files trade places, and reopening the frame offers the trade back.
   const RESCUE_NAMES = ['annotation.unsaved-backup.json', 'note.unsaved-backup.json',
-    'annotation.external-backup.json', 'note.external-backup.json', 'annotation.json.corrupt'];
+    'annotation.external-backup.json', 'note.external-backup.json', 'annotation.json.corrupt', 'note.json.corrupt'];
   const rescueFound = new Map();   // State.key() -> [names present at last check] (session cache)
   let rescueShownFor = null, rescueFiles = [], rescueSel = 0;
   async function checkRescueFiles(c, u) {
@@ -2152,7 +2202,7 @@
         if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
         // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
         if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
-        if (conflictedUnits.has(k)) { skippedConflicts++; continue; }   // chooser owns it — not written, not a failure
+        if (conflictedUnits.has(k) || protectedUnits.has(k)) { skippedConflicts++; continue; }   // chooser-owned or read-only-protected — not written, not a failure
         try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else n++; }   // the write itself may detect a fresh conflict and refuse
         catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
       }
@@ -2191,6 +2241,7 @@
   function scheduleAutoSave() {
     if (!$('autoSave').checked || !rootHandle || !cur) return;
     if (conflictedUnits.has(State.key(cur.caseId, cur.unitId))) return;   // unresolved conflict: nothing may write this frame; edits stay in State + mirror
+    if (protectedUnits.has(State.key(cur.caseId, cur.unitId))) return;    // A1: read-only frame
     pendingSave = { c: cur.caseId, u: cur.unitId, unit: cur.unit };   // (case,unit,handle) captured atomically in cur — never mix ids with a different unit's handle
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(runAutoSave, 1000);
@@ -2203,6 +2254,18 @@
     try {
       const fh = await unit.handle.getFileHandle('annotation.json');
       await FS.writeText(unit.handle, 'annotation.json.corrupt', await (await fh.getFile()).text());
+    } catch (e) { /* best effort — never block the real write */ }
+  }
+  // A2: a note.json that exists but does not parse is preserved as note.json.corrupt exactly once
+  // before any write replaces it — the same protection annotation.json has had since P0.
+  const noteCorruptUnits = new Set(), noteCorruptBackedUp = new Set();
+  async function backupNoteCorruptOnce(k, unit) {
+    if (!noteCorruptUnits.has(k) || noteCorruptBackedUp.has(k)) return;
+    noteCorruptBackedUp.add(k);
+    try {
+      const fh = await unit.handle.getFileHandle('note.json');
+      await FS.writeText(unit.handle, 'note.json.corrupt', await (await fh.getFile()).text());
+      setBanner('noteCorruptBackedUp', { id: unit.id }, 'warn');
     } catch (e) { /* best effort — never block the real write */ }
   }
   // ---- failed writes: retry queue ------------------------------------------------------------------
@@ -2297,6 +2360,7 @@
     // so refuse: the throw surfaces the write-failure banner and puts the unit in the retry queue.
     if (!sessionLoaded.has(k)) throw new Error('refusing to write ' + k + ': its annotation.json was never read this session');
     if (conflictedUnits.has(k)) return;               // the conflict chooser owns this frame: stays dirty, file stays untouched (4.2)
+    if (protectedUnits.has(k)) return;                // A1: read-only frame — never overwrite content we could not fully read
     let data = cacheTouch(k); if (data === undefined) data = await loadUnitCached(unit, k, false);
     if (tok !== dsToken) return;                      // …or during the load
     if (data.shapeMismatch) { State.markClean(caseId, unit.id, seq); return; }   // never write into a shape-mismatched frame (would fabricate annotation.json)
@@ -2313,7 +2377,11 @@
     await backupCorruptOnce(k, unit);
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
-    if (State.hasNoteData(caseId, unit.id)) await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+    if (State.hasNoteData(caseId, unit.id)) {
+      await backupNoteCorruptOnce(k, unit);           // A2: the unreadable original goes to note.json.corrupt first
+      await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+      noteCorruptUnits.delete(k);                     // the file on disk is valid JSON again
+    }
     corruptUnits.delete(k);   // the file on disk is valid JSON again
     const fileMs = (await annFileMtime(unit)) || Date.now();   // the FILE's own clock, not ours
     if (tok === dsToken) { ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs); }   // a reconcile must never mistake OUR write for an externally-newer file — this session OR after a reload (and a cross-open write must not pollute the new dataset's maps)
@@ -2394,10 +2462,10 @@
     refreshMarkers();
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
-  function askClear() { if (!cur || cur.virtual || cur.mismatch) return; $('confirmClear').classList.remove('hidden'); }   // view-only units have nothing to clear (and must never be marked dirty)
+  function askClear() { if (!cur || cur.virtual || cur.mismatch || cur.protected) return; $('confirmClear').classList.remove('hidden'); }   // view-only units have nothing to clear (and must never be marked dirty)
   function closeClear() { $('confirmClear').classList.add('hidden'); }
   function clear() {
-    if (!cur || cur.virtual || cur.mismatch) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
     State.clearUnit(cur.caseId, cur.unitId);
     view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // wipe the canvas paint layer too, else the next stroke re-encodes & re-saves the "cleared" paint
     State.markDirty(cur.caseId, cur.unitId);

@@ -108,7 +108,7 @@
     const a = await readAnnotation(unit);
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
-    return { W, H, img, label: parsed.data, mask, maskBad: maskUnreadable, annotation: a.annotation, annCorrupt: a.corrupt,
+    return { W, H, img, label: parsed.data, mask, maskBad: maskUnreadable, annotation: a.annotation, annCorrupt: a.corrupt, noteCorrupt: !!n.corrupt, versionAhead: a.versionAhead || 0,
              annDropped: a.dropped || 0, annUnreadable: !!(a.unreadable || n.unreadable), annMtime: a.mtime || 0, note: n.note, geometry };
   }
 
@@ -141,7 +141,10 @@
     let ann;
     try { ann = JSON.parse(text); }
     catch (e) { return { annotation: null, corrupt: true, dropped: 0, mtime }; }   // read fine, but it is not JSON — the real "corrupt"
-    if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, corrupt: true, dropped: 0, mtime };
+    // A1: a schema_version newer than this build is NOT "corrupt" — it is a healthy file from a newer
+    // app. Classified separately so the app can make the frame read-only instead of letting the
+    // corrupt path back it up and then OVERWRITE it with a downgraded rewrite.
+    if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, versionAhead: Number(ann.schema_version), corrupt: false, dropped: 0, mtime };
     const dropped = (root.State && root.State.annotationDropped) ? root.State.annotationDropped(ann) : 0;
     return { annotation: ann, corrupt: false, dropped, mtime };
   }
@@ -153,7 +156,7 @@
     try { text = await (await fh.getFile()).text(); }
     catch (e) { return { note: null, unreadable: true }; }
     try { return { note: JSON.parse(text) }; }
-    catch (e) { return { note: null }; }   // present but not JSON: unchanged for now — a corrupt note.json still needs its own .corrupt backup (separate finding, later commit)
+    catch (e) { return { note: null, corrupt: true }; }   // present but not JSON: flagged so the app backs the original up to note.json.corrupt before any write replaces it (A2)
   }
   // Optional geometry.json: per-segment named metrics that drive the stats + filter UI.
   // { segments: { "<segId>": { "<metric>": <number>, ... } }, filter?: {metric,min,max} }.
@@ -174,6 +177,7 @@
     const values = Object.create(null), metrics = [];
     const add = (name, id, raw) => {
       if (DANGEROUS(name) || DANGEROUS(id)) return;                     // never let a file-supplied key reach Object.prototype
+      if (raw == null || raw === '') return;   // B2: "no measurement" is NOT "measurement = 0" — Number(null) is 0, which made the filter hide (and un-click) the segment. No value => never filtered.
       const v = Number(raw); if (!Number.isFinite(v)) return;
       if (!values[name]) { values[name] = Object.create(null); metrics.push(name); }
       values[name][id] = v;
@@ -194,8 +198,8 @@
   // light re-read of just the mutable per-unit files (annotation.json + note.json) — no image decode
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
-    return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0,
-             unreadable: !!(a.unreadable || n.unreadable), note: n.note, mtime: a.mtime || 0 };
+    return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0, versionAhead: a.versionAhead || 0,
+             unreadable: !!(a.unreadable || n.unreadable), note: n.note, noteCorrupt: !!n.corrupt, mtime: a.mtime || 0 };
   }
 
   // read the dataset-level class definitions from classes.json at the root.

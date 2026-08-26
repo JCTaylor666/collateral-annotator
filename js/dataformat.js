@@ -130,12 +130,23 @@
 <ul>
 <li><code>annotation.json.corrupt</code> (in the frame) — an <code>annotation.json</code> that cannot be parsed is copied here <b>once</b>, before anything overwrites it. The frame opens with a warning and shows no marks until the file is fixed.</li>
 <li><code>classes.json.corrupt</code> (at the root) — same, for an unparseable <code>classes.json</code>. The tool will not auto-overwrite it with placeholder names until the original is safely copied.</li>
-<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code> (in the frame) — if you have unsaved edits in the browser and the file on disk turns out to be <b>newer</b> (someone else saved, or another tab did), your edits are written here rather than being dropped or blindly overwriting the newer file.</li>
+<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code> (in the frame) — the SESSION side of a resolved conflict: when you keep the folder's version, your session's copy is preserved here first.</li>
+<li><code>annotation.external-backup.json</code> / <code>note.external-backup.json</code> (in the frame) — the FOLDER side: when you keep the session's version, the folder's file is preserved here before being overwritten.</li>
+<li><code>note.json.corrupt</code> (in the frame) — an unparseable <code>note.json</code> is copied here once before any save replaces it (same protection <code>annotation.json</code> has).</li>
 </ul>
-<p class="doc-p">None of these are read back automatically. Inspect them yourself and merge by hand.</p></div>
+<p class="doc-p"><b>Conflicts.</b> If a frame's file on disk is <b>newer</b> than this session's copy AND differs (a colleague's save, a copy from another machine, a sync), nothing is auto-resolved: the frame becomes write-protected and OPENING it shows a two-thumbnail chooser — keep the folder version or the session version; the loser always lands in one of the backup files above. Identical content with only a newer timestamp is adopted silently.</p>
+<p class="doc-p"><b>Recovery.</b> Opening a frame that has any of these backup files shows a banner with a <i>View</i> action: a chooser compares the current version with each backup, and restoring is a SWAP — the replaced version is written back into the same backup file, so nothing is ever lost.</p>
+<p class="doc-p"><b>Version safety.</b> A file this app version cannot fully understand (a <code>schema_version</code> above its own, or an unknown <code>paint.encoding</code>) makes the frame READ-ONLY: it is never overwritten, and the banner offers a copyable diagnostic. Update the app or ask an agent — do not edit the file by hand.</p>
+<p class="doc-p"><b>Browser-local mirror.</b> Unsaved work is additionally mirrored in the browser's localStorage under <code>vessel_annotator_v2:*</code> keys (one small record per frame, full content only while a frame is unsaved). It is a crash net, not part of the dataset — nothing in the folder depends on it.</p></div>
 <div class="doc-sec"><h4>The <code>perfusion</code> unit — computed, not read from disk</h4><ul>
 <li>Every case gets one extra unit after <code>minip</code>, computed from that case's frames. It has <b>no folder and no files</b>; do not create one. It is view-only: no label, no mask, no geometry panel, and it can never be annotated or saved.</li>
 <li>The smoothness slider re-colours it live. It can be downloaded as <code>&lt;case&gt;_perfusion.png</code> — that is a browser download, not a file in the dataset.</li>
+</ul></div>
+<div class="doc-sec"><h4>Naming rules for generated datasets (hard constraints)</h4><ul>
+<li>Case folders: <code>s_&lt;number&gt;</code> (or any <code>&lt;prefix&gt;_&lt;number&gt;</code> — the trailing number orders them). Frame folders: <code>f_&lt;number&gt;</code>, plus the optional literal <code>minip</code>.</li>
+<li><b>A frame folder name must NEVER end in <code>#&lt;digits&gt;</code></b> (e.g. <code>f_3#1</code>): the tool keys per-layer content as <code>case/frame#layerId</code>, and such a name collides with a layer bucket of a sibling frame — annotations would cross-wire between frames.</li>
+<li>Class indices in <code>classes.json</code> must be <b>&ge; 1</b>. Index 0 is rejected at load (it is the paint layer's "unpainted" value).</li>
+<li>All per-frame files must share one <code>H×W</code>: <code>frames.png</code>, <code>label.npy</code> (<code>&lt;u2</code>), and <code>mask.npy</code> (<code>|u1</code>, optional). A parseable mask of the wrong shape makes the frame a read-only placeholder.</li>
 </ul></div>
 <div class="doc-sec"><h4>Failures that are SILENT — read this before generating data</h4>
 <p class="doc-p">Most malformed input produces a visible warning. These three do not:</p>
@@ -291,12 +302,23 @@
 <ul>
 <li><code>annotation.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>annotation.json</code> 会在被任何东西覆盖之前<b>备份一次</b>到这里。该帧带警告打开，在文件修好之前不显示任何标记。</li>
 <li><code>classes.json.corrupt</code>（在根目录）—— 同理，针对无法解析的 <code>classes.json</code>。在原文件被安全备份之前，工具不会用占位名去自动覆盖它。</li>
-<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code>（在帧文件夹里）—— 如果你在浏览器里有未保存的改动，而磁盘上的文件却<b>更新</b>（别人保存了，或另一个标签页写了），你的改动会写到这里，而不是被丢掉、也不会盲目覆盖那个更新的文件。</li>
+<li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code>（在帧文件夹里）—— 冲突解决时的「会话」一侧:你选择保留文件夹版本时,本次会话的副本先保存到这里。</li>
+<li><code>annotation.external-backup.json</code> / <code>note.external-backup.json</code>（在帧文件夹里）—— 「文件夹」一侧:你选择保留会话版本时,文件夹里的原文件先保存到这里再被覆盖。</li>
+<li><code>note.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>note.json</code> 在任何保存替换它之前会先复制到这里（与 <code>annotation.json</code> 同等保护）。</li>
 </ul>
-<p class="doc-p">这些文件都不会被自动读回。请自己查看并手动合并。</p></div>
+<p class="doc-p"><b>冲突。</b>若磁盘上的文件比本次会话的副本<b>新</b>且内容不同(同事保存过、从别的机器拷来、同步所致),程序不会自动取舍:该帧进入写保护,<b>打开它</b>会弹出双缩略图对比,由你选择保留哪个版本;落选的一方总会存进上面的备份文件。内容相同、仅时间戳变新的情况会静默采纳,不打扰。</p>
+<p class="doc-p"><b>恢复。</b>打开带有上述备份文件的帧会出现横幅和「查看」按钮:对比当前版本与各备份,恢复是<b>交换</b>——被替换的版本写回同名备份文件,任何选择都不会销毁内容。</p>
+<p class="doc-p"><b>版本安全。</b>本程序版本读不懂的文件(更高的 <code>schema_version</code>,或陌生的 <code>paint.encoding</code>)会使该帧变为只读:绝不覆盖,横幅提供可复制的诊断信息。请升级程序或交给 agent 判断,不要手工改文件。</p>
+<p class="doc-p"><b>浏览器本地镜像。</b>未保存的工作还会镜像在浏览器 localStorage 的 <code>vessel_annotator_v2:*</code> 键下(每帧一条小记录,仅未保存时保留全量内容)。它只是崩溃保险,不属于数据集——文件夹里的任何东西都不依赖它。</p></div>
 <div class="doc-sec"><h4><code>perfusion</code> 单元 — 计算得出，不来自磁盘</h4><ul>
 <li>每个病例在 <code>minip</code> 之后会自动多出一个单元，由该病例的各帧计算得到。它<b>没有文件夹、没有文件</b>，不要去创建。它是只读的：没有 label、没有 mask、没有几何面板，永远不能标注也不会保存。</li>
 <li>平滑度滑块会实时重新着色。可以下载为 <code>&lt;case&gt;_perfusion.png</code> — 那是浏览器下载，不是数据集里的文件。</li>
+</ul></div>
+<div class="doc-sec"><h4>数据集命名规范(硬约束,生成脚本/agent 必须遵守)</h4><ul>
+<li>病例文件夹:<code>s_&lt;数字&gt;</code>(或任意 <code>&lt;前缀&gt;_&lt;数字&gt;</code>,尾部数字决定排序)。帧文件夹:<code>f_&lt;数字&gt;</code>,外加可选的字面名 <code>minip</code>。</li>
+<li><b>帧文件夹名绝不能以 <code>#&lt;数字&gt;</code> 结尾</b>(如 <code>f_3#1</code>):程序内部用 <code>病例/帧#图层号</code> 作为图层键,这种名字会与相邻帧的图层桶撞车,导致两帧的标注串在一起。</li>
+<li><code>classes.json</code> 的类别编号必须 <b>&ge; 1</b>。编号 0 会被拒绝加载(0 是涂抹层的「未涂」值)。</li>
+<li>同一帧的所有文件必须同一 <code>H×W</code>:<code>frames.png</code>、<code>label.npy</code>(<code>&lt;u2</code>)、可选 <code>mask.npy</code>(<code>|u1</code>)。尺寸不符但可解析的 mask 会让该帧变成只读占位。</li>
 </ul></div>
 <div class="doc-sec"><h4>会「静默失败」的三件事 — 生成数据前务必读</h4>
 <p class="doc-p">大部分格式错误都会给出可见的提示。下面三种<b>不会</b>：</p>

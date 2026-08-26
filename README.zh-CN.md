@@ -102,6 +102,18 @@
 
 ---
 
+### 7. 保存、冲突与恢复
+
+- **保存 `s_N`** 只写当前病例;**全部保存**是收工前的整体落盘,带进度框和取消
+  (按钮上带全局未保存计数)。自动保存默认开启,每次修改约 1 秒后写当前帧。
+- 若某帧磁盘上的文件**更新且内容不同**(同事保存过、从别的机器拷来),程序不会
+  覆盖任何一方:打开该帧会弹出**双缩略图对比**,由你选择保留文件夹版本还是本次
+  会话版本;落选的一方总会先存进备份文件。
+- 文件里含本程序版本读不懂的内容(更高的 `schema_version`、陌生的涂抹编码)时,
+  该帧变为**只读**并提供可复制的诊断信息,而不是被静默改写。
+- 帧文件夹里的备份/救援文件会以横幅加「查看」按钮的形式出现:对比后**以交换方式
+  恢复**——任何选择都不会销毁内容。
+
 ## 你的标注存在哪
 
 所有内容都写在**你的数据文件夹里**,逐帧保存:
@@ -277,12 +289,20 @@ note.json
   this id so two datasets that both use case_1/frame_0 never bleed together. Safe
   to delete (resets browser state only) and safe to omit from an archive.
 
-RECOVERY FILES -- written only when something is wrong, never read back:
-  annotation.json.corrupt / classes.json.corrupt -- an unparseable file is copied
-    here ONCE before anything overwrites it.
-  annotation.unsaved-backup.json / note.unsaved-backup.json -- if the browser
-    holds unsaved edits and the file on disk turns out to be NEWER, the edits go
-    here rather than being dropped or overwriting the newer file.
+RECOVERY FILES -- written only when something needs protecting; the app can
+show and RESTORE them from the UI (opening the frame offers a "View" banner;
+restoring is a swap, nothing is destroyed):
+  annotation.json.corrupt / note.json.corrupt / classes.json.corrupt -- an
+    unparseable file is copied here ONCE before anything overwrites it.
+  annotation.unsaved-backup.json / note.unsaved-backup.json -- the session's
+    side of a resolved conflict (you kept the folder's version).
+  annotation.external-backup.json / note.external-backup.json -- the folder's
+    side of a resolved conflict (you kept the session's version).
+CONFLICTS: a file on disk NEWER than the session's copy and different in
+content is never auto-resolved -- the frame goes write-protected and opening
+it shows a two-thumbnail chooser. A file with a schema_version above the app's
+own, or an unknown paint.encoding, makes the frame READ-ONLY (never blindly
+rewritten by an older app).
 
 ========================================
 HOW TO PREPARE A DATASET -- STEP BY STEP
@@ -438,6 +458,9 @@ CHECKLIST
 [ ] (label > 0) equals mask.npy pixel for pixel.
 [ ] geometry.json keys equal the label.npy ids, as strings; values are objects of
     numeric metrics; "filter" names a metric that exists.
+[ ] NO frame folder name ends in "#" + digits (e.g. f_3#1 is FORBIDDEN: the tool
+    keys per-layer content as case/frame#layerId and such a name cross-wires
+    annotations between frames). Class indices in classes.json are all >= 1.
 [ ] Case and unit folder names contain a number; a unit named exactly "minip" is
     allowed and sorts last.
 [ ] classes.json ships WITH the data and declares every class index used.
