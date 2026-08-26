@@ -215,7 +215,7 @@
       perfCache.clear(); perfInflight.clear();
       corruptUnits.clear(); corruptBackedUp.clear();
       sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
-      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear();
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear(); rescueFound.clear();
       retryQ.clear(); if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }   // pending retries belong to the dataset we just closed (State for it is wiped below): they can never be written
       window.Loupe.reset(); ci = 0; ui = 0; buildCaseOptions();
       // adaptive LRU capacity: count-based first, tightened by real frame bytes as they load
@@ -634,6 +634,7 @@
       const badPaint = State.getLayers(c.id, u.id).some(ly => { const p = State.readLayer(c.id, u.id, ly.id).paint; return p && p.width && p.height && (p.width !== data.W || p.height !== data.H); });
       if (badPaint) setBanner('paintSizeBad', { id: u.id }, 'warn');
     }
+    checkRescueFiles(c, u);   // non-blocking: if rescue files exist, a banner with [View] appears once the listing lands (it defers to conflicts and critical warnings)
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
     schedulePrefetch();       // warm the rest of this sequence + the next two (bounded, cold-tier, cancellable)
     return true;
@@ -1958,6 +1959,133 @@
     }
   }
 
+  // ---- rescue-file recovery entry (user's option A) ------------------------------------------------
+  // The app writes rescue copies in several situations (conflict resolutions, corrupt-file protection):
+  // annotation/note .unsaved-backup.json, annotation/note .external-backup.json, annotation.json.corrupt.
+  // They used to be write-only — no UI could see or restore them. Now: opening a frame kicks off a
+  // non-blocking folder listing; if rescue files exist, a banner with a [View] action opens a chooser in
+  // the conflict-dialog style (thumbnail + summary per file, tabs when several). RESTORING IS A SWAP:
+  // the version being replaced is written into the same rescue file first, so no choice ever destroys
+  // anything — the files trade places, and reopening the frame offers the trade back.
+  const RESCUE_NAMES = ['annotation.unsaved-backup.json', 'note.unsaved-backup.json',
+    'annotation.external-backup.json', 'note.external-backup.json', 'annotation.json.corrupt'];
+  const rescueFound = new Map();   // State.key() -> [names present at last check] (session cache)
+  let rescueShownFor = null, rescueFiles = [], rescueSel = 0;
+  async function checkRescueFiles(c, u) {
+    const k = State.key(c.id, u.id), tok = dsToken;
+    try {
+      const names = [];
+      for await (const [name, h] of u.handle.entries()) if (h.kind === 'file' && RESCUE_NAMES.indexOf(name) >= 0) names.push(name);
+      names.sort((a, b) => RESCUE_NAMES.indexOf(a) - RESCUE_NAMES.indexOf(b));
+      if (tok !== dsToken) return;
+      rescueFound.set(k, names);
+      if (!names.length) return;
+      if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;        // navigated away while listing
+      if (conflictedUnits.has(k)) return;                                  // the conflict chooser owns the banner slot first
+      if (lastBanner && bannerPrio(lastBanner.key, lastBanner.kind) === 2) return;   // never displace a critical warning
+      setBanner('rescueFoundFmt', { n: names.length }, null);
+      const b = $('banner'), act = document.createElement('span');
+      act.className = 'banner-act'; act.textContent = I18n.t('rescueViewBtn');
+      act.onclick = () => openRescueDialog(k);
+      b.appendChild(act);
+    } catch (e) { /* listing is best-effort — a transient failure must never disturb annotating */ }
+  }
+  async function openRescueDialog(k) {
+    if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;
+    const c = cur.caseId, unit = cur.unit;
+    const names = rescueFound.get(k) || [];
+    if (!names.length) return;
+    rescueFiles = [];
+    for (const name of names) {
+      try {
+        const fh = await unit.handle.getFileHandle(name);
+        const txt = await (await fh.getFile()).text();
+        let parsed = null; try { parsed = JSON.parse(txt); } catch (e) { }
+        rescueFiles.push({ name, bytes: txt.length, parsed, isNote: name.indexOf('note.') === 0 });
+      } catch (e) { }
+    }
+    if (!cur || State.key(cur.caseId, cur.unitId) !== k || !rescueFiles.length) return;
+    rescueShownFor = k; rescueSel = 0;
+    $('rescueTitle').textContent = I18n.t('rescueTitleFmt', { id: cur.unitId });
+    renderRescueTabs();
+    renderRescueCompare();
+    $('rescueModal').classList.remove('hidden');
+  }
+  function renderRescueTabs() {
+    const tabs = $('rescueTabs'); tabs.innerHTML = '';
+    rescueFiles.forEach((f, i) => {
+      const t = document.createElement('button');
+      t.className = 'rescue-tab' + (i === rescueSel ? ' active' : '');
+      t.textContent = f.name;
+      t.onclick = () => { rescueSel = i; renderRescueTabs(); renderRescueCompare(); };
+      tabs.appendChild(t);
+    });
+    if (rescueFiles.length <= 1) tabs.classList.add('hidden'); else tabs.classList.remove('hidden');
+  }
+  function marksFromNoteJson(n) {   // note.json shape -> overlay marks (markers as red dots) + text
+    const out = { segs: new Set(), pts: [], paintRles: [], starred: false, note: '' };
+    if (!n || typeof n !== 'object') return out;
+    out.note = typeof n.text === 'string' ? n.text : '';
+    const order = n.coord_order === 'yx' ? 'yx' : 'xy';
+    if (Array.isArray(n.markers)) for (const m of n.markers)
+      if (m && Array.isArray(m.click) && m.click.length === 2) out.pts.push(order === 'xy' ? [m.click[0], m.click[1]] : [m.click[1], m.click[0]]);
+    return out;
+  }
+  function renderRescueCompare() {
+    const f = rescueFiles[rescueSel]; if (!f || !cur) return;
+    const data = cacheTouch(State.key(cur.caseId, cur.unitId)); if (!data) return;
+    const cm = f.isNote ? marksFromNoteJson(State.buildNote(cur.caseId, cur.unitId)) : marksFromLocal(cur.caseId, cur.unitId);
+    const cp = paintPx(cm.paintRles, data.W, data.H);
+    renderConflictThumb($('rescueThumbCur'), data, cm, cp.mask);
+    $('rescueSumCur').textContent = conflictSummary(cm, cp.n, State.getEditedAt(cur.caseId, cur.unitId));
+    if (f.parsed) {
+      const bm = f.isNote ? marksFromNoteJson(f.parsed) : marksFromAnn(f.parsed);
+      const bp = paintPx(bm.paintRles, data.W, data.H);
+      renderConflictThumb($('rescueThumbBak'), data, bm, bp.mask);
+      $('rescueSumBak').textContent = conflictSummary(bm, bp.n, 0);
+      $('btnRescueRestore').classList.remove('hidden');
+    } else {
+      try { const g = $('rescueThumbBak').getContext('2d'); $('rescueThumbBak').width = 230; $('rescueThumbBak').height = 60; g.clearRect(0, 0, 230, 60); } catch (e) { }
+      $('rescueSumBak').textContent = I18n.t('rescueUnparsableFmt', { bytes: f.bytes });
+      $('btnRescueRestore').classList.add('hidden');   // .corrupt that still does not parse: information only
+    }
+  }
+  function hideRescueDialog() { $('rescueModal').classList.add('hidden'); rescueShownFor = null; }
+  // THE SWAP: current version -> the rescue file's own name; rescue content -> the live State (+ auto-save).
+  async function restoreRescue() {
+    const f = rescueFiles[rescueSel];
+    if (!f || !f.parsed || !cur || rescueShownFor !== State.key(cur.caseId, cur.unitId)) return;
+    const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u), tok = dsToken;
+    const data = cacheTouch(k); if (!data) return;
+    try {
+      if (f.isNote) {
+        await FS.writeText(unit.handle, f.name, JSON.stringify(State.buildNote(c, u), null, 2));
+        if (tok !== dsToken) return;
+        for (const m of State.markerList(c, u)) State.removeMarker(c, u, m.id);   // clear, then adopt (importNoteJson only fills empty)
+        State.setNote(c, u, '');
+        State.importNoteJson(c, u, f.parsed);
+        if (typeof f.parsed.text === 'string') State.setNote(c, u, f.parsed.text);
+        $('note').value = State.getNote(c, u);
+        refreshMarkers(); buildMarkerChips();
+      } else {
+        await FS.writeText(unit.handle, f.name, JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
+        if (tok !== dsToken) return;
+        const keepNote = State.buildNote(c, u);                                   // annotation restore must not touch the note
+        State.resetUnit(c, u);
+        try { State.importAnnotation(c, u, f.parsed); } catch (e) { }
+        State.importNoteJson(c, u, keepNote);
+        if (typeof keepNote.text === 'string') State.setNote(c, u, keepNote.text);
+        view.setPaint(State.paintDense(c, u, cur.W, cur.H));
+        refreshCanvasSelection(); refreshMeta(); refreshMarkers(); buildLayerBar();
+        $('note').value = State.getNote(c, u);
+      }
+      State.markDirty(c, u);
+      highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
+      hideRescueDialog();
+      setBanner('rescueRestoredFmt', { file: f.name }, 'ok');
+    } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); }
+  }
+
   // ---- explicit save: two scopes sharing one engine ------------------------------------------------
   // "Save case" writes the case being annotated now; "Save all" is the end-of-day full write. Both run
   // through runSave(), which shows a progress modal (total is known up front, so the doctor can see how
@@ -2326,6 +2454,8 @@
     $('btnConflictDisk').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'disk'); };
     $('btnConflictLocal').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'local'); };
     $('btnConflictLater').onclick = hideConflictDialog;   // unresolved: frame stays dirty + protected; reopening the frame asks again
+    $('btnRescueRestore').onclick = restoreRescue;
+    $('btnRescueClose').onclick = hideRescueDialog;
     $('btnSaveClose').onclick = () => $('saveModal').classList.add('hidden');
     updateSaveButtons();
     $('btnUndo').onclick = undo;
@@ -2433,6 +2563,7 @@
     window.addEventListener('keydown', e => {
       if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
+      if (e.key === 'Escape' && !$('rescueModal').classList.contains('hidden')) { hideRescueDialog(); return; }
       if (e.key === 'Escape' && !$('conflictModal').classList.contains('hidden')) { hideConflictDialog(); return; }   // = "decide later"
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       // While ANY full-screen overlay is up, swallow every other hotkey. #confirmClear was already
