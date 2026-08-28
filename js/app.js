@@ -1422,7 +1422,14 @@
     if (State.getPerfMask() && curCase()) ensureMinipMask(curCase());
     repaintPerfusionNow();   // discrete toggle: repaint immediately, never queued behind a paused rAF
   }
-  async function saveNote() {   // saves the whole current frame (annotation + note) so the dirty flag stays honest
+  // Saves the whole current frame (annotation + note) so the dirty flag stays honest.
+  // REVIEW FIX R1: this used to be its OWN write path — FS.writeText with no conflictedUnits check, no
+  // M4 mtime check, no note.json.corrupt backup, and it advanced ownWriteAt/lastSeenMtime afterwards,
+  // erasing the evidence a conflict detector needs. A colleague's newer annotation.json was one
+  // "Save notes" click away from silent, unrecoverable overwrite. It now goes through writeUnit — the
+  // ONE write path that carries every guard (conflict, protection, mtime, corrupt backups, per-unit
+  // serialisation, retry) — and reports honestly when the write was refused as a conflict.
+  async function saveNote() {
     if (!cur || cur.virtual || cur.mismatch || cur.protected) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     // The handle MUST come from the unit captured atomically in `cur`. curUnit() resolves ci/ui, which
@@ -1430,17 +1437,18 @@
     // saveNote then wrote THIS frame's annotation.json and note.json into the NEXT frame's folder.
     const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u);
     if (!sessionLoaded.has(k)) { setBanner('frameNotSeeded', { id: u }, 'warn'); return; }   // same rule as writeUnit: never overwrite an annotation.json this session could not read
+    if (conflictedUnits.has(k)) { setBanner('conflictFoundFmt', { id: u }, 'warn'); showConflictDialog(k); return; }   // unresolved conflict: choosing comes first, no write may touch the file
     State.setNote(c, u, $('note').value);
     try {
-      const seq = State.getDirtySeq(c, u);                    // an edit landing during the writes below must stay dirty (same guard as writeUnit)
-      const data = cache.get(k) || await Loader.loadUnit(unit);
-      await backupCorruptOnce(k, unit);                       // preserve an unparseable annotation.json before overwriting it
-      await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
-      await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(c, u), null, 2));
-      corruptUnits.delete(k);                                 // the file on disk is valid JSON again
-      const fileMs = (await annFileMtime(unit)) || Date.now();
-      ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(c, u, fileMs);
-      State.markClean(c, u, seq, fileMs); updateDirtyUI();
+      setSaveStatus('saving');
+      await writeUnit(c, unit);
+      if (conflictedUnits.has(k)) {                           // the write itself found a NEWER file on disk and refused
+        setSaveStatus(null);                                  // the frame is NOT saved — never claim it is
+        setBanner('conflictFoundFmt', { id: u }, 'warn');
+        showConflictDialog(k);
+        return;
+      }
+      updateDirtyUI();
       setSaveStatus('noteSaved', { time: hhmm() });
     } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
   }
