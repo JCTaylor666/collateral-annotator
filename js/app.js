@@ -1495,7 +1495,12 @@
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
     if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
-      try { setSaveStatus('saving'); await writeUnit(c.id, u); setSavedStatus(); updateDirtyUI(); }
+      try {
+        setSaveStatus('saving'); await writeUnit(c.id, u); updateDirtyUI();
+        if (conflictedUnits.has(State.key(c.id, u.id))) {   // REVIEW FIX CONF-4: refused, not saved
+          setSaveStatus(null); setBanner('conflictFoundFmt', { id: u.id }, 'warn');
+        } else setSavedStatus();
+      }
       catch (e) { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: u.id }, 'warn'); }
     }
   }
@@ -2226,7 +2231,10 @@
     if (failed) { saveModalFinish(I18n.t('saveDonePartialFmt', { n, failed })); setBanner('savedPartial', { n, failed }, 'warn'); }
     else if (skippedConflicts) { saveModalFinish(I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts })); setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn'); }
     else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner(null); setBanner('savedAllFmt', { n }, 'ok'); }   // a clean full save retires any stale critical warning first — every frame just reached disk
-    if (skippedConflicts) setSaveStatus(null); else setSavedStatus();   // conflicted frames are still unsaved — the header must not say Saved
+    // REVIEW FIX SE-4: `failed` used to fall through to setSavedStatus(). Those failures come from
+    // ensureSeeded returning 'unreadable' (app.js:2210), which does NOT queue a retry — so retryQ is empty
+    // and setSavedStatus happily printed "Saved HH:MM" right after a Save-all that left frames unwritten.
+    if (failed || skippedConflicts) setSaveStatus(null); else setSavedStatus();   // anything unwritten — the header must not say Saved
   }
   function save() { return runSave(null); }
   function saveCase() { if (cur && !cur.virtual) return runSave(cur.caseId); }
@@ -2256,25 +2264,33 @@
     setSaveStatus('pendingSave');
   }
   function flushAutoSave() { if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; return runAutoSave(); } }   // returns the write promise so callers that must not race it can await
-  async function backupCorruptOnce(k, unit) {   // copy an unparseable annotation.json to .corrupt exactly once before we overwrite it
-    if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return;
-    corruptBackedUp.add(k);
+  // Copy an unparseable (or lossy) annotation.json to .corrupt exactly once before we overwrite it.
+  // REVIEW FIX SE-2: the latch used to be set BEFORE the copy and the failure was swallowed ("best effort"),
+  // so one transient read/write error destroyed the original — the very next line overwrites annotation.json —
+  // and because the latch was already down the copy was NEVER retried. backupClassesOnce (1300 lines up) had
+  // the right shape all along: latch only after a successful copy, and the caller refuses to overwrite when
+  // the backup failed. Returns TRUE when it is safe to overwrite.
+  async function backupCorruptOnce(k, unit) {
+    if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return true;
     try {
       const fh = await unit.handle.getFileHandle('annotation.json');
       await FS.writeText(unit.handle, 'annotation.json.corrupt', await (await fh.getFile()).text());
-    } catch (e) { /* best effort — never block the real write */ }
+      corruptBackedUp.add(k);
+      return true;
+    } catch (e) { return false; }   // never destroy what we could not back up
   }
   // A2: a note.json that exists but does not parse is preserved as note.json.corrupt exactly once
   // before any write replaces it — the same protection annotation.json has had since P0.
   const noteCorruptUnits = new Set(), noteCorruptBackedUp = new Set();
-  async function backupNoteCorruptOnce(k, unit) {
-    if (!noteCorruptUnits.has(k) || noteCorruptBackedUp.has(k)) return;
-    noteCorruptBackedUp.add(k);
+  async function backupNoteCorruptOnce(k, unit) {   // same contract as backupCorruptOnce (REVIEW FIX SE-2)
+    if (!noteCorruptUnits.has(k) || noteCorruptBackedUp.has(k)) return true;
     try {
       const fh = await unit.handle.getFileHandle('note.json');
       await FS.writeText(unit.handle, 'note.json.corrupt', await (await fh.getFile()).text());
+      noteCorruptBackedUp.add(k);
       setBanner('noteCorruptBackedUp', { id: unit.id }, 'warn');
-    } catch (e) { /* best effort — never block the real write */ }
+      return true;
+    } catch (e) { return false; }
   }
   // ---- failed writes: retry queue ------------------------------------------------------------------
   // Today a failed write is NEVER retried: the frame stays dirty, the accurate "write FAILED" banner is
@@ -2301,8 +2317,11 @@
     if (retryTimer) return;                    // one timer for the whole queue — the earliest due entry drives it
     retryTimer = setTimeout(() => { retryTimer = null; runRetries(); }, ms);
   }
+  // A write that returns because the frame is CONFLICTED (or read-only) resolves its promise like a
+  // success. REVIEW FIX CONF-4: every caller must re-check conflictedUnits before claiming "Saved" —
+  // runAutoSave and saveNote already did; the retry queue, the star and cross-frame undo did not.
   async function runRetries() {
-    let recovered = false;
+    let recovered = false, conflicted = null;
     for (const e of [...retryQ.values()]) {
       const k = State.key(e.caseId, e.unit.id);
       if (e.tok !== dsToken) { retryQ.delete(k); continue; }                          // queued against a dataset that is no longer open
@@ -2310,14 +2329,24 @@
       if (!c || !State.isDirty(e.caseId, e.unit.id)) { retryQ.delete(k); continue; }  // gone, or a later write already carried this unit to disk
       let st; try { st = await ensureSeeded(c, e.unit); } catch (err) { st = 'unreadable'; }
       if (st !== 'seeded' && st !== 'already') { retryLater(e.caseId, e.unit, e.tok, null); continue; }   // still cannot verify the file: count it as one more attempt
-      try { await writeUnit(e.caseId, e.unit); retryQ.delete(k); recovered = true; }
+      try {
+        await writeUnit(e.caseId, e.unit);
+        retryQ.delete(k);
+        if (conflictedUnits.has(k)) { if (!conflicted) conflicted = e.unit.id; }   // REFUSED, not recovered
+        else recovered = true;
+      }
       catch (err) { }                          // writeUnit's own hook has already re-queued (or dropped) it
     }
     if (retryQ.size) { setSaveStatus('retryPending', { n: retryQ.size }, true); armRetry(RETRY_DELAYS[RETRY_DELAYS.length - 1]); }
+    else if (conflicted) {                     // the retry found a NEWER file and refused: nothing was written
+      setSaveStatus(null);                     // never claim Saved
+      setBanner('conflictFoundFmt', { id: conflicted }, 'warn');
+    }
     else if (recovered) {
       if (lastBanner && lastBanner.key === 'writeFailedBanner') setBanner(null);      // it did reach the disk after all — that warning is no longer true
       setSaveStatus('saved', { time: hhmm() });
     }
+    else if (lastSaveStatus && lastSaveStatus.key === 'retryPending') setSaveStatus(null);   // REVIEW FIX SE-5: the queue drained without a recovery — don't freeze a red "retrying" line
     updateDirtyUI();
   }
   // "Saved HH:MM" must never be claimed while a write is still waiting to be retried.
@@ -2382,18 +2411,35 @@
       conflictedUnits.set(k, null);                   // parsed lazily when the chooser opens
       return;
     }
-    await backupCorruptOnce(k, unit);
+    // REVIEW FIX SE-2/SE-1: BOTH sidecar backups happen BEFORE either file is written. A failed backup
+    // throws — the unit stays dirty, lands in the retry queue and raises the write-failure banner — instead
+    // of the old "swallow it and overwrite anyway". Doing them up front also removes the half-written state
+    // where annotation.json landed and note.json's backup then refused.
+    const needNote = State.hasNoteData(caseId, unit.id);
+    if (!(await backupCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up');
+    if (tok !== dsToken) return;
+    if (needNote && !(await backupNoteCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt note.json could not be backed up');
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
-    if (State.hasNoteData(caseId, unit.id)) {
-      await backupNoteCorruptOnce(k, unit);           // A2: the unreadable original goes to note.json.corrupt first
+    if (needNote) {
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
       noteCorruptUnits.delete(k);                     // the file on disk is valid JSON again
     }
     corruptUnits.delete(k);   // the file on disk is valid JSON again
     const fileMs = (await annFileMtime(unit)) || Date.now();   // the FILE's own clock, not ours
-    if (tok === dsToken) { ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs); }   // a reconcile must never mistake OUR write for an externally-newer file — this session OR after a reload (and a cross-open write must not pollute the new dataset's maps)
-    State.markClean(caseId, unit.id, seq, fileMs);
+    // A reconcile must never mistake OUR write for an externally-newer file — this session OR after a
+    // reload — and a cross-open write must not pollute the NEW dataset's maps.
+    // REVIEW FIX R2: markClean used to sit OUTSIDE this guard. Since v61 it also writes the PERSISTED
+    // writtenAt, and since v65 the incoming dataset can hold PARKED dirty records — while switchDataset
+    // wipes every per-unit map except dirtySeq, so the seq guard passes across datasets. A write still in
+    // flight when the doctor opened another folder therefore cleared the new dataset's same-named frame:
+    // dirty flag gone, its fat mirror record rewritten skinny (the unsaved content dropped out of the crash
+    // net), writtenAt stamped with the OLD dataset's file mtime — which then feeds ownWriteMs into the M4
+    // conflict check. Reproduced end to end: after a crash-reload the parked note came back as "".
+    if (tok === dsToken) {
+      ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs);
+      State.markClean(caseId, unit.id, seq, fileMs);
+    }
   }
   async function runAutoSave() {
     saveTimer = null;
@@ -2462,8 +2508,12 @@
       const oc = cases.find(c => c.id === e.c), ou = oc && oc.units.find(u => u.id === e.u);
       if (ou && rootHandle && State.getAutoSave()) {
         setSaveStatus('saving');
-        writeUnit(e.c, ou).then(() => { setSavedStatus(); updateDirtyUI(); })
-          .catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
+        writeUnit(e.c, ou).then(() => {
+          updateDirtyUI();
+          if (conflictedUnits.has(State.key(e.c, e.u))) {   // REVIEW FIX CONF-4: refused, not saved
+            setSaveStatus(null); setBanner('conflictFoundFmt', { id: e.u }, 'warn');
+          } else setSavedStatus();
+        }).catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
       }
       return;
     }

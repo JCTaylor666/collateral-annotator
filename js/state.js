@@ -131,7 +131,11 @@
         try {
           if (rec) localStorage.setItem(kk, JSON.stringify(rec)); else localStorage.removeItem(kk);
           staleUnits.delete(k);
-        } catch (e) { ok = false; break; }   // quota/blocked: keep this and the rest stale — a later persist retries
+        } catch (e) { ok = false; }   // REVIEW FIX SP-1: this used to `break`. staleUnits is a Set iterated in
+        // INSERTION order and the failing key is never deleted, so one record too big for the quota sat at the
+        // head forever and every later persist — the 400 ms throttle, markClean/noteWritten's immediate write,
+        // and the beforeunload/pagehide flush — broke on it again and wrote NOTHING for any other frame. The
+        // crash mirror died wholesale from one oversized frame. Keep that record stale and carry on with the rest.
       }
     } else staleUnits.clear();               // no dataset open yet: per-unit state cannot exist, only prefs
     if (metaStale) {
