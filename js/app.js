@@ -170,6 +170,29 @@
     b.className = cls;
     if (view && $('view').clientHeight !== h0) onResize();
   }
+  // Attach an action link to whatever the banner is CURRENTLY showing, raising our own message only when
+  // the slot is free.
+  // REVIEW FIX R11/R8/B7 — three defects with one root: the rescue notice used to REPLACE the banner.
+  //   R11: showUnit sets the frame's own data warning synchronously (maskBad / annCorrupt / paintSizeBad /
+  //        annUnreadable / annLayersDropped, all priority 1) and the folder listing lands ~300 ms later;
+  //        the old gate only refused priority 2, so the same-priority rescue notice ate that warning and
+  //        it never came back — the doctor kept painting with "foreground only" that silently did nothing.
+  //   R8:  on a read-only frame the priority-2 banner made the gate drop the notice entirely, so the
+  //        [View] span — the ONLY entry to the rescue chooser — could never appear on exactly the frames
+  //        whose backups matter most.
+  //   B7:  the action span was appended AFTER setBanner's height check, so a span that wrapped the banner
+  //        onto a second line changed the canvas height with no re-layout — every click then resolved to
+  //        an image row above the cursor. Re-check the height here.
+  function bannerAddAction(labelKey, onClick) {
+    const b = $('banner');
+    const h0 = view ? $('view').clientHeight : 0;
+    const act = document.createElement('span');
+    act.className = 'banner-act'; act.textContent = I18n.t(labelKey);
+    act.onclick = onClick;
+    b.appendChild(act);
+    if (view && $('view').clientHeight !== h0) onResize();
+    return act;
+  }
   // Per-unit warnings (shape mismatch / corrupt annotation / broken mask) describe ONE frame — they
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
@@ -662,16 +685,15 @@
     exitMarkerArm(); refreshMarkers();
     view.layout(); view.render(); updateZoomReadout();
     refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
-    $('note').value = State.getNote(c.id, u.id); $('note').disabled = false;
+    // REVIEW FIX F6: the box used to stay enabled on a read-only frame while onNoteInput dropped every
+    // keystroke — the doctor typed a paragraph of findings, navigated away and it was gone with no warning.
+    $('note').value = State.getNote(c.id, u.id); $('note').disabled = !!cur.protected;
     updateDirtyUI(); updateCopyBtn();
     if (conflictedUnits.has(State.key(c.id, u.id))) showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
     else if (cur.protected) {                                  // A1: read-only frame — say why, and offer a copyable diagnostic for an agent
       const k2 = State.key(c.id, u.id);
       setBanner('protectedFrameFmt', { id: u.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
-      const b2 = $('banner'), act2 = document.createElement('span');
-      act2.className = 'banner-act'; act2.textContent = I18n.t('copyDiagBtn');
-      act2.onclick = async () => { if (await copyProtectedDiag(k2)) act2.textContent = I18n.t('copyDiagDone'); };
-      b2.appendChild(act2);
+      const act2 = bannerAddAction('copyDiagBtn', async () => { if (await copyProtectedDiag(k2)) act2.textContent = I18n.t('copyDiagDone'); });
     }
     else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
@@ -708,7 +730,7 @@
     exitMarkerArm();
     paintPerfIntoView(perf);
     maybeWarnPerfMask(c);                                   // filter ON but minip mask known-unavailable for this case
-    refreshMeta(); buildFrameList(); buildLayerBar();
+    refreshMeta(); buildFrameList(); buildLayerBar(); buildMarkerChips();   // AEP-3: drop the previous frame's × buttons
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
     if (inspect) { stripSig = ''; preloadCase(); scheduleLoupe(); }
@@ -746,7 +768,7 @@
     if (inspect) exitInspect();                              // a placeholder frame has no valid image for the loupe
     exitMarkerArm();
     view.layout(); view.render(); updateZoomReadout();
-    refreshMeta(); buildFrameList(); buildLayerBar();
+    refreshMeta(); buildFrameList(); buildLayerBar(); buildMarkerChips();   // AEP-3: drop the previous frame's × buttons
     $('note').value = ''; $('note').disabled = true;
     updateDirtyUI(); updateCopyBtn();
     setBanner('shapeMismatchBanner', { id: u.id }, 'warn');
@@ -1258,6 +1280,10 @@
     if (!src.virtual && !src.mismatch) {                             // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
       const st = await ensureSeeded(c, src);
       if (st !== 'seeded' && st !== 'already') { setBanner('frameNotSeeded', { id: src.id }, 'warn'); return; }   // we could not read the source: say so instead of copying "nothing"
+      // REVIEW FIX F5: copying FROM a read-only frame was never refused. Its State is empty (or half
+      // imported), so the doctor got "has no annotations to copy" — a lie about a fully annotated file —
+      // and an unknown paint encoding would have been decoded as v1 straight into the writable target.
+      if (protectedUnits.has(State.key(c.id, src.id))) { setBanner('copyFromProtected', { id: src.id }, 'warn'); return; }
     }
     if (!cur || copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started: say so, don't silently no-op
     doCopyFrom(c.id, src);
@@ -1333,12 +1359,19 @@
   function buildMarkerChips() {
     const box = $('markerChips'); if (!box) return;
     box.innerHTML = '';
-    if (!cur) return;
+    // REVIEW FIX AEP-3/SG-1: showPerfusionUnit / showMismatchUnit never rebuilt the chips, so the PREVIOUS
+    // frame's × buttons stayed live over a view-only unit and clicking one dirtied it. They call this now,
+    // and a view-only unit renders no chips at all.
+    if (!cur || cur.virtual || cur.mismatch) return;
     for (const m of State.markerList(cur.caseId, cur.unitId)) {
       const chip = document.createElement('span'); chip.className = 'mk-chip';
       const dot = document.createElement('span'); dot.className = 'mk-dot'; dot.textContent = m.id;
       const x = document.createElement('span'); x.className = 'mk-x'; x.textContent = '×'; x.title = I18n.t('markerDelete');
       x.onclick = () => {
+        // REVIEW FIX R6/F2: this was the ONE edit entry point with no guard. On a read-only frame it
+        // removed the marker from State while every writer refused the file, so the panel and the disk
+        // disagreed and the frame stayed unsaved forever. (placeMarker/enterMarkerArm were guarded.)
+        if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
         State.removeMarker(cur.caseId, cur.unitId, m.id);
         view.setMarkerHighlight(0);
         State.markDirty(cur.caseId, cur.unitId);
@@ -1482,7 +1515,6 @@
     const c = cases.find(x => x.id === caseId), u = c && c.units.find(x => x.id === unitId);
     if (!c || !u) return;                  // the row belongs to a case/unit that is no longer part of this dataset
     if (u.virtual || u.mismatch) return;   // view-only units can't be starred (no file to persist it to)
-    if (protectedUnits.has(State.key(caseId, unitId))) return;   // A1: read-only frame — the star lives in annotation.json
     // CRITICAL guard: this frame may never have been seeded this session (fresh browser + background scan
     // hasn't reached it) — starring would then autosave an EMPTY annotation over its real file. Seed first,
     // and honour the contract: only 'seeded'/'already' mean State matches the file on disk.
@@ -1491,6 +1523,11 @@
       if (st === 'unreadable') setBanner('frameNotSeeded', { id: u.id }, 'warn');
       return;
     }
+    // REVIEW FIX R5: the protectedUnits check used to sit BEFORE ensureSeeded, so a frame the background
+    // scan had not reached yet was never in the set when it was tested — evalImportProtection only runs
+    // during the seed. The star went into State and the frame list lit ★ while writeUnit silently refused,
+    // leaving "Saved" on screen, nothing on disk and a permanently unsaved frame. Test it AFTER the seed.
+    if (protectedUnits.has(State.key(caseId, unitId))) { setBanner('protectedFrameFmt', { id: u.id, what: (protectedUnits.get(State.key(caseId, unitId)) || {}).what || '?' }, 'warn'); return; }
     State.setStarred(c.id, u.id, !State.isStarred(c.id, u.id));
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
@@ -1997,6 +2034,16 @@
       try { if (r.ann) State.importAnnotation(cc, uu, r.ann); if (r.note) State.importNoteJson(cc, uu, r.note); } catch (e) { }
       State.markClean(cc, uu, undefined, r.annMtime);
       lastSeenMtime.set(k, r.annMtime || 0);
+      // REVIEW FIX F8: evalImportProtection runs only at seed/loadCur/scan time, and the lastSeenMtime we
+      // just set makes loadCur take its `unchanged` fast path — so a frame whose file has since been FIXED
+      // stayed locked read-only forever. Re-evaluate against the version we just adopted.
+      // …but ONLY when we actually adopted a readable file. r.ann === null means the folder copy is
+      // corrupt / newer-schema / unreadable — clearing the flag there would UNLOCK a frame we still
+      // cannot read (and the frame is now empty, which is L1's separate problem).
+      if (r.ann) {
+        evalImportProtection(cRef, unit, r.ann, 0);
+        if (cur && cur.caseId === cc && cur.unitId === uu) cur.protected = protectedUnits.has(k);
+      }
       conflictedUnits.delete(k);
       hideConflictDialog();
       if (cur && cur.caseId === cc && cur.unitId === uu) {                 // repaint the frame with the adopted version
@@ -2017,8 +2064,15 @@
       hideConflictDialog();
       try { await writeUnit(cc, unit); } catch (e) { }         // failures land in the retry queue like any write
       highlightNav(); updateDirtyUI();
-      setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', null, 'ok');
-      if (!retryQ.size) setSavedStatus();
+      // REVIEW FIX CD-3/F3: on a read-only frame writeUnit returns without writing, so "Kept this
+      // session's version." + "Saved" were both false — the edits lived only in the browser mirror.
+      if (protectedUnits.has(k)) {
+        setBanner('protectedFrameFmt', { id: uu, what: (protectedUnits.get(k) || {}).what || '?' }, 'warn');
+        setSaveStatus(null);
+      } else {
+        setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', null, 'ok');
+        if (!retryQ.size) setSavedStatus();
+      }
     }
   }
 
@@ -2044,13 +2098,9 @@
       rescueFound.set(k, names);
       if (!names.length) return;
       if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;        // navigated away while listing
-      if (conflictedUnits.has(k)) return;                                  // the conflict chooser owns the banner slot first
-      if (lastBanner && bannerPrio(lastBanner.key, lastBanner.kind) === 2) return;   // never displace a critical warning
-      setBanner('rescueFoundFmt', { n: names.length }, null);
-      const b = $('banner'), act = document.createElement('span');
-      act.className = 'banner-act'; act.textContent = I18n.t('rescueViewBtn');
-      act.onclick = () => openRescueDialog(k);
-      b.appendChild(act);
+      if (conflictedUnits.has(k)) return;                                  // the conflict chooser owns the frame first
+      if (!lastBanner) setBanner('rescueFoundFmt', { n: names.length }, null);   // slot free: say why the link is there
+      bannerAddAction('rescueViewBtn', () => openRescueDialog(k));               // otherwise ride along (R11/R8)
     } catch (e) { /* listing is best-effort — a transient failure must never disturb annotating */ }
   }
   async function openRescueDialog(k) {
@@ -2115,14 +2165,36 @@
   }
   function hideRescueDialog() { $('rescueModal').classList.add('hidden'); rescueShownFor = null; }
   // THE SWAP: current version -> the rescue file's own name; rescue content -> the live State (+ auto-save).
+  // The name the DISPLACED version is written to. REVIEW FIX R4: the swap used to write straight back over
+  // the rescue file — including `.corrupt` files, whose entire value is content this build cannot represent
+  // (a duplicate/absent layer id: importAnnotation drops it, so State's rebuild is provably SHORTER than the
+  // file). Overwriting one destroyed the only copy of the dropped layer while the banner said "nothing is
+  // lost". A `.corrupt` original is never overwritten now; the displaced version goes to the .unsaved-backup
+  // sidecar instead, so both survive.
+  function rescueSwapTarget(name) {
+    if (name === 'annotation.json.corrupt') return 'annotation.unsaved-backup.json';
+    if (name === 'note.json.corrupt') return 'note.unsaved-backup.json';
+    return name;
+  }
   async function restoreRescue() {
     const f = rescueFiles[rescueSel];
     if (!f || !f.parsed || !cur || rescueShownFor !== State.key(cur.caseId, cur.unitId)) return;
     const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u), tok = dsToken;
     const data = cacheTouch(k); if (!data) return;
+    // REVIEW FIX R9/SE-3: restoreRescue was the ONE writer with no authority check. "Restoring" is a SWAP,
+    // and the version it writes into the rescue file is built from State — so when State is not authoritative
+    // for this frame (read-only/protected, or never seeded because the frame's own files could not be read)
+    // the swap wrote a provably EMPTY document over a real backup, and the content it adopted could then
+    // never reach disk because every writer refuses the frame. Both directions destroy; refuse instead.
+    if (cur.virtual || cur.mismatch || cur.protected || !sessionLoaded.has(k) || conflictedUnits.has(k)) {
+      hideRescueDialog();
+      setBanner('rescueRefusedFmt', { id: u, file: f.name }, 'warn');
+      return;
+    }
+    const swapTo = rescueSwapTarget(f.name);
     try {
       if (f.isNote) {
-        await FS.writeText(unit.handle, f.name, JSON.stringify(State.buildNote(c, u), null, 2));
+        await FS.writeText(unit.handle, swapTo, JSON.stringify(State.buildNote(c, u), null, 2));
         if (tok !== dsToken) return;
         for (const m of State.markerList(c, u)) State.removeMarker(c, u, m.id);   // clear, then adopt (importNoteJson only fills empty)
         State.setNote(c, u, '');
@@ -2131,7 +2203,7 @@
         $('note').value = State.getNote(c, u);
         refreshMarkers(); buildMarkerChips();
       } else {
-        await FS.writeText(unit.handle, f.name, JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
+        await FS.writeText(unit.handle, swapTo, JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
         if (tok !== dsToken) return;
         const keepNote = State.buildNote(c, u);                                   // annotation restore must not touch the note
         State.resetUnit(c, u);
@@ -2145,7 +2217,7 @@
       State.markDirty(c, u);
       highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
       hideRescueDialog();
-      setBanner('rescueRestoredFmt', { file: f.name }, 'ok');
+      setBanner('rescueRestoredFmt', { file: swapTo }, 'ok');   // name the file the displaced version actually went to
     } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); }
   }
 
@@ -2510,8 +2582,11 @@
         setSaveStatus('saving');
         writeUnit(e.c, ou).then(() => {
           updateDirtyUI();
-          if (conflictedUnits.has(State.key(e.c, e.u))) {   // REVIEW FIX CONF-4: refused, not saved
+          const uk = State.key(e.c, e.u);
+          if (conflictedUnits.has(uk)) {                   // REVIEW FIX CONF-4: refused, not saved
             setSaveStatus(null); setBanner('conflictFoundFmt', { id: e.u }, 'warn');
+          } else if (protectedUnits.has(uk)) {             // REVIEW FIX F7: read-only frame — also refused
+            setSaveStatus(null); setBanner('protectedFrameFmt', { id: e.u, what: (protectedUnits.get(uk) || {}).what || '?' }, 'warn');
           } else setSavedStatus();
         }).catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
       }
