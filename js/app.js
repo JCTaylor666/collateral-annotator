@@ -208,7 +208,14 @@
   async function ensureDatasetId(root) {
     const FNAME = '.annotator_dataset.json';
     let fh = null;
-    try { fh = await root.getFileHandle(FNAME); } catch (e) { /* truly absent — create one below */ }
+    // REVIEW FIX F3'/SWG-4: this catch used to swallow EVERY error as "truly absent", so one transient
+    // Drive/permission failure minted a fresh uuid and OVERWROTE the folder's real identity — orphaning
+    // its whole localStorage mirror. Only NotFoundError means absent; anything else means "it is there,
+    // we just could not look at it", and we must not create or overwrite.
+    try { fh = await root.getFileHandle(FNAME); }
+    catch (e) {
+      if (!(e && e.name === 'NotFoundError')) return 'name:' + (root.name || 'unknown');
+    }
     if (fh) {
       // File EXISTS. If it parses, use its id. If it's present-but-unreadable (corrupt, or a transient
       // Google-Drive sync glitch), return a STABLE name-based id and DON'T overwrite it with a fresh
@@ -224,14 +231,27 @@
     catch (e) { return 'name:' + (root.name || 'unknown'); }
   }
 
+  // Are these two picks literally the same directory? The ONLY authority on folder identity that the
+  // filesystem itself provides — everything else (the id file, the folder name) can be duplicated.
+  async function isSameFolder(a, b) {
+    try { return !!(a && b && a.isSameEntry && await a.isSameEntry(b)); } catch (e) { return false; }
+  }
+  // Give a folder its own identity when the one it carries is already in use by a DIFFERENT folder.
+  async function remintDatasetId(root) {
+    const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
+    try { await FS.writeText(root, '.annotator_dataset.json', JSON.stringify({ id, created: new Date().toISOString(), reminted: true }, null, 2)); }
+    catch (e) { /* could not persist it — the session-local id still keeps the two datasets apart */ }
+    return id;
+  }
+
   // Opening a folder is a TRANSACTION. Everything is read and validated into LOCALS first; the module
   // state (rootHandle / cases / classes / dsToken / openGen / State) is replaced in ONE synchronous commit
   // block at the end. A cancelled, failed or case-less pick therefore changes NOTHING: no half-switched
   // rootHandle whose classes.json writes land in the wrong folder, no empty `cases` behind a still-clickable
   // frame list, and no generation bump that would abort a Save / class deletion the doctor started earlier.
-  // Never throws. Returns the deferred UI action for openFolder(): null | { restore } | { show, sw }.
+  // Never throws. Returns the deferred UI action for openFolder(): null | { restore } | { show, sw, reminted }.
   async function openFolderTxn() {
-    let prevView = null, sw = null, committed = false;
+    let prevView = null, sw = null, committed = false, reminted = false;   // `reminted` is read in the catch too — must not be block-scoped to the try
     try {
       const newRoot = await FS.pickDirectory();
       // Considering the switch. Freeze annotation NOW: the old frame stays visible through the (slow, async)
@@ -247,7 +267,23 @@
       $('note').disabled = true; updateCopyBtn();
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
-      const newId = await ensureDatasetId(newRoot);
+      // REVIEW FIX SC-1/HF-1 (the audit's only CRITICAL): .annotator_dataset.json is copied VERBATIM when
+      // a folder is duplicated (Drive "Make a copy", Finder ⌘D, cp -r), and the two 'name:<folder>'
+      // fallbacks collide whenever two study folders share a name. switchDataset then sees the same id,
+      // early-returns {switched:false} and NOTHING is wiped: the outgoing folder's unsaved annotations stay
+      // live, render on the folder just opened, and the next save (or the scan's sweepDirty) writes them
+      // into ITS files — while the folder they belong to silently loses them on the next visit. Nothing
+      // else could catch it: `grep isSameEntry` over js/ returned zero hits. Compare the handles now — a
+      // DIFFERENT folder carrying an id we already hold is re-identified before anything else happens.
+      let newId = await ensureDatasetId(newRoot);
+      // `rootHandle &&` is essential: on the FIRST open of a session there is no other folder to collide
+      // with, and State.getDatasetId() is simply the id restored from this dataset's own mirror — reminting
+      // there would cut the folder off from its own crash-recovery records. Only an ALREADY-OPEN, DIFFERENT
+      // folder makes a shared id a collision.
+      if (rootHandle && newId && newId === State.getDatasetId() && !(await isSameFolder(rootHandle, newRoot))) {
+        newId = await remintDatasetId(newRoot);
+        reminted = true;
+      }
       if (newId !== State.getDatasetId() && State.dirtyCount() > 0 &&
           !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) return { restore: prevView };
       const found = await Loader.discover(newRoot);
@@ -283,9 +319,9 @@
       buildClassMgr(); buildClassPicker();
       setBanner(null);
       // ---------------------------------- end COMMIT ----------------------------------
-      return { show: true, sw };
+      return { show: true, sw, reminted };
     } catch (e) {
-      if (committed) return { show: true, sw };                     // the synchronous commit already ran: the new dataset IS open
+      if (committed) return { show: true, sw, reminted };           // the synchronous commit already ran: the new dataset IS open
       if (!(e && e.name === 'AbortError')) setBanner('errOpenFailed', { msg: e.message }, 'warn');   // AbortError = the doctor closed the picker
       return prevView ? { restore: prevView } : null;               // nothing was committed — put the frozen view back
     }
@@ -307,6 +343,7 @@
     if (okUnit) {
       if (classesIndexBad) setBanner('classesIndexZero', { n: classesBadCount }, 'warn');
       else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+      else if (act.reminted) setBanner('datasetReminted', null, 'warn');   // SC-1: this folder was a copy of the one that was open
       else if (act.sw && act.sw.switched && act.sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
     }
     startBackgroundScan();                      // badges / copy-sources / class auto-add fill in behind the first frame
