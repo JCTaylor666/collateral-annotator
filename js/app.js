@@ -27,6 +27,7 @@
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
+  let classesRaw = null;                      // the parsed classes.json AS IT WAS ON DISK (UI-2: unknown fields round-trip)
   let classesIndexBad = false, classesBadCount = 0;   // 4.7: parseable but with index<1 entries (dropped; same no-auto-rewrite protection, its own banner)
   let lastScanConflicts = 0;                  // # frames the last open found conflicted (newer differing file on disk)
   // Decision 4.2: frames whose file on disk is NEWER than this session's dirty copy AND differs in content.
@@ -313,8 +314,12 @@
       // automatically — fixing it is the user's (pipeline's) call.
       const badIdx = cls.list.filter(x => !(Number.isFinite(x.index) && x.index >= 1));
       classes = cls.list.filter(x => Number.isFinite(x.index) && x.index >= 1);
-      classesFileCorrupt = !cls.ok || badIdx.length > 0; classesBackedUp = false; classesOverwriteOK = false;
-      classesIndexBad = cls.ok && badIdx.length > 0; classesBadCount = badIdx.length;   // parseable but with index<1 entries: same protection, its own (accurate) banner
+      // F1: entries loadClasses had to DISCARD (no usable index) count as "this file is not trustworthy"
+      // exactly like an index-0 entry does — otherwise the file is auto-regenerated over the real names.
+      const badCount = badIdx.length + (cls.dropped || 0);
+      classesFileCorrupt = !cls.ok || badCount > 0; classesBackedUp = false; classesOverwriteOK = false;
+      classesIndexBad = cls.ok && badCount > 0; classesBadCount = badCount;   // parseable but with unusable entries: same protection, its own (accurate) banner
+      classesRaw = (cls.ok && cls.raw && typeof cls.raw === 'object') ? cls.raw : null;   // UI-2: preserve unknown fields on write
       dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
       openGen++;                                // bumped WITH rootHandle, never before it: the old dataset's scan/prefetch/late reconciles go inert, and a cancelled Open now aborts nothing
       committed = true;
@@ -1082,7 +1087,21 @@
     const wasCorrupt = classesFileCorrupt;
     if (wasCorrupt && !(await backupClassesOnce())) { setBanner('classesBackupFailed', null, 'warn'); setSaveStatus('classesSaveFailed', null, true); return; }
     try {
-      await FS.writeText(rootHandle, 'classes.json', JSON.stringify({ classes }, null, 2));
+      // REVIEW FIX UI-2: this used to write `{ classes }` — the whole file rebuilt from a lossy
+      // {index,name} model, so a pipeline's schema_version / dataset / generated_by and every per-class
+      // color / abbrev / description were silently destroyed, and the background scan triggers this write
+      // with no prompt at all. Merge into the object that was on disk instead, exactly as flushGeomWrite
+      // does for geometry.json: unknown top-level keys survive, and each class keeps the extra fields it
+      // came with.
+      const prevByIdx = new Map();
+      if (classesRaw && Array.isArray(classesRaw.classes)) {
+        for (const c of classesRaw.classes) { const i = Number(c && c.index); if (Number.isFinite(i)) prevByIdx.set(i, c); }
+      }
+      const merged = Object.assign({}, classesRaw || {}, {
+        classes: classes.map(c => Object.assign({}, prevByIdx.get(c.index) || {}, { index: c.index, name: c.name })),
+      });
+      await FS.writeText(rootHandle, 'classes.json', JSON.stringify(merged, null, 2));
+      classesRaw = merged;                     // what is on disk now
       if (wasCorrupt) {   // the file parses again — and the "left untouched" banner has just become FALSE
         classesFileCorrupt = false; classesBackedUp = false;
         setBanner('classesReplaced', null, 'warn');
@@ -1123,20 +1142,35 @@
   async function usedClassSet(onProgress) {
     const used = new Set(State.usedClasses());
     const units = [];
+    let unimported = 0;
     for (const c of cases) for (const u of c.units) {
       if (u.virtual) continue;                                       // perfusion unit has no files on disk
-      if (sessionLoaded.has(State.key(c.id, u.id))) continue;        // already reconciled into State
+      const uk = State.key(c.id, u.id);
+      // REVIEW FIX UI-1: `sessionLoaded` means "the scan reconciled this unit", NOT "we know what is in it".
+      // A read-only frame (newer schema / unknown paint encoding) and a corrupt-or-lossy one are seeded with
+      // NOTHING imported, so State.usedClasses() cannot speak for them — yet they were skipped here as
+      // already-known. A class still in use by such a frame was therefore deleted from the whole folder's
+      // vocabulary, and since that frame is never rewritten its name was gone for good. Count them as
+      // un-checked so the "never delete on partial evidence" guard fires.
+      if (protectedUnits.has(uk) || corruptUnits.has(uk)) { unimported++; continue; }
+      if (sessionLoaded.has(uk)) continue;                           // reconciled AND imported into State
       units.push(u);
     }
     const total = units.length;
-    let next = 0, done = 0, unread = 0;
+    let next = 0, done = 0, unread = unimported;
     if (onProgress) onProgress(0, total);
     const worker = async () => {
       while (next < units.length) {
         const u = units[next++];
         try {
           const r = await Loader.loadAnnotation(u);
-          if (r.unreadable) unread++; else collectAnnClasses(r.annotation, used);
+          // REVIEW FIX UI-1: only `unreadable` counted as "could not check". A CORRUPT file and a
+          // newer-schema (versionAhead) file both come back with annotation:null and unreadable:false, so
+          // collectAnnClasses saw nothing, `unread` stayed 0, and the "never delete on partial evidence"
+          // guard did not fire — a class still in use by a read-only frame was deleted from the whole
+          // folder's vocabulary, and that frame is never rewritten, so the name was gone for good.
+          if (r.unreadable || r.annCorrupt || r.versionAhead) unread++;
+          else collectAnnClasses(r.annotation, used);
         } catch (e) { unread++; }
         done++;
         if (onProgress && ((done & 7) === 0 || done === total)) onProgress(done, total);

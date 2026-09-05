@@ -203,20 +203,36 @@
   }
 
   // read the dataset-level class definitions from classes.json at the root.
-  // { list, ok }: ok=false means the file EXISTS but is unparseable/wrong-shaped — callers must
-  // NOT auto-regenerate it (that would replace the user's class names with placeholders).
+  // { list, ok, dropped, raw }:
+  //   ok=false     the file EXISTS but is unparseable/wrong-shaped — callers must NOT auto-regenerate it
+  //                (that would replace the user's class names with placeholders).
+  //   dropped>0    it parsed, but N entries carry no usable `index` and were discarded. REVIEW FIX F1:
+  //                these used to vanish inside .filter() while ok stayed TRUE, and app.js computes its
+  //                "is this file trustworthy?" check from the POST-filter list — so it could never see
+  //                them. A pipeline writing "id" instead of "index" (or index:"one", or one entry missing
+  //                it) therefore looked like a perfectly healthy file, the background scan invented
+  //                Unnamed-xxxx names for the indices it found on disk, and saveClasses OVERWROTE the real
+  //                vocabulary with no backup and no confirmation. Report them so the caller can refuse.
+  //   raw          the parsed object as it was on disk. REVIEW FIX UI-2: saveClasses rebuilt the file from
+  //                a lossy {index,name} model, dropping schema_version/dataset/generated_by and every
+  //                per-class color/abbrev/description. readGeometry keeps `raw` for exactly this reason.
+  //   absent       -> { list: [], ok: true } (a fresh dataset, fine to create later). A present-but-
+  //                unreadable file is NOT absent: only NotFoundError takes that path.
   async function loadClasses(rootHandle) {
     let fh;
     try { fh = await rootHandle.getFileHandle('classes.json'); }
-    catch (e) { return { list: [], ok: true }; }   // absent — a fresh dataset, fine to create later
+    catch (e) { return (e && e.name === 'NotFoundError') ? { list: [], ok: true } : { list: [], ok: false }; }
     try {
       const o = JSON.parse(await (await fh.getFile()).text());
       if (!o || !Array.isArray(o.classes)) return { list: [], ok: false };
-      const list = o.classes
-        .map(c => ({ index: Number(c.index), name: c.name }))          // coerce string indices ("1") written by other tools
-        .filter(c => Number.isFinite(c.index))
-        .map(c => ({ index: c.index, name: String(c.name || window.I18n.t('classFallbackName', { idx: c.index })) }));
-      return { list, ok: true };
+      let dropped = 0;
+      const list = [];
+      for (const c of o.classes) {
+        const idx = Number(c && c.index);
+        if (!Number.isFinite(idx)) { dropped++; continue; }             // coerces string indices ("1") written by other tools
+        list.push({ index: idx, name: String((c && c.name) || window.I18n.t('classFallbackName', { idx })) });
+      }
+      return { list, ok: true, dropped, raw: o };
     } catch (e) { return { list: [], ok: false }; }   // present but broken
   }
 
