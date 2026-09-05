@@ -356,7 +356,16 @@
       if (act.restore.had) await showUnit(act.restore.ci, act.restore.ui);   // un-freeze: back to the dataset that is still open
       return;                                   // openGen never moved, so that dataset's background scan is still running — do NOT start a second one
     }
+    // REVIEW FIX F2: openBusy is released in the finally ABOVE, before this await, so a second Open can
+    // commit (openGen++) while this one is still loading its first frame — and the tail below then started
+    // a SECOND live scan of the same folder. scanTotal/scanDone are module-level, so the two scans trampled
+    // each other's counters and #scanProg blanked at half the real work; the doctor then trusts the ☆/★
+    // glyphs, and clicking a hollow ☆ on a still-unscanned frame does the OPPOSITE of what the row promises
+    // (ensureSeeded reads the true starred value first, then toggleStar flips it OFF and writes that).
+    // Plus the whole folder is read twice.
+    const myGen = openGen;
     const okUnit = await showUnit(0, 0);        // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
+    if (myGen !== openGen) return;              // a newer Open committed while we were loading: its own tail owns the scan
     // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
     if (okUnit) {
       if (classesIndexBad) setBanner('classesIndexZero', { n: classesBadCount }, 'warn');
@@ -658,6 +667,7 @@
         State.pushPaintUndo(cur.caseId, cur.unitId, rec.changes);
         State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);
         State.markDirty(cur.caseId, cur.unitId);
+        updateDirtyUI(); updateFrameDot(cur.caseId, cur.unitId);   // REVIEW FIX ANS-4: the paint branch dirtied the frame without refreshing the unsaved indicator — with auto-save off the header kept reading "Synced" over an edited frame
         scheduleAutoSave();   // queue the outgoing unit; the flushAutoSave() in showUnit writes it immediately
       }
     }
@@ -757,7 +767,12 @@
       highlightNav();   // ui-5: the case dropdown / frame-list highlight jumped to the failed target on click — snap them back to what is actually on screen
       return false;
     }
-    finally { navBusy = false; if (gen === navGen) setNavBusy(false); }   // a superseded load must leave the NEWEST navigation's busy hint alone
+    // REVIEW FIX ANS-1: the generation check guarded only the visible hint — `navBusy` itself was cleared
+    // unconditionally. Click frame 5 (warm, ~100 ms) then frame 11 (cold, seconds): the superseded frame-5
+    // load runs this finally and drops navBusy while frame 11 is still loading. navBusy is the ONLY thing
+    // stopping onDragStart, so a stroke could start on the frame still on screen while `cur` was about to
+    // change under it. A superseded load must leave BOTH alone.
+    finally { if (gen === navGen) { navBusy = false; setNavBusy(false); } }
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
@@ -808,7 +823,7 @@
   // the computed, view-only perfusion unit: colour image, no label/mask/annotation
   async function showPerfusionUnit(c, u, gen, prevCi, prevUi) {
     navBusy = true; setNavBusy(true);
-    let perf; try { perf = await ensureCasePerfusion(c); } finally { navBusy = false; if (gen === navGen) setNavBusy(false); }
+    let perf; try { perf = await ensureCasePerfusion(c); } finally { if (gen === navGen) { navBusy = false; setNavBusy(false); } }   // ANS-1: same rule as showUnit
     if (gen !== navGen) return false;                       // superseded by a newer navigation
     if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
     cur = { W: perf.W, H: perf.H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
@@ -1396,6 +1411,7 @@
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
   async function pickCopySource(caseId, unitId) {
     const c = cases.find(x => x.id === caseId), src = c && c.units.find(x => x.id === unitId);
+    const tgtCase = cur && cur.caseId, tgtUnit = cur && cur.unitId;   // AEP-2: the frame the copy is FOR, captured before any await
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
     if (!c || !src || !cur || cur.caseId !== caseId || cur.unitId === unitId) return;   // the source must be another frame of the case that is actually displayed
     if (!src.virtual && !src.mismatch) {                             // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
@@ -1406,7 +1422,12 @@
       // and an unknown paint encoding would have been decoded as v1 straight into the writable target.
       if (protectedUnits.has(State.key(c.id, src.id))) { setBanner('copyFromProtected', { id: src.id }, 'warn'); return; }
     }
-    if (!cur || copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started: say so, don't silently no-op
+    // REVIEW FIX AEP-2: only "is the target still empty?" was re-checked after the await — not "is it still
+    // the SAME target". Reading the source off a cold folder takes seconds; one arrow-key press in that
+    // window lands on a prefetched (millisecond) frame, and doCopyFrom then wrote the source's annotations
+    // into THAT frame and auto-saved them. Pin the target across the await.
+    if (!cur || cur.caseId !== tgtCase || cur.unitId !== tgtUnit) { setBanner('copyBusyNow', null, 'warn'); return; }
+    if (copyTargetBusy(cur.caseId, cur.unitId)) { setBanner('copyBusyNow', null, 'warn'); return; }   // got busy since picking started: say so, don't silently no-op
     doCopyFrom(c.id, src);
   }
   function doCopyFrom(srcCaseId, srcUnit) {
@@ -2120,8 +2141,14 @@
       // REVIEW FIX R3/L2: the loader's classification used to be thrown away here, so an unreadable /
       // corrupt / newer-schema folder copy arrived as `ann: null` and marksFromAnn rendered it as a clean
       // "0 segments · 0 points" — a lie that steers the doctor into overwriting a fully annotated file.
+      const tok0 = dsToken;
       try {
         const r = await Loader.loadAnnotation(unit);
+        // REVIEW FIX CD-2: the record was stored BEFORE any re-check, and there was no dsToken guard at all —
+        // openFolder does not await a running flushAutoSave, so this read can still be in flight over a cold
+        // folder while the doctor picks another one. The old dataset's annotation then landed in the NEW
+        // dataset's conflictedUnits under the same case_N/frame_M key.
+        if (tok0 !== dsToken) return;
         rec = { ann: r.annotation, note: r.note, annMtime: r.mtime || 0,
                 opaque: !r.annotation && !!(r.unreadable || r.annCorrupt || r.versionAhead) };
         conflictedUnits.set(k, rec);
@@ -2146,8 +2173,17 @@
   function hideConflictDialog() { $('conflictModal').classList.add('hidden'); conflictShownFor = null; }
   // choice: 'disk' keeps the folder file (session copy sidecar-backed-up first);
   //         'local' keeps the session copy (folder file backed up, then written over).
+  // REVIEW FIX SU-3: the chooser's two buttons stayed live through every await below — conflictShownFor is
+  // cleared by hideConflictDialog, which runs only AFTER the backup writes (seconds on Drive). Clicking
+  // "Keep folder version" and then impatiently "Keep session version" ran two resolutions of the same
+  // conflict concurrently, each writing its own backup. One at a time.
+  let resolveBusy = false;
   async function resolveConflict(k, choice) {
-    const rec = conflictedUnits.get(k);
+    if (resolveBusy) return;
+    resolveBusy = true;
+    try { return await resolveConflictInner(k, choice, conflictedUnits.get(k)); } finally { resolveBusy = false; }
+  }
+  async function resolveConflictInner(k, choice, rec) {
     const [cc, uu] = [k.slice(0, k.lastIndexOf('/')), k.slice(k.lastIndexOf('/') + 1)];
     const cRef = cases.find(x => x.id === cc), unit = cRef && cRef.units.find(x => x.id === uu);
     if (!unit) return;
@@ -2683,6 +2719,13 @@
     if (needNote && !(await backupNoteCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt note.json could not be backed up');
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+    // REVIEW FIX SE-1: the "this file on disk is OURS" stamp lived only at the very end, after BOTH writes.
+    // If note.json's write then failed — creating a new file is a different operation from replacing one —
+    // the throw left ownWriteAt/lastSeenMtime/writtenAt at 0 even though annotation.json WAS on disk with a
+    // fresh mtime. The 2 s retry then measured that file against zero, declared the frame CONFLICTED
+    // against OUR OWN write, and returned "successfully" — runRetries printed "Saved" over a frame whose
+    // note existed only in RAM. Record the annotation write the moment it lands.
+    if (tok === dsToken) { const annMs = await annFileMtime(unit); if (annMs) { ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); } }
     if (needNote) {
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
       noteCorruptUnits.delete(k);                     // the file on disk is valid JSON again
