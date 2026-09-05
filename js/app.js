@@ -151,7 +151,11 @@
     'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
     'classesBackupFailed', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
     'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
-    'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed', 'protectedFrameFmt']);
+    'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed', 'protectedFrameFmt',
+    // v79: the three R3 resolution messages belong here for the same reason conflictKept* do — they RETIRE
+    // the critical conflictFoundFmt warning, so they must be able to take the slot from it. Without this
+    // the doctor resolved a conflict and the banner still said "the file in the folder is NEWER".
+    'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused']);
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
     const b = $('banner');
@@ -412,6 +416,20 @@
   async function annFileMtime(unit) {
     try { return (await (await unit.handle.getFileHandle('annotation.json')).getFile()).lastModified || 0; }
     catch (e) { return 0; }
+  }
+  // REVIEW FIX SWG-5: the M4 blind-overwrite guard statted ONLY annotation.json, so a colleague who edited
+  // just the NOTE was overwritten with no chooser and no backup — the 4.2 promise ("no write ever clobbers
+  // a newer file") simply did not cover note.json. The guard now sees the newer of the frame's two files.
+  async function unitDiskMtime(unit) {
+    let n = 0;
+    try { n = (await (await unit.handle.getFileHandle('note.json')).getFile()).lastModified || 0; } catch (e) { }
+    return Math.max(await annFileMtime(unit), n);
+  }
+  // Raw bytes of one of a frame's files, or null when it cannot be read. The conflict resolver needs this:
+  // a folder copy this build cannot PARSE still has to be preserved byte-for-byte before we overwrite it.
+  async function rawFileText(unit, name) {
+    try { return await (await (await unit.handle.getFileHandle(name)).getFile()).text(); }
+    catch (e) { return null; }
   }
   // "Our own write" time for a unit: the session map, plus the PERSISTED stamp so the very first reconcile
   // after a reload still recognises our own file instead of calling it an external change.
@@ -2026,7 +2044,15 @@
     const c = cur.caseId, unit = cur.unit;
     let rec = conflictedUnits.get(k);
     if (!rec) {                                        // detected by the write path: parse the disk copy now
-      try { const r = await Loader.loadAnnotation(unit); rec = { ann: r.annotation, note: r.note, annMtime: r.mtime || 0 }; conflictedUnits.set(k, rec); }
+      // REVIEW FIX R3/L2: the loader's classification used to be thrown away here, so an unreadable /
+      // corrupt / newer-schema folder copy arrived as `ann: null` and marksFromAnn rendered it as a clean
+      // "0 segments · 0 points" — a lie that steers the doctor into overwriting a fully annotated file.
+      try {
+        const r = await Loader.loadAnnotation(unit);
+        rec = { ann: r.annotation, note: r.note, annMtime: r.mtime || 0,
+                opaque: !r.annotation && !!(r.unreadable || r.annCorrupt || r.versionAhead) };
+        conflictedUnits.set(k, rec);
+      }
       catch (e) { return; }
       if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;
     }
@@ -2037,7 +2063,9 @@
     $('conflictTitle').textContent = I18n.t('conflictTitleFmt', { id: cur.unitId });
     renderConflictThumb($('conflictThumbDisk'), data, dm, dp.mask);
     renderConflictThumb($('conflictThumbLocal'), data, lm, lp.mask);
-    $('conflictSumDisk').textContent = conflictSummary(dm, dp.n, rec.annMtime);
+    $('conflictSumDisk').textContent = rec.opaque
+      ? I18n.t('conflictOpaqueDisk')                       // R3/L2: say "unknown", never "0 segments"
+      : conflictSummary(dm, dp.n, rec.annMtime);
     $('conflictSumLocal').textContent = conflictSummary(lm, lp.n, State.getEditedAt(c, cur.unitId));
     conflictShownFor = k;
     $('conflictModal').classList.remove('hidden');
@@ -2052,7 +2080,13 @@
     if (!unit) return;
     const tok = dsToken;
     let r = rec;
-    if (!r || !r.ann) { try { const rr = await Loader.loadAnnotation(unit); r = { ann: rr.annotation, note: rr.note, annMtime: rr.mtime || 0 }; } catch (e) { r = { ann: null, note: null, annMtime: 0 }; } }
+    if (!r || !r.ann) {
+      try {
+        const rr = await Loader.loadAnnotation(unit);
+        r = { ann: rr.annotation, note: rr.note, annMtime: rr.mtime || 0,
+              opaque: !rr.annotation && !!(rr.unreadable || rr.annCorrupt || rr.versionAhead) };
+      } catch (e) { r = { ann: null, note: null, annMtime: 0, opaque: true }; }
+    }
     if (tok !== dsToken) return;
     if (choice === 'disk') {
       let backedUp = false;
@@ -2067,6 +2101,14 @@
         }
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
       if (tok !== dsToken) return;
+      // REVIEW FIX R3/L1: adopting a folder copy we could not PARSE used to resetUnit() and import nothing —
+      // the frame went blank while the banner said "Kept the folder version." loader.js's own contract says
+      // callers must not reset State from an unreadable read. Refuse instead; the session copy stays.
+      if (r.opaque) {
+        hideConflictDialog();
+        setBanner('conflictKeptDiskRefused', null, 'warn');
+        return;
+      }
       State.resetUnit(cc, uu);
       try { if (r.ann) State.importAnnotation(cc, uu, r.ann); if (r.note) State.importNoteJson(cc, uu, r.note); } catch (e) { }
       State.markClean(cc, uu, undefined, r.annMtime);
@@ -2091,9 +2133,18 @@
       highlightNav(); updateDirtyUI();
       setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', null, 'ok');
     } else {
+      // REVIEW FIX R3: `if (r.ann)` meant that exactly when the folder copy could NOT be parsed — the one
+      // case where it is irreplaceable — no external-backup was written and writeUnit overwrote it anyway.
+      // Preserve the RAW BYTES instead; if even that fails, resolve nothing rather than destroy it.
       try {
         if (r.ann) await FS.writeText(unit.handle, 'annotation.external-backup.json', JSON.stringify(r.ann, null, 2));
+        else {
+          const raw = await rawFileText(unit, 'annotation.json');
+          if (raw === null) { hideConflictDialog(); setBanner('conflictDiskUnsavable', null, 'warn'); return; }
+          await FS.writeText(unit.handle, 'annotation.external-backup.json', raw);
+        }
         if (r.note) await FS.writeText(unit.handle, 'note.external-backup.json', JSON.stringify(r.note, null, 2));
+        else { const rawN = await rawFileText(unit, 'note.json'); if (rawN !== null) await FS.writeText(unit.handle, 'note.external-backup.json', rawN); }
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
       if (tok !== dsToken) return;
       conflictedUnits.delete(k);
@@ -2106,6 +2157,9 @@
       if (protectedUnits.has(k)) {
         setBanner('protectedFrameFmt', { id: uu, what: (protectedUnits.get(k) || {}).what || '?' }, 'warn');
         setSaveStatus(null);
+      } else if (r.opaque) {                               // R3: the bytes we could not read are safe in the sidecar
+        setBanner('conflictDiskUnreadable', { file: 'annotation.external-backup.json' }, 'warn');
+        if (!retryQ.size) setSavedStatus();
       } else {
         setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', null, 'ok');
         if (!retryQ.size) setSavedStatus();
@@ -2514,7 +2568,7 @@
     // it — that silently destroyed a colleague's (or another machine's) work with a stale in-memory copy
     // while the banner reported success. A newer-but-changed file makes this frame CONFLICTED instead:
     // the write is skipped, the frame stays dirty, and opening it shows the two-version chooser.
-    const diskMs = await annFileMtime(unit);
+    const diskMs = await unitDiskMtime(unit);   // SWG-5: annotation.json OR note.json, whichever is newer
     if (tok !== dsToken) return;
     if (diskMs && diskMs > Math.max(ownWriteMs(caseId, unit.id, k), lastSeenMtime.get(k) || 0) + 2000) {
       conflictedUnits.set(k, null);                   // parsed lazily when the chooser opens
@@ -2535,7 +2589,7 @@
       noteCorruptUnits.delete(k);                     // the file on disk is valid JSON again
     }
     corruptUnits.delete(k);   // the file on disk is valid JSON again
-    const fileMs = (await annFileMtime(unit)) || Date.now();   // the FILE's own clock, not ours
+    const fileMs = (await unitDiskMtime(unit)) || Date.now();   // the FILES' own clock, not ours (both — SWG-5)
     // A reconcile must never mistake OUR write for an externally-newer file — this session OR after a
     // reload — and a cross-open write must not pollute the NEW dataset's maps.
     // REVIEW FIX R2: markClean used to sit OUTSIDE this guard. Since v61 it also writes the PERSISTED

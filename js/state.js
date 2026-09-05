@@ -648,7 +648,14 @@
     const out = [];
     for (const ly of layersOf(c, u)) {
       const r = paintR[lkey(c, u, ly.id)];
-      if (r && r.encoding && r.encoding !== 'rle_rows_v1' && out.indexOf(r.encoding) < 0) out.push(r.encoding);
+      if (!r || !r.classes) continue;
+      // REVIEW FIX SIO-1/HF-4: this required `r.encoding` to be TRUTHY, so a paint blob with no encoding
+      // key at all slipped through — while paintDense refuses to decode exactly that blob because
+      // `undefined !== 'rle_rows_v1'`. The frame therefore rendered EMPTY and was NOT protected: the doctor
+      // saw a blank layer, painted one stroke, and setPaintDense replaced the blob outright. Anything this
+      // build will not decode must make the frame read-only — a missing key included.
+      const enc = r.encoding || '(no "encoding" key)';
+      if (r.encoding !== 'rle_rows_v1' && out.indexOf(enc) < 0) out.push(enc);
     }
     return out;
   }
@@ -684,15 +691,36 @@
   // three `continue`s in the loop below plus its Array.isArray gate. A file that loses content on import is
   // as dangerous as an unparseable one: the frame renders short, and the next save writes the SHORTENED
   // version back — so callers treat dropped > 0 like `corrupt` and back the original up first.
+  // Mirrors the per-ITEM `continue`s in importLayerContent: a collateral with no usable id, or a point
+  // whose click is not a 2-element array, is silently discarded on import.
+  // REVIEW FIX SIO-2/HF-3: annotationDropped counted LAYER entries only, so for a flat v5 file it could
+  // never be non-zero — a file with 20 collaterals, 5 of them with broken ids, imported short, reported
+  // dropped:0, never entered corruptUnits, never got a .corrupt backup, and the next save wrote the
+  // SHORTENED version back over it.
+  function itemsDropped(obj) {
+    let d = 0;
+    if (obj && Array.isArray(obj.collaterals)) for (const it of obj.collaterals) {
+      if (!it || typeof it !== 'object' || !Number.isFinite(Number(it.id))) d++;
+    }
+    if (obj && Array.isArray(obj.points)) for (const it of obj.points) {
+      const click = Array.isArray(it) ? it : (it && it.click);
+      if (!(Array.isArray(click) && click.length === 2)) d++;
+    }
+    return d;
+  }
   function annotationDropped(ann) {
     if (!ann || typeof ann !== 'object') return 0;
-    if (!Array.isArray(ann.layers)) return (ann.layers && typeof ann.layers === 'object') ? 1 : 0;   // "layers" written as an OBJECT: the whole block is ignored and the file imports as flat v5
+    if (!Array.isArray(ann.layers)) {
+      if (ann.layers && typeof ann.layers === 'object') return 1;   // "layers" written as an OBJECT: the whole block is ignored and the file imports as flat v5
+      return itemsDropped(ann);                                     // flat v5: per-item losses are the only kind
+    }
     let dropped = 0; const seen = [];
     for (const ly of ann.layers) {
       if (!ly || typeof ly !== 'object') { dropped++; continue; }
       const id = Number(ly.id);
       if (!Number.isFinite(id) || seen.indexOf(id) >= 0) { dropped++; continue; }   // missing/non-numeric id, or a duplicate of an earlier layer
       seen.push(id);
+      dropped += itemsDropped(ly);
     }
     return dropped;
   }
