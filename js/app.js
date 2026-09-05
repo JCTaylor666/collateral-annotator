@@ -163,6 +163,7 @@
     const txt = key ? I18n.t(key, vars) : '';
     const cls = 'banner' + (key ? (kind ? ' ' + kind : '') : ' hidden');
     lastBanner = key ? { key, vars, kind } : null;
+    bannerActions = [];                       // the links belonged to the message being replaced
     const h0 = view ? $('view').clientHeight : 0;
     b.textContent = txt;
     if (key && bannerPrio(key, kind) === 2) {   // critical messages are dismissable by hand — sticky must never mean stuck
@@ -187,8 +188,10 @@
   //   B7:  the action span was appended AFTER setBanner's height check, so a span that wrapped the banner
   //        onto a second line changed the canvas height with no re-layout — every click then resolved to
   //        an image row above the cursor. Re-check the height here.
+  let bannerActions = [];   // {labelKey, onClick} for the links riding on the CURRENT banner (see onLangChange)
   function bannerAddAction(labelKey, onClick) {
     const b = $('banner');
+    bannerActions.push({ labelKey, onClick });
     const h0 = view ? $('view').clientHeight : 0;
     const act = document.createElement('span');
     act.className = 'banner-act'; act.textContent = I18n.t(labelKey);
@@ -201,7 +204,13 @@
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
   function clearUnitBanner() {
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt'];
+    // REVIEW FIX BT-4: the conflict/rescue RESOLUTION confirmations are one-shot messages about ONE frame,
+    // but they sit at critical priority (they have to, to take the slot from the warning they retire) — so
+    // "Kept the folder version." went on suppressing every ordinary per-frame warning on every frame the
+    // doctor visited afterwards, until dismissed by hand. They are per-unit; clear them on navigation.
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt',
+      'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
+      'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
   }
 
@@ -1324,7 +1333,13 @@
     copyPickMode = false;
     $('frameList').classList.remove('picking');
     document.body.classList.remove('copy-picking');
-    setBanner(null);
+    // REVIEW FIX R12/B3: this was an UNCONDITIONAL setBanner(null) — cancelling copy-pick (Esc, a second
+    // click, or simply navigating, which also calls this) wiped whatever was in the slot, including the
+    // sticky critical "12 frames have a newer file in the folder". That message is produced only at scan
+    // end and save end, so it never came back: the doctor never learned those frames were conflicted and
+    // kept editing them while every write was refused. exitMarkerArm has guarded the identical clear since
+    // v19 with the comment "never eat another mode's banner" — this site was simply never audited.
+    if (lastBanner && lastBanner.key === 'copyPickHint') setBanner(null);
     updateCopyBtn();
   }
   function toggleCopyPick() { if (copyPickMode) exitCopyPick(); else enterCopyPick(); }
@@ -1554,7 +1569,14 @@
     $('unitIndicator').textContent = I18n.t('unitIndicatorFmt', { ui: uIdx + 1, uc: c.units.length, ci: cIdx + 1, cc: cases.length });
     const ids = State.selectedIds(c.id, u.id);
     $('chips').innerHTML = ids.length ? ids.map(i => '<span class="chip">' + i + '</span>').join('') : '<span class="muted">' + I18n.t('none') + '</span>';
-    $('progress').textContent = I18n.t('progressFmt', { segs: ids.length, pts: State.pointCount(c.id, u.id) });
+    // REVIEW FIX UI-4: both numbers (and the chip row) are ACTIVE-LAYER only, but the line was worded as if
+    // it described the frame — so annotating 23 segments on "Layer 1" and then adding "Layer 2" made the
+    // header report the frame as empty. Say which layer it is counting whenever there is more than one.
+    const layers = State.getLayers(c.id, u.id);
+    const act = layers.find(l => l.id === State.getActiveLayer(c.id, u.id));
+    $('progress').textContent = (layers.length > 1 && act)
+      ? I18n.t('progressLayerFmt', { segs: ids.length, pts: State.pointCount(c.id, u.id), layer: act.name, nl: layers.length })
+      : I18n.t('progressFmt', { segs: ids.length, pts: State.pointCount(c.id, u.id) });
   }
 
   function buildCaseOptions() {
@@ -2359,7 +2381,7 @@
     // scope filter: a case id is a folder name, it can never contain '/', so prefix+'/' is exact
     const keys = State.unitsWithData().filter(k => !caseId || k.slice(0, caseId.length + 1) === caseId + '/');
     const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
-    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0;
+    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0, skippedProtected = 0;
     saveRunning = true;
     saveModalOpen(caseId ? 'savingCaseFmt' : 'savingAllTitle', caseId ? { id: caseId } : null);
     $('btnSave').disabled = true; $('btnSaveCase').disabled = true; $('btnOpen').disabled = true;
@@ -2378,7 +2400,12 @@
         if (st !== 'seeded' && st !== 'already') { failed++; continue; }   // could not read this frame's file: leave it untouched and report it, never write a State we could not verify
         // don't fabricate empty annotation.json for merely-viewed, never-annotated frames
         if (!State.isDirty(ref.c.id, ref.u.id) && !State.unitHasContent(ref.c.id, ref.u.id)) continue;
-        if (conflictedUnits.has(k) || protectedUnits.has(k)) { skippedConflicts++; continue; }   // chooser-owned or read-only-protected — not written, not a failure
+        // REVIEW FIX F9: v74 folded PROTECTED frames into the CONFLICT counter, so the banner told the
+        // doctor they "have a newer file in the folder — opening each will ask which version to keep".
+        // Both halves are false for a read-only frame: there is no newer file, and opening it shows the
+        // read-only banner, never a chooser. Count them apart and say the right thing about each.
+        if (conflictedUnits.has(k)) { skippedConflicts++; continue; }        // chooser-owned
+        if (protectedUnits.has(k)) { skippedProtected++; continue; }          // read-only: this build cannot fully read it
         try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else n++; }   // the write itself may detect a fresh conflict and refuse
         catch (e) { failed++; }   // a single unloadable/broken unit must not abort saving the rest
       }
@@ -2392,12 +2419,29 @@
     if (cancelled) { saveModalFinish(I18n.t('saveCancelledFmt', { n })); setSaveStatus(null); return; }   // frames are still unsaved — the header must not claim Saved
     saveModalStep(keys.length, keys.length, '');
     if (failed) { saveModalFinish(I18n.t('saveDonePartialFmt', { n, failed })); setBanner('savedPartial', { n, failed }, 'warn'); }
-    else if (skippedConflicts) { saveModalFinish(I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts })); setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn'); }
-    else { saveModalFinish(I18n.t('saveDoneFmt', { n })); setBanner(null); setBanner('savedAllFmt', { n }, 'ok'); }   // a clean full save retires any stale critical warning first — every frame just reached disk
+    else if (skippedConflicts || skippedProtected) {
+      saveModalFinish(skippedProtected && skippedConflicts
+        ? I18n.t('saveDoneProtectedFmt', { n, c: skippedConflicts, p: skippedProtected })
+        : I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts + skippedProtected }));
+      if (skippedConflicts) setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn');
+      else setBanner('protectedScanFmt', { n: skippedProtected }, 'warn');
+    }
+    else {
+      saveModalFinish(I18n.t('saveDoneFmt', { n }));
+      // REVIEW FIX B2: this used to be a bare setBanner(null) — "a clean full save retires any stale
+      // critical warning". True for WRITE-failure warnings; false for everything else in the slot. It also
+      // erased multiTabWarn and classesCorrupt/classesIndexZero, and BOTH are one-shot: the multi-tab latch
+      // is never reset, and the classes banners are set only inside openFolder. One clean save and the
+      // doctor never learns again that the class names on screen are invented placeholders. Retire only
+      // what this save actually fixed.
+      const retired = ['writeFailedBanner', 'savedPartial', 'saveAborted', 'conflictScanFmt', 'protectedScanFmt'];
+      if (lastBanner && retired.indexOf(lastBanner.key) >= 0) setBanner(null);
+      setBanner('savedAllFmt', { n }, 'ok');
+    }
     // REVIEW FIX SE-4: `failed` used to fall through to setSavedStatus(). Those failures come from
     // ensureSeeded returning 'unreadable' (app.js:2210), which does NOT queue a retry — so retryQ is empty
     // and setSavedStatus happily printed "Saved HH:MM" right after a Save-all that left frames unwritten.
-    if (failed || skippedConflicts) setSaveStatus(null); else setSavedStatus();   // anything unwritten — the header must not say Saved
+    if (failed || skippedConflicts || skippedProtected) setSaveStatus(null); else setSavedStatus();   // anything unwritten — the header must not say Saved
   }
   function save() { return runSave(null); }
   function saveCase() { if (cur && !cur.virtual) return runSave(cur.caseId); }
@@ -2506,7 +2550,11 @@
       setBanner('conflictFoundFmt', { id: conflicted }, 'warn');
     }
     else if (recovered) {
-      if (lastBanner && lastBanner.key === 'writeFailedBanner') setBanner(null);      // it did reach the disk after all — that warning is no longer true
+      // REVIEW FIX RS-5: only writeFailedBanner was retired here, so the sticky critical "Saved n — 2
+      // FAILED" from the Save-all that queued these retries stayed up saying 2 frames failed while the
+      // status line beside it said Saved — and being priority 2 it went on suppressing every per-frame
+      // warning until the doctor dismissed it by hand.
+      if (lastBanner && (lastBanner.key === 'writeFailedBanner' || lastBanner.key === 'savedPartial')) setBanner(null);
       setSaveStatus('saved', { time: hhmm() });
     }
     else if (lastSaveStatus && lastSaveStatus.key === 'retryPending') setSaveStatus(null);   // REVIEW FIX SE-5: the queue drained without a recovery — don't freeze a red "retrying" line
@@ -2711,7 +2759,15 @@
     else { $('curLabel').textContent = I18n.t('notLoaded'); $('chips').innerHTML = '<span class="muted">' + I18n.t('none') + '</span>'; }
     updateCopyBtn(); updateDirtyUI();   // updateDirtyUI also re-renders the dynamic save-button labels
     buildCaseOptions(); buildFrameList(); buildClassMgr(); buildClassPicker(); buildMarkerChips(); buildLayerBar(); updateScanProg();
-    if (lastBanner) setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
+    if (lastBanner) {
+      // REVIEW FIX B6/HCW-3: setBanner rebuilds textContent (which drops every child) and re-adds only the
+      // ✕. The [Copy diagnostic] / [View backups] links are appended by their CALLERS, so a language switch
+      // left a banner still promising an action with no control to reach it — and [View] is the ONLY entry
+      // to the rescue chooser. Replay them.
+      const acts = bannerActions.slice();
+      setBanner(lastBanner.key, lastBanner.vars, lastBanner.kind);
+      for (const a of acts) bannerAddAction(a.labelKey, a.onClick);
+    }
     if (lastSaveStatus) setSaveStatus(lastSaveStatus.key, lastSaveStatus.vars, lastSaveStatus.warn);
   }
 
