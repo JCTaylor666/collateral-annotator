@@ -541,14 +541,31 @@
     // State already equals disk — skip the reset so the frame's undo history survives navigation.
     const unchanged = sessionLoaded.has(k) && !State.isDirty(c.id, u.id) &&
       (m === (lastSeenMtime.get(k) || 0) || m <= ownWriteMs(c.id, u.id, k) + 2000);
+    const seenBefore = lastSeenMtime.has(k);   // R7: telling a FIRST sighting apart from a later replacement
+    let rec = null;
     if (!unchanged) {
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
-      const rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
+      rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       evalImportProtection(c, u, data.annotation, data.versionAhead);
       if (data.noteCorrupt) noteCorruptUnits.add(k);
     }
-    lastSeenMtime.set(k, m);
+    // REVIEW FIX R7: this used to run for EVERY outcome, 'kept-dirty' included — and 'kept-dirty' is
+    // returned by reconcile's FIRST guard, before any content comparison. So a colleague's differing file
+    // whose mtime happens to sit below our editedAt (Drive preserves the source clock; the audit measured
+    // real skew) was recorded as "seen", and writeUnitInner's `diskMs > max(ownWriteMs, lastSeenMtime)+2000`
+    // check went blind: the next save overwrote it with no chooser and no backup. Whether the doctor was
+    // protected depended on nothing but whether they happened to navigate away and back. lastSeenMtime may
+    // only advance when State actually mirrors the file.
+    // Advance when State actually mirrors the file ('clean' / 'stale-clean' / the unchanged fast path), and
+    // on the FIRST sighting of a frame — that read IS how we came to know the file, and without a record any
+    // pre-existing annotation.json looks "newer than anything we have seen" and every dirty-but-unseeded
+    // frame would be declared conflicted (the P0-11 gate caught exactly that). Do NOT advance when we kept a
+    // dirty local copy over a file whose CONTENT we never compared: that is the R7 hole — reconcile's first
+    // guard returns 'kept-dirty' before any comparison, so recording the replacement's mtime as "seen" told
+    // writeUnitInner the file was known and the next save overwrote a colleague's work with no chooser.
+    if (rec !== 'kept-dirty' && rec !== 'conflict') lastSeenMtime.set(k, m);
+    else if (!seenBefore) lastSeenMtime.set(k, m);
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
     return data;
   }
@@ -1162,7 +1179,7 @@
           evalImportProtection(c, u, ann, versionAhead);    // A1: the SCAN seeds most frames first — without this the loadCur fast path never re-evaluates
           if (noteCorrupt) noteCorruptUnits.add(uk);        // A2
           if (rec === 'conflict') conflicts++;
-          lastSeenMtime.set(uk, annMtime);
+          if (rec !== 'kept-dirty' && rec !== 'conflict' || !lastSeenMtime.has(uk)) lastSeenMtime.set(uk, annMtime);   // R7: same rule as loadCur (advance when State mirrors the file, or on a first sighting)
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
         if (curCase() && c.id === curCase().id) updateFrameStar(c.id, u.id);   // the row was built before this unit was read: a stale hollow ☆ that the doctor clicks DELETES the star on disk
@@ -2668,7 +2685,28 @@
     catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
   }
 
+  // REVIEW FIX R10: undo() is async — when the top entry is a paint change on an OFF-SCREEN frame that the
+  // LRU has evicted, it awaits a re-read of that frame (seconds on Drive) before popping. A second Ctrl+Z
+  // (or a click on #btnUndo — neither had a lock) during that await peeked the SAME entry, then both
+  // continuations popped: the second one consumed an entry it had never peeked and never pre-loaded. If
+  // that entry was a full-erase stroke (which deletes the layer's RLE bucket, and with it the dimensions),
+  // applyPaintUndoOffscreen returned false and the entry was dropped on the floor — the erased paint became
+  // unrecoverable, silently. Serialise the whole thing.
+  // Serialised, not dropped: a second press while the first is still fetching is QUEUED, so two deliberate
+  // presses still undo two steps — each one peeking and pre-loading its own entry. (Key auto-repeat is a
+  // different thing and is already filtered by decision 4.9-A's `!e.repeat` in the hotkey handler.) The
+  // queue is capped so a panicked mash cannot run away.
+  let undoBusy = false, undoQueued = 0;
+  const UNDO_QUEUE_MAX = 8;
   async function undo() {
+    if (undoBusy) { if (undoQueued < UNDO_QUEUE_MAX) undoQueued++; return; }
+    undoBusy = true;
+    try {
+      await undoInner();
+      while (undoQueued > 0) { undoQueued--; await undoInner(); }
+    } finally { undoBusy = false; undoQueued = 0; }
+  }
+  async function undoInner() {
     if (!cur) return;
     // Peek BEFORE popping: an offscreen paint entry needs the unit's dims; after LRU eviction (or a reopen)
     // the cache may not have them and the entry would be consumed with no effect. Pre-load, THEN pop.
