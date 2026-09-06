@@ -109,7 +109,13 @@
     const n = await readNote(unit);
     const geometry = await readGeometry(unit);
     return { W, H, img, label: parsed.data, mask, maskBad: maskUnreadable, annotation: a.annotation, annCorrupt: a.corrupt, noteCorrupt: !!n.corrupt, versionAhead: a.versionAhead || 0,
-             annDropped: a.dropped || 0, annUnreadable: !!(a.unreadable || n.unreadable), annMtime: a.mtime || 0, note: n.note, geometry };
+             // REVIEW FIX ANS-3: a note.json read failure used to be folded into the ANNOTATION's flag. On a
+             // Drive folder where one frame's note.json has not materialised while annotation.json reads
+             // perfectly, the doctor was told "annotation.json exists but could NOT be read", loadCur bailed
+             // without seeding, and EVERY write to that frame was refused for the rest of the session — while
+             // Finder showed a perfectly healthy annotation.json. They are separate files with separate fates.
+             annDropped: a.dropped || 0, annUnreadable: !!a.unreadable, noteUnreadable: !!n.unreadable,
+             annMtime: a.mtime || 0, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
@@ -199,7 +205,7 @@
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
     return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0, versionAhead: a.versionAhead || 0,
-             unreadable: !!(a.unreadable || n.unreadable), note: n.note, noteCorrupt: !!n.corrupt, mtime: a.mtime || 0 };
+             unreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, note: n.note, noteCorrupt: !!n.corrupt, mtime: a.mtime || 0 };   // ANS-3: the note's fate is its own
   }
 
   // read the dataset-level class definitions from classes.json at the root.

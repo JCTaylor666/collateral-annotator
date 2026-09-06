@@ -15,6 +15,12 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .banner{padding:8px 12px;font-size:13px}
 .banner.warn{background:var(--warn-bg);color:var(--warn)}
 .banner.ok{background:var(--ok-bg);color:var(--ok)}
+/* REVIEW FIX HCW-1: there was no generic rule — .hidden was styled only for .banner / .modal-overlay /
+   #geomPanel / #layerSec / .doc-body / .loupe-panel. So classList.add('hidden') on a BUTTON or a plain
+   div did nothing: the save modal showed "Cancel" and "Close" at the same time, the rescue chooser's
+   tab strip never collapsed for a single file, and "Restore this backup" stayed visible and clickable
+   for an unparseable backup (its handler then returned in silence — HCW-2). One rule covers them all. */
+.hidden{display:none !important}
 .banner.hidden{display:none}
 .banner-x{float:right;margin-left:14px;cursor:pointer;font-weight:700;opacity:.55;padding:0 4px}
 .banner-x:hover{opacity:1}

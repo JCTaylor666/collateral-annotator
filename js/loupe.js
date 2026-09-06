@@ -31,8 +31,15 @@
     if (inflight.has(key)) return inflight.get(key);
     const myEpoch = epoch;
     const p = root.Loader.loadGray(unit).then(g => {
-      inflight.delete(key);
+      // REVIEW FIX LP-2: inflight.delete ran BEFORE the epoch check, so a stale (pre-reset) load landing
+      // late deleted the registration belonging to the load that was actually live — after which the next
+      // ensure() started a THIRD load for the same key, and the two same-epoch loads each did
+      // `grayCache.set` + `grayBytes += size` for one cached entry. The counter over-counted permanently
+      // (node-verified: cache.size 1, grayBytes 2×), so the 60 MB budget filled with phantom bytes and the
+      // loupe began evicting neighbours it was still displaying. Only remove our OWN registration.
+      if (inflight.get(key) === p) inflight.delete(key);
       if (myEpoch !== epoch) return;      // dataset changed while loading — discard
+      if (grayCache.has(key)) { grayCache.delete(key); grayBytes -= graySize(g); }   // belt and braces: never count one key twice
       grayCache.set(key, g); grayBytes += graySize(g);
       while (grayCache.size > MAX_GRAY || grayBytes > MAX_GRAY_BYTES) {
         const k0 = grayCache.keys().next().value;
@@ -40,7 +47,7 @@
       }
       fireReady();
     }).catch(() => {
-      inflight.delete(key);
+      if (inflight.get(key) === p) inflight.delete(key);
       if (myEpoch === epoch) failed.set(key, Date.now());
     });
     inflight.set(key, p);

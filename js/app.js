@@ -17,7 +17,7 @@
   function perfTouch(id) { const v = perfCache.get(id); if (v !== undefined) { perfCache.delete(id); perfCache.set(id, v); } return v; }
   function perfPut(id, v) {
     perfCache.delete(id); perfCache.set(id, v);
-    const keep = curCase() && curCase().id;
+    const keep = (cur && cur.caseId) || (curCase() && curCase().id);   // PL2: the case ON SCREEN, not the nav target
     for (const k of perfCache.keys()) {
       if (perfCache.size <= PERF_CACHE_MAX) break;
       if (k === id || k === keep) continue;
@@ -26,6 +26,15 @@
   }
   let saveTimer = null, pendingSave = null;   // debounced auto-write-to-disk
   let classes = [];                           // dataset class defs [{index,name}] from classes.json
+  // Frames whose annotation.json this session could NOT import a single mark from: unparseable JSON, or a
+  // schema/encoding this build does not understand (those are also in protectedUnits). State.usedClasses()
+  // cannot speak for them. Kept apart from corruptUnits, which ALSO holds annDropped frames — those parsed
+  // and imported almost everything, so treating them as unknown made one lossy frame block class deletion
+  // for the whole dataset forever.
+  const unimportedUnits = new Set();
+  // ANS-3: note.json EXISTS but could not be read. Its annotation is fine and saves normally; we simply
+  // must not write a fresh note.json over a file whose contents we never saw.
+  const noteUnreadableUnits = new Set();
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
   let classesRaw = null;                      // the parsed classes.json AS IT WAS ON DISK (UI-2: unknown fields round-trip)
   let classesIndexBad = false, classesBadCount = 0;   // 4.7: parseable but with index<1 entries (dropped; same no-auto-rewrite protection, its own banner)
@@ -209,7 +218,7 @@
     // but they sit at critical priority (they have to, to take the slot from the warning they retire) — so
     // "Kept the folder version." went on suppressing every ordinary per-frame warning on every frame the
     // doctor visited afterwards, until dismissed by hand. They are per-unit; clear them on navigation.
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt',
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt',
       'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
       'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
@@ -529,11 +538,13 @@
     catch (e) { return 'unreadable'; }                                     // I/O failure: never let the caller build over a file we could not read
     if (r.unreadable) return 'unreadable';                                 // …and the same when the read "succeeded" but the file could not be opened: seeding EMPTY here is what later lets a star/Save overwrite the real annotations
     if (tok !== dsToken) return 'aborted';                                 // folder switched during the read — this unit belongs to the OLD dataset
+    if (r.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);             // UI-1: nothing was imported from it
     if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
     const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
     if (rec === 'aborted') return 'aborted';
     evalImportProtection(c, u, r.annotation, r.versionAhead); // A1: unreadable-by-this-version content => the frame goes read-only
     if (r.noteCorrupt) noteCorruptUnits.add(k);               // A2: back the original up before any write replaces it
+    if (r.noteUnreadable) noteUnreadableUnits.add(k); else noteUnreadableUnits.delete(k);   // ANS-3
     if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
     lastSeenMtime.set(k, r.mtime || 0);
     sessionLoaded.add(k);
@@ -549,6 +560,7 @@
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
     if (data.annUnreadable) return data;   // this frame's annotation.json exists but could not be read: do NOT reset State from it and do NOT mark the unit seeded — every write path re-reads first (and refuses meanwhile)
+    if (data.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);          // UI-1
     if (data.annCorrupt || data.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);
     const m = data.annMtime || 0;
     // clean revisit with the disk file unchanged since our last reconcile (or only changed by OUR OWN write):
@@ -563,6 +575,7 @@
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       evalImportProtection(c, u, data.annotation, data.versionAhead);
       if (data.noteCorrupt) noteCorruptUnits.add(k);
+      if (data.noteUnreadable) noteUnreadableUnits.add(k); else noteUnreadableUnits.delete(k);   // ANS-3
     }
     // REVIEW FIX R7: this used to run for EVERY outcome, 'kept-dirty' included — and 'kept-dirty' is
     // returned by reconcile's FIRST guard, before any content comparison. So a colleague's differing file
@@ -649,8 +662,14 @@
         const view = perfView(c);   // colour at the current smoothness
         if (inspect) scheduleLoupe();   // a pinned perfusion tile can now render
         return view;
-      } catch (e) { perfPut(c.id, 'failed'); return null; }
-      finally { perfInflight.delete(c.id); }
+      // REVIEW FIX PL3: the success path checks pGen, this one never did — so a read that errored after the
+      // doctor re-opened the folder wrote 'failed' into the NEW dataset's freshly-cleared cache under the
+      // same case id, and that case then reported "perfusion failed" for the rest of the session without
+      // ever being computed.
+      } catch (e) { if (pGen === openGen) perfPut(c.id, 'failed'); return null; }
+      // REVIEW FIX ANS-5: this deleted the entry by case id even when a NEW-generation compute for the same
+      // id had already registered its own promise there — the two datasets reuse case_N names.
+      finally { if (perfInflight.get(c.id) === p) perfInflight.delete(c.id); }
     })();
     perfInflight.set(c.id, p);
     return p;
@@ -797,6 +816,7 @@
       const act2 = bannerAddAction('copyDiagBtn', async () => { if (await copyProtectedDiag(k2)) act2.textContent = I18n.t('copyDiagDone'); });
     }
     else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
+    else if (data.noteUnreadable) setBanner('noteUnreadableFmt', { id: u.id }, 'warn');   // ANS-3: the NOTE alone — the annotation is fine and still saves
     else if (data.annCorrupt) setBanner('annCorrupt', { id: u.id }, 'warn');       // corrupt file preserved (backed up before any overwrite)
     else if (data.annDropped) setBanner('annLayersDropped', { id: u.id, n: data.annDropped }, 'warn');   // parts of the file cannot be represented by this build
     else if (data.maskBad) setBanner('maskBad', { id: u.id }, 'warn');        // mask present but broken: onmask constraint won't apply
@@ -1167,7 +1187,7 @@
       // already-known. A class still in use by such a frame was therefore deleted from the whole folder's
       // vocabulary, and since that frame is never rewritten its name was gone for good. Count them as
       // un-checked so the "never delete on partial evidence" guard fires.
-      if (protectedUnits.has(uk) || corruptUnits.has(uk)) { unimported++; continue; }
+      if (protectedUnits.has(uk) || unimportedUnits.has(uk)) { unimported++; continue; }
       if (sessionLoaded.has(uk)) continue;                           // reconciled AND imported into State
       units.push(u);
     }
@@ -1221,6 +1241,7 @@
           if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();   // annotations. Leave State alone and let a write path re-read it.
           continue;
         }
+        if (annCorrupt) unimportedUnits.add(uk);                                          // UI-1
         if (annCorrupt || annDropped) corruptUnits.add(uk);
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
@@ -1575,8 +1596,12 @@
   function repaintPerfusionNow() {
     if (navBusy) return;                     // mid-navigation cur is stale while ci already points at the target case — painting would show the WRONG case's map
     if (cur && cur.virtual) {
-      const pv = perfView(curCase()); if (pv) paintPerfIntoView(pv);
-      maybeWarnPerfMask(curCase());
+      // REVIEW FIX SW-4: curCase() is the nav target. The navBusy guard above is the only thing that made
+      // that safe, and ANS-1 showed navBusy could be cleared early by a SUPERSEDED navigation — so moving
+      // the smoothness slider could paint another case's arrival-time map onto the screen. Anchor on `cur`.
+      const dc = cases.find(x => x.id === cur.caseId) || curCase();
+      const pv = perfView(dc); if (pv) paintPerfIntoView(pv);
+      maybeWarnPerfMask(dc);
       if (!State.getPerfMask() && lastBanner && lastBanner.key === 'perfMaskUnavailable') setBanner(null);   // unchecking clears the warning
     }
     if (inspect) { stripSig = ''; scheduleLoupe(); }
@@ -1857,8 +1882,13 @@
     loupeRAF = true;
     requestAnimationFrame(() => { loupeRAF = false; if (inspect) renderLoupe(); });
   }
+  // REVIEW FIX PL1: this keyed on curCase() — the NAVIGATION TARGET — while renderLoupe correctly anchors
+  // on the displayed frame (the pl-4 rule, applied one line above in enterInspect but not here). During a
+  // slow case switch the loupe therefore pre-loaded the INCOMING case's 18 frames while displaying the old
+  // one, so every neighbour tile sat at "loading" with nobody fetching it — and if the incoming load then
+  // FAILED, nothing re-ran this, so the tiles stayed stuck for as long as the doctor held the key.
   function preloadCase() {
-    const c = curCase(); if (!c) return;
+    const c = (cur && cases.find(x => x.id === cur.caseId)) || curCase(); if (!c) return;
     for (const u of c.units) Loupe.ensure(State.key(c.id, u.id), u);
   }
   // gray of a unit for the loupe: fresh snapshot for the current unit (never stored),
@@ -2713,7 +2743,8 @@
     // throws — the unit stays dirty, lands in the retry queue and raises the write-failure banner — instead
     // of the old "swallow it and overwrite anyway". Doing them up front also removes the half-written state
     // where annotation.json landed and note.json's backup then refused.
-    const needNote = State.hasNoteData(caseId, unit.id);
+    // ANS-3: never write a fresh note.json over one whose contents we could not read.
+    const needNote = State.hasNoteData(caseId, unit.id) && !noteUnreadableUnits.has(k);
     if (!(await backupCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up');
     if (tok !== dsToken) return;
     if (needNote && !(await backupNoteCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt note.json could not be backed up');
