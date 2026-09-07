@@ -282,7 +282,11 @@
       // over the OLD dataset's annotation.json via the captured handle — and leak stray marks into the new one.
       commitActiveStroke();
       await flushAutoSave();                 // write any just-committed stroke to the OLD folder before the wipe
-      prevView = { had: !!cur, ci, ui };
+      // REVIEW FIX SW-6: `had` came from cur but the coordinates came from the nav cursor, so a cancelled
+      // Open restored the frame the doctor was navigating TO rather than the one that was frozen on screen.
+      prevView = cur
+        ? { had: true, ci: Math.max(0, cases.findIndex(x => x.id === cur.caseId)), ui: Math.max(0, (cases.find(x => x.id === cur.caseId) || { units: [] }).units.findIndex(x => x.id === cur.unitId)) }
+        : { had: false, ci, ui };
       // Invalidate any in-flight showUnit: a slow (Google-Drive) loadCur resolving during the reads below
       // would otherwise pass its `gen === navGen` gate and resurrect the OLD unit into `cur`. The openBusy
       // gate our caller set (synchronously, before any await) keeps NEW navigation from un-freezing it.
@@ -845,7 +849,16 @@
     navBusy = true; setNavBusy(true);
     let perf; try { perf = await ensureCasePerfusion(c); } finally { if (gen === navGen) { navBusy = false; setNavBusy(false); } }   // ANS-1: same rule as showUnit
     if (gen !== navGen) return false;                       // superseded by a newer navigation
-    if (!perf) { ci = prevCi; ui = prevUi; setBanner('perfFailed', null, 'warn'); return false; }
+    // REVIEW FIX SW-3: this restored ci/ui blindly. The loadCur failure path 60 lines up deliberately does
+    // syncNavToCur() + highlightNav() instead, because prevCi/prevUi are the coordinates of a navigation that
+    // may itself have been superseded — restoring them leaves the case dropdown and the rail pointing at a
+    // frame that is not on screen, permanently.
+    if (!perf) {
+      if (!syncNavToCur()) { ci = prevCi; ui = prevUi; }
+      setBanner('perfFailed', null, 'warn');
+      highlightNav();
+      return false;
+    }
     cur = { W: perf.W, H: perf.H, caseId: c.id, unitId: u.id, unit: u, virtual: true };
     curGeom = null; refreshGeomPanel();                     // perfusion unit has no geometry — hide the panel
     exitMarkerArm();
@@ -1252,7 +1265,7 @@
           if (rec !== 'kept-dirty' && rec !== 'conflict' || !lastSeenMtime.has(uk)) lastSeenMtime.set(uk, annMtime);   // R7: same rule as loadCur (advance when State mirrors the file, or on a first sighting)
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
-        if (curCase() && c.id === curCase().id) updateFrameStar(c.id, u.id);   // the row was built before this unit was read: a stale hollow ☆ that the doctor clicks DELETES the star on disk
+        if (cur && c.id === cur.caseId) updateFrameStar(c.id, u.id);   // SW-5: the rail shows the DISPLAYED case's rows   // the row was built before this unit was read: a stale hollow ☆ that the doctor clicks DELETES the star on disk
         collectAnnClasses(ann, diskUsed);                      // flat v5 AND v6 layers — a class used only inside a layer must be re-added too
         scanDone++;
         if ((scanDone & 15) === 0 || scanDone === scanTotal) updateScanProg();
@@ -1715,8 +1728,15 @@
       catch (e) { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: u.id }, 'warn'); }
     }
   }
+  // REVIEW FIX SW-1: this built the NAV TARGET's rows (curCase()) while the canvas, the header, and
+  // highlightNav all anchor on the DISPLAYED frame. On a cold folder a case switch takes seconds, and three
+  // independent things rebuild the list inside that window — onLangChange, the background scan's tail, and
+  // a star whose ensureSeeded read just finished. The rail then listed the INCOMING case's frames over the
+  // outgoing case's image. The rows are correctly bound to their own case id (v77), so clicking a star did
+  // exactly what the row said — it starred the OTHER case's frame, which is not what the doctor meant.
+  // Same anchor as refreshMeta/highlightNav: the frame on screen.
   function buildFrameList() {
-    const c = curCase(), list = $('frameList'); list.innerHTML = '';
+    const c = (cur && cases.find(x => x.id === cur.caseId)) || curCase(), list = $('frameList'); list.innerHTML = '';
     if (!c) return;
     // A row outlives the case it was built for: showUnit advances ci BEFORE its (slow) await, so a click that
     // lands during a case switch used to be applied to the INCOMING case's frame of the same index. Bind each
