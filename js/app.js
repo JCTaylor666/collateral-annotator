@@ -325,8 +325,13 @@
       // class 0 brush is a silent no-op on empty pixels and a silent ERASER over existing paint. Offending
       // entries are dropped with a banner, and the file is treated like a corrupt one: nothing rewrites it
       // automatically — fixing it is the user's (pipeline's) call.
-      const badIdx = cls.list.filter(x => !(Number.isFinite(x.index) && x.index >= 1));
-      classes = cls.list.filter(x => Number.isFinite(x.index) && x.index >= 1);
+      // REVIEW FIX HF-5: "finite and >= 1" let 70000 and 2.5 through. The paint layer is a Uint16Array, so
+      // 70000 is STORED as 4464 — the doctor paints with "Pial collateral" and the file records a class that
+      // does not exist — and a fractional index can never match anything the brush writes. The usable range
+      // is exactly 1…65535, integers.
+      const okIdx = x => Number.isInteger(x.index) && x.index >= 1 && x.index <= 65535;
+      const badIdx = cls.list.filter(x => !okIdx(x));
+      classes = cls.list.filter(okIdx);
       // F1: entries loadClasses had to DISCARD (no usable index) count as "this file is not trustworthy"
       // exactly like an index-0 entry does — otherwise the file is auto-regenerated over the real names.
       const badCount = badIdx.length + (cls.dropped || 0);
@@ -1163,11 +1168,28 @@
   // canonical ANNOTATION-CONTENT signature (ignores metadata: schema_version/case/unit/image_size/coord_order/
   // layer_name) so "same annotations, different file wrapper" compares equal — used to avoid a spurious
   // unsaved-backup when a stale dirty flag actually matches the disk content.
+  // REVIEW FIX SIO-3: the signature compared coordinate ARRAYS verbatim while the app writes them in the
+  // CURRENT "coordinate order" preference and a file carries its own. Flip that setting once and a
+  // byte-identical, re-synced annotation.json stopped comparing equal to our rebuild of it — the quiet
+  // "same content, only the timestamp moved" adoption turned into a conflict for every frame in the folder.
+  // Canonicalise to x,y first, exactly as noteContentSig already does for markers.
   function annContentSig(a) {
     if (!a || typeof a !== 'object') return 'null';
-    const layer = o => ({ collaterals: o.collaterals || [], points: o.points || [], paint: (o.paint && o.paint.classes) || null });
+    const ord = a.coord_order === 'yx' ? 'yx' : 'xy';
+    const cxy = c2 => (Array.isArray(c2) && c2.length === 2) ? (ord === 'xy' ? [c2[0], c2[1]] : [c2[1], c2[0]]) : c2;
+    const norm = arr => (Array.isArray(arr) ? arr : []).map(it => {
+      if (Array.isArray(it)) return { click: cxy(it) };
+      if (!it || typeof it !== 'object') return it;
+      const o = {}; if ('id' in it) o.id = it.id; o.click = cxy(it.click); if ('class' in it) o.class = it.class;
+      return o;
+    });
+    // REVIEW FIX SP-2: the signature ignored layer NAMES, so a frame whose only unsaved change was a layer
+    // rename compared EQUAL to the disk copy. reconcile then took its 'stale-clean' path — adopt the file,
+    // markClean — and the rename was gone with no banner, no sidecar, and the mirror record erased. A name
+    // the doctor typed is content.
+    const layer = o => ({ name: o.name == null ? null : String(o.name), collaterals: norm(o.collaterals), points: norm(o.points), paint: (o.paint && o.paint.classes) || null });
     if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => ({ id: l.id, ...layer(l) })) });
-    return JSON.stringify({ starred: !!a.starred, layers: [{ id: 0, ...layer(a) }] });
+    return JSON.stringify({ starred: !!a.starred, layer_name: a.layer_name == null ? null : String(a.layer_name), layers: [{ id: 0, ...layer(a) }] });
   }
   function collectAnnClasses(ann, used) {
     const cls = v => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -1278,7 +1300,7 @@
     const used = new Set([...diskUsed, ...State.usedClasses()]);   // disk truth + live memory AT THE TAIL — no stale start-snapshot (deleteClass mid-scan must stay deleted)
     const have = new Set(classes.map(cl => cl.index));
     let added = 0;
-    for (const idx of [...used].sort((a, b) => a - b)) if (idx >= 1 && !have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }   // 4.7: never auto-add class 0 — it is the paint layer's \"unpainted\" value
+    for (const idx of [...used].sort((a, b) => a - b)) if (Number.isInteger(idx) && idx >= 1 && idx <= 65535 && !have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }   // UI-7/HF-5: never auto-add a fractional or out-of-range index either   // 4.7: never auto-add class 0 — it is the paint layer's \"unpainted\" value
     if (added && scanRoot === rootHandle) {
       classes.sort((a, b) => a.index - b.index);
       ensureActiveClass(); buildClassMgr(); buildClassPicker();
@@ -2129,7 +2151,21 @@
       if (Array.isArray(o.points)) for (const it of o.points) { const c2 = Array.isArray(it) ? it : (it && it.click); if (Array.isArray(c2) && c2.length === 2) out.pts.push(conv(c2)); }
       if (o.paint && o.paint.classes) out.paintRles.push(o.paint);
     };
-    if (Array.isArray(ann.layers) && ann.layers.length) { for (const ly of ann.layers) if (ly && typeof ly === 'object') one(ly); }
+    // REVIEW FIX CD-1: this counted every layer OBJECT, id or not, while State.importAnnotation skips any
+    // layer without a usable (and unique) numeric id. A file whose single layer carries a name but no `id`
+    // therefore showed "20 segments · 3 points" in the chooser — and picking it imported NOTHING, leaving a
+    // frame that is clean AND empty, which the next edit then writes over the folder copy. Count only what
+    // would actually be imported, exactly as importAnnotation decides it.
+    if (Array.isArray(ann.layers) && ann.layers.length) {
+      const seenIds = [];
+      for (const ly of ann.layers) {
+        if (!ly || typeof ly !== 'object') continue;
+        const lid = Number(ly.id);
+        if (!Number.isFinite(lid) || seenIds.indexOf(lid) >= 0) continue;   // importAnnotation drops these
+        seenIds.push(lid);
+        one(ly);
+      }
+    }
     else one(ann);
     out.starred = ann.starred === true;
     return out;
@@ -2146,7 +2182,16 @@
   }
   function paintPx(rles, W, H) {   // total painted pixels across layers (for the summary line)
     let mask = null;
-    for (const r of rles) { const d = State.decodeRLE(r, W, H); if (!mask) mask = new Uint8Array(W * H); for (let i = 0; i < d.length; i++) if (d[i]) mask[i] = 1; }
+    for (const r of rles) {
+      // REVIEW FIX CD-4: this called the raw decoder, bypassing the guard paintDense applies — so the
+      // chooser counted (and the thumbnail tinted) paint that the app itself refuses to DISPLAY: a blob
+      // recorded at other dimensions, or in an encoding this build cannot read. The doctor compared against
+      // pixels that would never appear on screen.
+      if (!r || !r.classes) continue;
+      if (r.encoding !== 'rle_rows_v1') continue;
+      if ((r.width && r.width !== W) || (r.height && r.height !== H)) continue;
+      const d = State.decodeRLE(r, W, H); if (!mask) mask = new Uint8Array(W * H); for (let i = 0; i < d.length; i++) if (d[i]) mask[i] = 1;
+    }
     if (!mask) return { n: 0, mask: null };
     let n = 0; for (let i = 0; i < mask.length; i++) n += mask[i];
     return { n, mask };
@@ -2248,15 +2293,18 @@
     }
     if (tok !== dsToken) return;
     if (choice === 'disk') {
-      let backedUp = false;
+      // REVIEW FIX I18N-1: the banner named annotation.unsaved-backup.json unconditionally. When only the
+      // NOTE differed, the file actually written was note.unsaved-backup.json — and the doctor went looking
+      // for a file that does not exist. Name what we really wrote.
+      let backedUp = false; const keptFiles = [];
       try {
         const sz = (r.ann && Array.isArray(r.ann.image_size) && r.ann.image_size.length === 2) ? r.ann.image_size : [0, 0];
         const localAnn = State.buildAnnotation(cc, uu, sz[0], sz[1]);
         if (State.unitHasContent(cc, uu) && annContentSig(localAnn) !== annContentSig(r.ann)) {
-          await FS.writeText(unit.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2)); backedUp = true;
+          await FS.writeText(unit.handle, 'annotation.unsaved-backup.json', JSON.stringify(localAnn, null, 2)); backedUp = true; keptFiles.push('annotation.unsaved-backup.json');
         }
         if (State.hasNoteData(cc, uu) && noteContentSig(State.buildNote(cc, uu)) !== noteContentSig(r.note)) {
-          await FS.writeText(unit.handle, 'note.unsaved-backup.json', JSON.stringify(State.buildNote(cc, uu), null, 2)); backedUp = true;
+          await FS.writeText(unit.handle, 'note.unsaved-backup.json', JSON.stringify(State.buildNote(cc, uu), null, 2)); backedUp = true; keptFiles.push('note.unsaved-backup.json');
         }
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
       if (tok !== dsToken) return;
@@ -2290,7 +2338,7 @@
         $('note').value = State.getNote(cc, uu);
       }
       highlightNav(); updateDirtyUI();
-      setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', null, 'ok');
+      setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', { file: keptFiles.join(' + ') }, 'ok');
     } else {
       // REVIEW FIX R3: `if (r.ann)` meant that exactly when the folder copy could NOT be parsed — the one
       // case where it is irreplaceable — no external-backup was written and writeUnit overwrote it anyway.
@@ -2808,6 +2856,9 @@
         setSaveStatus(null);                          // the frame is NOT saved — never claim it is
         setBanner('conflictFoundFmt', { id: p.unit.id }, 'warn');
         if (cur && cur.caseId === p.c && cur.unitId === p.unit.id) showConflictDialog(k2);
+      } else if (protectedUnits.has(k2)) {            // REVIEW FIX BT-6: read-only is the OTHER silent refusal
+        setSaveStatus(null);
+        setBanner('protectedFrameFmt', { id: p.unit.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
       } else setSavedStatus();
     }
     catch (e) { setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser

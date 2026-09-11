@@ -673,7 +673,17 @@
       const s = selLW(c, u, L);
       for (const item of obj.collaterals) {
         if (!item || typeof item !== 'object') continue;   // a null/garbage element must not abort the whole import (and the folder open)
-        const id = Number(item.id); if (!Number.isFinite(id)) continue;
+        // REVIEW FIX HF-6: Number() turns null into 0, "" into 0 and true into 1, and Number.isFinite let
+        // them through — so a collateral with no usable id was stored under segment 0 (an invisible,
+        // un-removable ghost: canvas.js never draws label value 0, and clicking background resolves to 0 so
+        // it can never be toggled off) or silently re-attached to segment 1, a real and different vessel.
+        // It was then written back that way. A segment id is a positive integer or it is not an id.
+        // Number() also turns true into 1, so a type check has to come first — otherwise `{"id": true}`
+        // silently became segment 1, a real and different vessel.
+        const rawId = item.id;
+        if (rawId === null || rawId === undefined || rawId === '' || typeof rawId === 'boolean') continue;
+        const id = Number(rawId);
+        if (!Number.isInteger(id) || id < 1) continue;
         const xy = (Array.isArray(item.click) && item.click.length === 2) ? conv(item.click) : [-1, -1];
         s[String(id)] = { xy, cls: asCls(item.class) };
       }
@@ -699,8 +709,9 @@
   // SHORTENED version back over it.
   function itemsDropped(obj) {
     let d = 0;
+    const usableId = v => !(v === null || v === undefined || v === '' || typeof v === 'boolean') && Number.isInteger(Number(v)) && Number(v) >= 1;
     if (obj && Array.isArray(obj.collaterals)) for (const it of obj.collaterals) {
-      if (!it || typeof it !== 'object' || !Number.isFinite(Number(it.id))) d++;
+      if (!it || typeof it !== 'object' || !usableId(it.id)) d++;
     }
     if (obj && Array.isArray(obj.points)) for (const it of obj.points) {
       const click = Array.isArray(it) ? it : (it && it.click);
