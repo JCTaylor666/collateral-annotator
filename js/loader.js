@@ -25,25 +25,33 @@
       dirs.push({ name, handle, cnum });
     }
     const cases = new Array(dirs.length); let next = 0;
+    const skipped = [];
     const worker = async () => {
       while (next < dirs.length) {
         const i = next++, d = dirs[i];
-        const units = [];
-        for await (const [uname, uhandle] of d.handle.entries()) {
-          if (uhandle.kind !== 'directory' || uname.startsWith('.')) continue;
-          const isMinip = uname === 'minip';
-          const unum = folderNum(uname);
-          if (!isMinip && unum === null) continue;            // not a numbered frame folder (nor minip) — ignore
-          units.push({ id: uname, kind: isMinip ? 'minip' : 'frame',
-                       order: isMinip ? Infinity : unum, handle: uhandle });
-        }
-        units.sort((a, b) => a.order - b.order);
-        cases[i] = units.length ? { id: d.name, num: d.cnum, handle: d.handle, units } : null;
+        // REVIEW FIX LN-3: one unlistable case folder — a permission blip, a half-synced Drive directory —
+        // used to reject Promise.all and fail the ENTIRE Open, with an error that named no folder at all.
+        // A dataset is hundreds of independent case directories; one being unreadable right now is a
+        // warning, not a reason to refuse the other 299. Isolate it and report which.
+        try {
+          const units = [];
+          for await (const [uname, uhandle] of d.handle.entries()) {
+            if (uhandle.kind !== 'directory' || uname.startsWith('.')) continue;
+            const isMinip = uname === 'minip';
+            const unum = folderNum(uname);
+            if (!isMinip && unum === null) continue;            // not a numbered frame folder (nor minip) — ignore
+            units.push({ id: uname, kind: isMinip ? 'minip' : 'frame',
+                         order: isMinip ? Infinity : unum, handle: uhandle });
+          }
+          units.sort((a, b) => a.order - b.order);
+          cases[i] = units.length ? { id: d.name, num: d.cnum, handle: d.handle, units } : null;
+        } catch (e) { cases[i] = null; skipped.push(d.name); }
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, Math.max(1, dirs.length)) }, worker));
     const out = cases.filter(Boolean);
     out.sort((a, b) => a.num - b.num);
+    out.skipped = skipped;                                     // LN-3: names of case folders that could not be listed
     return out;
   }
 

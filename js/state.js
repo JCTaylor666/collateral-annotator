@@ -543,7 +543,12 @@
   function resetUnit(c, u) {
     const k = key(c, u), pfx = k + '#';
     for (const store of [selections, points, paintR]) for (const kk of Object.keys(store)) if (kk === k || kk.startsWith(pfx)) delete store[kk];
-    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k]; delete writtenAt[k];
+    // REVIEW FIX SP-3: writtenAt is the PERSISTED "this file on disk is ours" stamp — the reload guard this
+    // file's own header describes. resetUnit runs for every CLEAN frame the background scan touches, so the
+    // scan stripped it from the whole dataset on every open, after which the first reconcile of each frame
+    // could mistake our own last write for an external change. Re-seeding a unit from disk does not make
+    // our past write somebody else's.
+    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
     // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
     // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
     undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persistUnit(c, u);

@@ -215,6 +215,16 @@
     function setPaint(dense) { paint = (dense instanceof Uint16Array && dense.length === W * H) ? dense : new Uint16Array(W * H); buildPaintLayer(); }
     function getPaint() { return paint; }
     function setPaintColorFn(fn) { paintColorFn = fn; }
+    // REVIEW FIX MEM-3: dragging the perfusion smoothness slider re-ran the WHOLE setUnit path per notch —
+    // reallocating paint, gray, the segment index and every layer canvas (~100 MB per repaint, ~700 MB/s
+    // while dragging) even though nothing but the colour image changes. When the size and mode already
+    // match, swap the image and redraw the base only.
+    function setColorImage(image) {
+      if (!colorMode || !W || !H) return false;
+      img = image; colorImg = image;
+      buildBase();
+      return true;
+    }
     function setBrushCursor(x, y, r, show) { brushCur = show ? { x, y, r } : null; }
 
     function setSelected(s, all) { sel = (s instanceof Map) ? s : new Map(); selAll = (all instanceof Set) ? all : new Set(sel.keys()); if (W) buildSelLayer(); }   // callers that pass no full set keep the old display==exclusion behaviour
@@ -469,7 +479,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, selApplyDelta, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray, flushPaintLayer,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray, flushPaintLayer, setColorImage,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

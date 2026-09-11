@@ -38,7 +38,7 @@
 <div class="doc-sec"><h4><code>mask.npy</code> — input, optional</h4><ul>
 <li>2-D <code>(H, W)</code> uint8 array of 0/1: the vessel mask. Rendered as the bright-blue overlay; also limits the brush when “Foreground only” is checked.</li>
 <li><b>Shape rule:</b> <code>frames.png</code>, <code>label.npy</code>, and <code>mask.npy</code> (when present) must all share one H×W. If any disagree, the frame becomes a view-only grey placeholder that lists the shapes — it is never annotated or saved.</li>
-<li>If <code>mask.npy</code> is <b>absent</b> there is simply no overlay (everything else works). If it is <b>present</b> it must match exactly — a present mask with a different shape, or one that is truncated / non-2-D, triggers the placeholder above (it is <em>not</em> silently ignored).</li>
+<li>If <code>mask.npy</code> is <b>absent</b> there is simply no overlay (everything else works). A mask that is <b>present and parses but has the wrong shape</b> triggers the grey placeholder above. A mask that is <b>present but cannot be parsed at all</b> (truncated, non-2-D, unsupported dtype) does <em>not</em>: the frame stays fully annotatable and shows a warning saying the overlay and the “foreground only” brush limit are off for it — decision 4.6, so a broken mask never blocks annotation.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>geometry.json</code> — input + output, optional</h4>
 <pre class="doc-tree">{ "segments": {

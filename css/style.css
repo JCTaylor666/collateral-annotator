@@ -207,3 +207,14 @@ body.sel-brush-mode .single-opts{display:none}
 .loupe-tile .cap{font-size:10px;color:var(--muted);line-height:1.1;text-align:center}
 .loupe-tile.cur .cap{color:var(--accent);font-weight:600}
 .loupe-curve{width:100%;height:120px;display:block}
+
+/* REVIEW FIX HCW-5: the header was a fixed-height overflow:hidden strip, so #curLabel was silently clipped
+   and below ~1250px the cursor readout, the panel toggle and the language buttons were cut out of reach
+   altogether. Let it wrap instead of swallowing its own controls. */
+header.strip{flex-wrap:wrap;height:auto;min-height:44px;overflow:visible}
+/* REVIEW FIX HCW-6: .modal had no max-height and .modal-overlay did not scroll, so below a ~554px viewport
+   the rescue chooser's Close button sat off-screen and could not be clicked at all. */
+.modal-overlay{overflow:auto;padding:12px}
+.modal{max-height:calc(100vh - 24px);overflow:auto}
+/* HCW-7: these spans are now real buttons to the keyboard — give them a visible focus ring. */
+[role="button"]:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}

@@ -203,6 +203,21 @@
   //   B7:  the action span was appended AFTER setBanner's height check, so a span that wrapped the banner
   //        onto a second line changed the canvas height with no re-layout — every click then resolved to
   //        an image row above the cursor. Re-check the height here.
+  // REVIEW FIX HCW-7: every per-item destructive control (layer delete/rename, marker delete, the star) was
+  // a bare <span onclick> — not in the tab order, and Enter/Space did nothing. A doctor working by keyboard
+  // could not reach them at all, and a screen reader announced them as plain text. One helper makes any
+  // span behave like the button it already looks like.
+  function asButton(el, label) {
+    el.setAttribute('role', 'button');
+    el.setAttribute('tabindex', '0');
+    if (label) el.setAttribute('aria-label', label);
+    el.addEventListener('keydown', ev => {
+      if (ev.key !== 'Enter' && ev.key !== ' ') return;
+      ev.preventDefault(); ev.stopPropagation();
+      if (typeof el.onclick === 'function') el.onclick(ev);
+    });
+    return el;
+  }
   let bannerActions = [];   // {labelKey, onClick} for the links riding on the CURRENT banner (see onLangChange)
   function bannerAddAction(labelKey, onClick) {
     const b = $('banner');
@@ -322,6 +337,7 @@
       // Nothing is committed yet, so an unusable pick leaves the dataset that IS open fully alive: its rows
       // still navigate, its classes.json is still the one that gets written.
       if (!found.length) { setBanner('errNoCases', null, 'warn'); return { restore: prevView }; }
+      const skippedCases = found.skipped || [];   // LN-3: case folders that could not be listed at all
       const cls = await Loader.loadClasses(newRoot);
       // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
       for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
@@ -360,9 +376,9 @@
       buildClassMgr(); buildClassPicker();
       setBanner(null);
       // ---------------------------------- end COMMIT ----------------------------------
-      return { show: true, sw, reminted };
+      return { show: true, sw, reminted, skippedCases };
     } catch (e) {
-      if (committed) return { show: true, sw, reminted };           // the synchronous commit already ran: the new dataset IS open
+      if (committed) return { show: true, sw, reminted, skippedCases: [] };   // the synchronous commit already ran: the new dataset IS open
       if (!(e && e.name === 'AbortError')) setBanner('errOpenFailed', { msg: e.message }, 'warn');   // AbortError = the doctor closed the picker
       return prevView ? { restore: prevView } : null;               // nothing was committed — put the frozen view back
     }
@@ -389,10 +405,16 @@
     const myGen = openGen;
     const okUnit = await showUnit(0, 0);        // show the FIRST frame immediately — loadCur reconciles it from disk itself, no need to wait for the scan
     if (myGen !== openGen) return;              // a newer Open committed while we were loading: its own tail owns the scan
+    // REVIEW FIX F4: if that first frame could not be shown (the doctor cancelled a second Open during the
+    // load, or the frame failed), `cur` stays null — blank canvas, empty rail, and #progress frozen on
+    // "Loading…" until the whole background scan ends. Put something on screen.
+    if (!okUnit && !cur && cases.length) { for (let i = 1; i < Math.min(cases[0].units.length, 4); i++) { if (await showUnit(0, i)) break; } }
+    if (!cur) setNavBusy(false);                // at minimum, stop claiming we are still loading
     // higher-priority open-time warnings take precedence — but never clobber a load-failure banner
     if (okUnit) {
       if (classesIndexBad) setBanner('classesIndexZero', { n: classesBadCount }, 'warn');
       else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
+      else if (act.skippedCases && act.skippedCases.length) setBanner('casesSkippedFmt', { n: act.skippedCases.length, names: act.skippedCases.slice(0, 4).join(', ') + (act.skippedCases.length > 4 ? ' …' : '') }, 'warn');   // LN-3
       else if (act.reminted) setBanner('datasetReminted', null, 'warn');   // SC-1: this folder was a copy of the one that was open
       else if (act.sw && act.sw.switched && act.sw.hadDirty) setBanner('datasetSwitched', null, 'warn');
     }
@@ -413,8 +435,11 @@
     // per cached frame ≈ label(2B/px) + mask(1B/px) + decoded image (~4B/px) ⇒ ~7B/px; budget ~900MB.
     const byteCap = maxPxSeen ? Math.floor(900e6 / (maxPxSeen * 7)) : 192;
     const want = Math.min(3 * maxSeqLen + 16, byteCap);
-    const floor_ = Math.min(192, Math.max(16, maxSeqLen + 8));   // always hold the longest live sequence + margin (anti-thrash)
-    cacheCap = Math.min(192, Math.max(floor_, want));
+    // REVIEW FIX MEM-4: the anti-thrash floor was applied AFTER the byte budget, so on a dataset with long
+    // sequences it silently overrode it — at 1432² and maxSeqLen 70 the floor alone is 78 frames ≈ 1.1 GB,
+    // well past the 900 MB the line above computes. Keep the floor, but never let it exceed the budget.
+    const floor_ = Math.min(192, Math.max(16, maxSeqLen + 8));
+    cacheCap = Math.min(192, Math.max(Math.min(floor_, byteCap), want));
   }
   function cacheInsert(k, data, cold) {
     if (cache.has(k)) cache.delete(k);
@@ -443,6 +468,11 @@
   // and a late read from a switched-away dataset can never pollute the new dataset's cache.
   function loadUnitCached(u, k, cold) {
     const hit = cacheTouch(k); if (hit !== undefined) return Promise.resolve(hit);
+    // REVIEW FIX MEM-6: nothing capped how many full-frame decodes could be in flight at once. Holding an
+    // arrow key on a cold Drive folder starts one per keypress — dozens of label+mask+image buffers live
+    // simultaneously, none of them in `cache` yet and so invisible to cacheCap's byte budget. A cold
+    // (prefetch) request is simply dropped when the pipe is full; a real navigation is never refused.
+    if (cold && inflightLoads.size >= 6 && !inflightLoads.has(k)) return Promise.resolve(undefined);
     let p = inflightLoads.get(k);
     if (!p) {
       const gen = openGen;
@@ -657,6 +687,10 @@
     if (got === 'failed') return Promise.resolve(null);
     if (got && got.fields) return Promise.resolve(perfView(c));   // cached fields -> colour at current smoothness
     if (perfInflight.has(c.id)) return perfInflight.get(c.id);
+    // REVIEW FIX LP-4: the "<2 frames" test below is SYNCHRONOUS, so the promise settled — and its finally
+    // ran — BEFORE `perfInflight.set(c.id, p)` executed. The resolved entry then sat in perfInflight for
+    // ever and every later call returned it instead of re-evaluating. Decide it here, outside the promise.
+    if (c.units.filter(u => u.kind === 'frame').length < 2) { perfPut(c.id, 'failed'); return Promise.resolve(null); }
     const pGen = openGen;
     const p = (async () => {
       try {
@@ -813,6 +847,7 @@
     State.markVisited(c.id, u.id);
     cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u, protected: protectedUnits.has(State.key(c.id, u.id)) };
     curGeom = data.geometry || null;                          // per-segment radius (drives the geometry stats + filter panel)
+    perfShownDims = '';                       // MEM-3: a REAL frame invalidates the perfusion fast path
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
     view.setPerfLegend(0);
     view.setSelected(selColorMap(), selFullSet());
@@ -848,8 +883,18 @@
 
   // draw a perfusion map into the main canvas (shared by nav-in and the live smoothness slider). Keeps
   // zoom/pan (setUnit only re-fits on a dimension change) so re-colouring mid-drag doesn't jump the view.
+  let perfShownDims = '';   // MEM-3: dimensions of the perfusion map currently in the view
   function paintPerfIntoView(perf) {
     const W = perf.W, H = perf.H;
+    // REVIEW FIX MEM-3: dragging the smoothness slider re-ran the WHOLE setUnit path per notch —
+    // reallocating paint, gray, the segment index and every layer canvas (~100 MB per repaint, ~700 MB/s
+    // while dragging) even though nothing but the colour image changes. Take the cheap path when the view
+    // already holds a perfusion map of the same size.
+    if (perfShownDims === W + 'x' + H && view.setColorImage && view.setColorImage(perf.canvas)) {
+      view.setPerfLegend(perf.frames); view.render();
+      return;
+    }
+    perfShownDims = W + 'x' + H;
     view.setUnit(perf.canvas, W, H, new Uint16Array(W * H), null, true);   // empty label, no mask, colour image as-is
     view.setPerfLegend(perf.frames);   // arrival-time colour legend (frame ticks)
     view.setSelected(new Map(), new Set()); view.setPaint(new Uint16Array(W * H));
@@ -957,6 +1002,7 @@
       const ed = document.createElement('span'); ed.className = 'led'; ed.textContent = '✎'; ed.title = I18n.t('layerRenameTitle');
       ed.onclick = e => { e.stopPropagation(); renameLayerAction(ly.id, ly.name); };
       const del = document.createElement('span'); del.className = 'lx'; del.textContent = '✕'; del.title = I18n.t('layerDeleteTitle');
+      asButton(del, I18n.t('layerDeleteTitle'));   // HCW-7
       del.onclick = e => { e.stopPropagation(); deleteLayerAction(ly.id, ly.name); };
       chip.appendChild(name); chip.appendChild(ed); chip.appendChild(del);
       bar.appendChild(chip);
@@ -1065,7 +1111,11 @@
   function setupGeomRangeForMetric(restore) {
     const vals = view.labelSegs().map(segVal).filter(v => v != null);
     if (!vals.length) { $('geomPanel').classList.add('hidden'); view.setVisibleSegs(null); return; }
-    geomLo = Math.min(...vals); geomHi = Math.max(...vals);
+    // REVIEW FIX HF-7: Math.min(...vals) blows the argument limit past ~125k values and throws RangeError,
+    // which aborts showUnit MID-RENDER — the note textarea keeps the previous frame's text while the canvas
+    // has already moved on. A dense geometry.json on a large label map reaches that easily. Loop instead.
+    geomLo = Infinity; geomHi = -Infinity;
+    for (let i = 0; i < vals.length; i++) { const v = vals[i]; if (v < geomLo) geomLo = v; if (v > geomHi) geomHi = v; }
     const clampG = v => Math.max(geomLo, Math.min(geomHi, v));
     const saved = (restore && curGeom.filter && curGeom.filter.metric === geomMetric) ? curGeom.filter : null;
     if (saved) { geomMin = clampG(saved.min); geomMax = Math.max(geomMin, clampG(saved.max)); }   // restore this metric's saved window
@@ -1110,9 +1160,22 @@
   }
   function flushGeomWrite(force) {
     if (geomSaveTimer) { clearTimeout(geomSaveTimer); geomSaveTimer = null; }
-    if (!rootHandle || !pendingGeom.size || (!force && !$('autoSave').checked)) return;
-    for (const [, p] of pendingGeom) if (p.unit && p.unit.handle) FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).catch(() => {});   // best-effort; a filter write must never block
+    if (!rootHandle || !pendingGeom.size) return;
+    if (!force && !$('autoSave').checked) {
+      // MEM-5: with auto-save off nothing was written AND nothing was dropped, so a session of filtering
+      // held one parsed geometry.json per frame forever. The radius window is a view preference — keeping
+      // the most recent ones is plenty; the rest are released.
+      const CAP = 64;
+      while (pendingGeom.size > CAP) pendingGeom.delete(pendingGeom.keys().next().value);
+      return;
+    }
+    const pend = [...pendingGeom.values()];
     pendingGeom.clear();
+    // UI-6: every error used to be swallowed while the save modal reported an unqualified success.
+    Promise.all(pend.map(p => (p.unit && p.unit.handle)
+      ? FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).then(() => true, () => false)
+      : Promise.resolve(true)))
+      .then(rs => { const bad = rs.filter(x => !x).length; if (bad) setBanner('geomWriteFailedFmt', { n: bad }, 'warn'); });
   }
   function ensureActiveClass() {
     if (!classes.length) { State.setActiveClass(null); return; }
@@ -1126,9 +1189,15 @@
   // backup is retried on the next attempt instead of being skipped forever.
   async function backupClassesOnce() {
     if (!classesFileCorrupt || classesBackedUp) return true;
+    // REVIEW FIX UI-3: `rootHandle` was re-read on both sides of the await, so a folder switch landing in
+    // between copied folder A's classes.json into folder B — and then set the latch, marking B "backed up"
+    // when it never was. Bind the handle once.
+    const root = rootHandle;
     try {
-      const fh = await rootHandle.getFileHandle('classes.json');
-      await FS.writeText(rootHandle, 'classes.json.corrupt', await (await fh.getFile()).text());
+      const fh = await root.getFileHandle('classes.json');
+      if (root !== rootHandle) return false;
+      await FS.writeText(root, 'classes.json.corrupt', await (await fh.getFile()).text());
+      if (root !== rootHandle) return false;
       classesBackedUp = true;
       return true;
     } catch (e) { return false; }
@@ -1236,8 +1305,10 @@
     const total = units.length;
     let next = 0, done = 0, unread = unimported;
     if (onProgress) onProgress(0, total);
+    const tok0 = dsToken, gen0 = openGen;   // REVIEW FIX SU-9: the workers had no generation check, so a sweep kept reading a folder that was already closed — and repainted the NEW dataset's scan-progress line with the old one's counts
     const worker = async () => {
       while (next < units.length) {
+        if (tok0 !== dsToken || gen0 !== openGen) return;
         const u = units[next++];
         try {
           const r = await Loader.loadAnnotation(u);
@@ -1310,7 +1381,13 @@
     for (const idx of [...used].sort((a, b) => a - b)) if (Number.isInteger(idx) && idx >= 1 && idx <= 65535 && !have.has(idx)) { classes.push({ index: idx, name: randomName() }); added++; }   // UI-7/HF-5: never auto-add a fractional or out-of-range index either   // 4.7: never auto-add class 0 — it is the paint layer's \"unpainted\" value
     if (added && scanRoot === rootHandle) {
       classes.sort((a, b) => a.index - b.index);
-      ensureActiveClass(); buildClassMgr(); buildClassPicker();
+      ensureActiveClass();
+      // REVIEW FIX UI-5: the scan's tail rebuilt the class manager under the doctor's hands, throwing away a
+      // rename they were part-way through typing. Skip the rebuild while a class name field has focus; the
+      // picker (which has no editable field) is safe to refresh either way.
+      const ae = typeof document !== 'undefined' && document.activeElement;
+      if (!(ae && ae.classList && ae.classList.contains('cls-name-inp'))) buildClassMgr();
+      buildClassPicker();
       // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
       if (!classesFileCorrupt) await saveClasses();
     }
@@ -1505,7 +1582,11 @@
     // Mirror EVERY source layer onto the (empty) target: reuse the target's lone layer for the first source
     // layer, add a fresh one for each subsequent. Segments/points are re-resolved by coordinate against the
     // target's own label; paint copies 1:1 only at identical W×H. Each layer's writes go to that layer's bucket.
+    // REVIEW FIX AEP-4: `dropped` lumped three unrelated causes together and the banner named only one of
+    // them ("with no class"), so a doctor copying between differently-sized frames was told marks were
+    // skipped for a reason that had nothing to do with what happened.
     let totSegs = 0, totPts = 0, totPaint = 0, dropped = 0, paintSkipped = false;
+    let dropNoClass = 0, dropOutside = 0, dropCollide = 0;
     for (let li = 0; li < layerData.length; li++) {
       const { ly, data } = layerData[li];
       let tLayer;
@@ -1515,13 +1596,13 @@
       const segMap = new Map(), ptSeen = new Set(), pts = [];
       for (const s of data.segs.concat(data.points)) {
         const xy = s.xy, cls = s.cls;
-        if (cls == null) { dropped++; continue; }
-        if (!xy || !view.inBounds(xy[0], xy[1])) { dropped++; continue; }   // no/out-of-bounds coordinate: can't re-resolve
+        if (cls == null) { dropNoClass++; dropped++; continue; }
+        if (!xy || !view.inBounds(xy[0], xy[1])) { dropOutside++; dropped++; continue; }   // no/out-of-bounds coordinate: can't re-resolve
         const seg = view.segAt(xy[0], xy[1]);
         if (seg > 0) {
           const prev = segMap.get(seg);
           if (!prev) segMap.set(seg, { xy, cls });
-          else if (prev.cls !== cls) dropped++;               // two source marks hit the same target segment with different classes: first wins, count the loser
+          else if (prev.cls !== cls) { dropCollide++; dropped++; }   // two source marks hit the same target segment with different classes: first wins, count the loser
         }
         else { const k = xy[0] + ',' + xy[1]; if (!ptSeen.has(k)) { ptSeen.add(k); pts.push({ xy, cls }); } }
       }
@@ -1548,7 +1629,11 @@
     State.setActiveLayer(tc, tu, (tLayers[srcActiveIdx] || tLayers[0]).id);
     State.markDirty(tc, tu);
     renderActiveLayer(); buildLayerBar(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
-    const droppedTxt = dropped ? I18n.t('copyDoneDropped', { n: dropped }) : '';
+    const parts = [];
+    if (dropNoClass) parts.push(I18n.t('copyDropNoClass', { n: dropNoClass }));
+    if (dropOutside) parts.push(I18n.t('copyDropOutside', { n: dropOutside }));
+    if (dropCollide) parts.push(I18n.t('copyDropCollide', { n: dropCollide }));
+    const droppedTxt = parts.length ? I18n.t('copyDoneDropped', { n: dropped }) + ' (' + parts.join(', ') + ')' : '';
     const paintTxt = totPaint ? I18n.t('copyDonePaint', { n: totPaint }) : (paintSkipped ? I18n.t('copyPaintSkipped') : '');
     setBanner('copyDone', { id: srcUnit.id, segs: totSegs, pts: totPts, dropped: droppedTxt + paintTxt }, paintSkipped ? 'warn' : 'ok');
   }
@@ -1572,6 +1657,7 @@
       const chip = document.createElement('span'); chip.className = 'mk-chip';
       const dot = document.createElement('span'); dot.className = 'mk-dot'; dot.textContent = m.id;
       const x = document.createElement('span'); x.className = 'mk-x'; x.textContent = '×'; x.title = I18n.t('markerDelete');
+      asButton(x, I18n.t('markerDelete'));   // HCW-7
       x.onclick = () => {
         // REVIEW FIX R6/F2: this was the ONE edit entry point with no guard. On a read-only frame it
         // removed the marker from State while every writer refused the file, so the panel and the disk
@@ -1781,6 +1867,7 @@
       if (!u.virtual) {   // perfusion is view-only: no star / no annotation badge
         const on = State.isStarred(c.id, u.id);
         const star = document.createElement('span'); star.className = 'frm-star' + (on ? ' on' : ''); star.textContent = on ? '★' : '☆'; star.title = I18n.t(on ? 'unstarThisFrame' : 'starThisFrame');
+        asButton(star, I18n.t(on ? 'unstarThisFrame' : 'starThisFrame'));   // HCW-7
         star.onclick = (e) => { e.stopPropagation(); toggleStar(cid, uid); };
         el.appendChild(star);
       }
@@ -2767,6 +2854,7 @@
     for (const k of State.unitsWithData()) {
       if (tok !== dsToken) return;                                       // another folder was opened: the remaining units belong to it, not to us
       const ref = map.get(k); if (!ref || ref.u.virtual || ref.u.mismatch) continue;
+      if (!$('autoSave').checked) return;                                // REVIEW FIX SU-6: the sweep is the "auto-save was just switched ON" catch-up. It re-checked dsToken and isDirty every iteration but never the setting that started it, so switching auto-save back OFF mid-sweep did not stop it writing.
       if (!State.isDirty(ref.c.id, ref.u.id)) continue;                  // only work that is NOT on disk
       let st; try { st = await ensureSeeded(ref.c, ref.u); } catch (e) { st = 'unreadable'; }
       if (st !== 'seeded' && st !== 'already') continue;                 // unverifiable file: leave it untouched (Save reports it; the retry queue keeps trying)
@@ -2903,6 +2991,10 @@
         const oc = cases.find(cc => cc.id === top.c), ou = oc && oc.units.find(uu => uu.id === top.u);
         if (ou && !ou.virtual) { try { await loadUnitCached(ou, k, false); } catch (err) { return; } }   // can't get dims: leave the entry ON the stack for a later retry
       }
+      // REVIEW FIX UI-6: `cur` is dereferenced all the way down without re-checking, and openFolderTxn holds
+      // cur === null for seconds while it reads a folder. An undo landing there popped its entry and then
+      // threw it away on the null dereference. Bail BEFORE popping.
+      if (!cur) return;
     }
     const e = State.undo();
     if (!e) return;                                         // nothing undone: don't spuriously dirty the current unit
@@ -3030,7 +3122,7 @@
     $('btnRescueClose').onclick = hideRescueDialog;
     $('btnSaveClose').onclick = () => $('saveModal').classList.add('hidden');
     updateSaveButtons();
-    $('btnUndo').onclick = undo;
+    $('btnUndo').onclick = () => { if (!painting && !selecting) undo(); };   // REVIEW FIX UI-5: the hotkey has this guard (an undo INTO a live stroke corrupts its change record); a focused Undo button did not
     $('btnClear').onclick = askClear;
     $('btnAddLayer').onclick = addLayerAction;
     $('cancelClear').onclick = closeClear;
@@ -3161,7 +3253,7 @@
       if (e.key === 'ArrowRight') stepUnit(1);
       else if (e.key === 'ArrowLeft') stepUnit(-1);
       else if (e.key === '\\') toggleRail();
-      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!e.repeat && !painting && !selecting) undo(); }   // don't undo mid-stroke (would corrupt the live stroke's change record — paint AND select strokes). !e.repeat = decision 4.9-A: HOLDING the key undoes ONE step, auto-repeats are dropped — a panicked hold after deleting the wrong thing must not machine-gun through the history
+      else if (e.key.toLowerCase() === 'z' && (e.ctrlKey || e.metaKey) && !e.shiftKey) { e.preventDefault(); if (!e.repeat && !painting && !selecting) undo(); }   // REVIEW FIX UI-4: Ctrl/Cmd+SHIFT+Z is the universal REDO chord — there is no redo here, and treating it as undo silently ate a SECOND step   // don't undo mid-stroke (would corrupt the live stroke's change record — paint AND select strokes). !e.repeat = decision 4.9-A: HOLDING the key undoes ONE step, auto-repeats are dropped — a panicked hold after deleting the wrong thing must not machine-gun through the history
       else if (!e.ctrlKey && !e.metaKey && !e.altKey) {
         if (e.key >= '1' && e.key <= '9') { const n = +e.key; if (classes.some(c => c.index === n)) { State.setActiveClass(n); buildClassPicker(); } }   // number = activate class with that index
         else { const k = e.key.toLowerCase();                                                                                                             // C/B/P = single-select / brush-select / paint
