@@ -41,6 +41,8 @@
       visibleSegs = null;                        // clear any geometry filter; app re-applies for the new unit
       if (w !== W || h !== H) needFit = true;   // re-fit only when dimensions change; else keep zoom/pan across frames
       img = image; W = w; H = h; label = lab; maskData = maskArr || null; hov = 0;
+      hovImg = null; hovPrev = null; maskImg = null; paintLayerStale = false;   // CR-3/CR-5/CR-1: buffers belong to the OLD frame
+      brushCur = null; snapPt = null;                                          // CR-6: a snap ring / brush cursor from the previous frame must not linger
       colorMode = !!isColor; colorImg = isColor ? image : null;   // perfusion: show the colour image as-is
       selCv.width = hovCv.width = maskCv.width = paintCv.width = baseCv.width = W;
       selCv.height = hovCv.height = maskCv.height = paintCv.height = baseCv.height = H;
@@ -108,19 +110,35 @@
       }
       selCtx.putImageData(id, 0, 0);
     }
-    function buildHovLayer() { hovCtx.clearRect(0, 0, W, H); if (hov) fillPixels(hovCtx, segPixels(hov), HOV_RGB); }
+    // REVIEW FIX CR-3: this went through fillPixels, which allocates a FULL-FRAME ImageData (8 MB at 1432²)
+    // and uploads it — on every hover change, i.e. every time the pointer crosses a vessel boundary. Keep one
+    // buffer, and only rewrite the pixels that actually change: the segment we are leaving and the one we are
+    // entering.
+    let hovImg = null, hovPrev = null;
+    function buildHovLayer() {
+      if (!W || !H) return;
+      if (!hovImg || hovImg.width !== W || hovImg.height !== H) { hovImg = hovCtx.createImageData(W, H); hovPrev = null; }
+      const d = hovImg.data;
+      if (hovPrev) for (let k = 0; k < hovPrev.length; k++) { const p = hovPrev[k] * 4; d[p] = 0; d[p + 1] = 0; d[p + 2] = 0; d[p + 3] = 0; }
+      hovPrev = hov ? segPixels(hov) : null;
+      if (hovPrev) for (let k = 0; k < hovPrev.length; k++) { const p = hovPrev[k] * 4; d[p] = HOV_RGB[0]; d[p + 1] = HOV_RGB[1]; d[p + 2] = HOV_RGB[2]; d[p + 3] = 255; }
+      hovCtx.putImageData(hovImg, 0, 0);
+    }
+    // REVIEW FIX CR-5: a full-frame createImageData (8 MB at 1432²) plus a full 2 M-pixel sweep ran on EVERY
+    // setVisibleSegs — i.e. on every notch of the geometry-filter slider. Reuse one buffer and zero it in
+    // place; the sweep is unavoidable (it is per-pixel by nature) but the allocation is not.
+    let maskImg = null;
     function buildMaskLayer() {
       if (!W || !H) return;
-      maskCtx.clearRect(0, 0, W, H);
-      const id = maskCtx.createImageData(W, H), d = id.data;
+      if (!maskImg || maskImg.width !== W || maskImg.height !== H) maskImg = maskCtx.createImageData(W, H);
+      const d = maskImg.data;
+      d.fill(0);
       if (visibleSegs) {                                     // geometry filter on: overlay only in-range segments (from label)
-        if (!label) return;
-        for (let i = 0; i < label.length; i++) { const s = label[i]; if (s && visibleSegs.has(s)) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
-        maskCtx.putImageData(id, 0, 0); return;
+        if (label) for (let i = 0; i < label.length; i++) { const s = label[i]; if (s && visibleSegs.has(s)) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
+      } else if (maskData) {
+        for (let i = 0; i < maskData.length; i++) { if (maskData[i]) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
       }
-      if (!maskData) return;
-      for (let i = 0; i < maskData.length; i++) { if (maskData[i]) { const p = i * 4; d[p] = MASK_RGB[0]; d[p + 1] = MASK_RGB[1]; d[p + 2] = MASK_RGB[2]; d[p + 3] = 255; } }
-      maskCtx.putImageData(id, 0, 0);
+      maskCtx.putImageData(maskImg, 0, 0);
     }
     // geometry filter: Set of visible segment ids (mask overlay shows only these). null clears the filter.
     function setVisibleSegs(s) { visibleSegs = (s instanceof Set) ? s : null; buildMaskLayer(); }
@@ -182,12 +200,18 @@
     }
     function strokeEnd() { const changes = strokeChanges ? [...strokeChanges.entries()] : []; strokeChanges = null; return { changes }; }
     function applyPaintUndo(changes) { for (const [i, old] of changes) paint[i] = old; buildPaintLayer(); }
-    function clearPaintInSegment(seg) {   // wipe paint under a segment (used when that segment gets selected)
+    // REVIEW FIX CR-1: buildPaintLayer is a full-frame allocate-and-sweep, and this called it ONCE PER
+    // SEGMENT. A brush-select drag across 40 vessels therefore did 40 of them inside one gesture — 320 MB
+    // allocated and 82 M pixel iterations while the doctor is dragging. Callers inside a stroke pass
+    // defer=true and flush once per rendered frame instead.
+    let paintLayerStale = false;
+    function clearPaintInSegment(seg, defer) {   // wipe paint under a segment (used when that segment gets selected)
       const px = segPixels(seg), changes = [];
       for (let k = 0; k < px.length; k++) { const i = px[k]; if (paint[i]) { changes.push([i, paint[i]]); paint[i] = 0; } }
-      if (changes.length) buildPaintLayer();
+      if (changes.length) { if (defer) paintLayerStale = true; else buildPaintLayer(); }
       return changes;
     }
+    function flushPaintLayer() { if (paintLayerStale) { paintLayerStale = false; buildPaintLayer(); } }
     function setPaint(dense) { paint = (dense instanceof Uint16Array && dense.length === W * H) ? dense : new Uint16Array(W * H); buildPaintLayer(); }
     function getPaint() { return paint; }
     function setPaintColorFn(fn) { paintColorFn = fn; }
@@ -280,9 +304,12 @@
       ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1; ctx.strokeRect(gx + 0.5, gy + 0.5, barW - 1, barH - 1);
       ctx.fillStyle = '#e5e7eb'; ctx.font = '9px sans-serif'; ctx.textBaseline = 'top';
       const ty = gy + barH + 2;
-      ctx.textAlign = 'left'; ctx.fillText('0', gx, ty);
-      ctx.textAlign = 'center'; ctx.fillText(String(Math.floor((T - 1) / 2)), gx + barW / 2, ty);
-      ctx.textAlign = 'right'; ctx.fillText(String(T - 1), gx + barW, ty);
+      // REVIEW FIX CR-2/LP-1: these were 0-based series positions, while every frame in the UI and in the
+      // data spec is 1-based (frame_1 … frame_N). A doctor reading "arrival time 8" went looking for
+      // frame_8 when the pixel actually filled in frame_9.
+      ctx.textAlign = 'left'; ctx.fillText('1', gx, ty);
+      ctx.textAlign = 'center'; ctx.fillText(String(Math.max(1, Math.round((1 + T) / 2))), gx + barW / 2, ty);
+      ctx.textAlign = 'right'; ctx.fillText(String(Math.max(1, T)), gx + barW, ty);
       ctx.restore();
     }
     function setPerfLegend(frames) { perfLegend = frames > 0 ? frames : 0; }
@@ -442,7 +469,7 @@
     function getGray() { return { gray, W, H }; }
 
     return { setUnit, setSelected, selApplyDelta, setHovered, setOpacity, setBrushActive, setMaskOpacity, setWindow, getWindow, autoWindow,
-             layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray,
+             layout, render, eventToImage, segAt, segSize, segsInBrush, labelSegs, nearestSegNear, setSnapPreview, setPerfLegend, setPlaceholder, setVisibleSegs, inBounds, getGray, flushPaintLayer,
              fitView, zoomAt, panBy, getZoom, setDots, setMarkers, setMarkerHighlight, imageToScreen,
              setPaint, getPaint, setPaintColorFn, setBrushCursor,
              strokeStart, strokeMove, strokeEnd, applyPaintUndo, clearPaintInSegment,

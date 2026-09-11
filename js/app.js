@@ -16,6 +16,11 @@
   const PERF_CACHE_MAX = 4;
   function perfTouch(id) { const v = perfCache.get(id); if (v !== undefined) { perfCache.delete(id); perfCache.set(id, v); } return v; }
   function perfPut(id, v) {
+    // REVIEW FIX MEM-2/LP-5: an entry is ~8 MB of fields + ~16 MB of rendered output + a 41 MB smoothing
+    // scratch that Perfusion attaches on first render — ~66 MB, not the ~27 MB this 4-entry cap was sized
+    // against. The scratch only earns its keep for the case whose slider is being dragged, so keep it on
+    // the newest entry and drop it from the rest: 4 × 66 MB becomes 66 MB + 3 × 25 MB.
+    for (const [k2, v2] of perfCache) if (k2 !== id && v2 && v2 !== 'failed' && v2.fields) delete v2.fields._smoothScratch;
     perfCache.delete(id); perfCache.set(id, v);
     const keep = (cur && cur.caseId) || (curCase() && curCase().id);   // PL2: the case ON SCREEN, not the nav target
     for (const k of perfCache.keys()) {
@@ -721,7 +726,7 @@
         if (selStrokeSegs.has(seg)) continue;                 // each segment handled once per drag
         selStrokeSegs.add(seg);
         if (sb.mode === 'add' && State.hasPaint(cur.caseId, cur.unitId)) {   // paint ⟂ selection: wipe paint under a newly-selected segment
-          const pc = view.clearPaintInSegment(seg);
+          const pc = view.clearPaintInSegment(seg, true);   // CR-1: defer the full-layer rebuild to the frame flush
           if (pc.length) appendAll(selPaintChanges, pc);
         }
         const ch = State.brushSeg(cur.caseId, cur.unitId, seg, xy, State.getActiveClass(), sb.mode === 'erase');
@@ -738,6 +743,7 @@
   // sp-5: paint ONLY the segments this drag changed since the last frame (no 8 MB ImageData allocation,
   // no full-layer loop), then refresh the red dots (erase sweeps them) and composite.
   function flushSelDeltas() {
+    if (view.flushPaintLayer) view.flushPaintLayer();   // CR-1: one rebuild per rendered frame, not one per segment
     if (selPendingDeltas && selPendingDeltas.length) view.selApplyDelta(selPendingDeltas.splice(0));
     refreshDots();
     view.render();
@@ -745,6 +751,7 @@
   function finalizeSelectStroke() {
     if (!selecting) return;
     selecting = false;
+    if (view.flushPaintLayer) view.flushPaintLayer();   // CR-1: make sure the last deferred clear is on screen
     if (selPaintChanges && selPaintChanges.length) {
       State.pushPaintUndo(cur.caseId, cur.unitId, selPaintChanges);
       State.setPaintDense(cur.caseId, cur.unitId, view.getPaint(), cur.W, cur.H);

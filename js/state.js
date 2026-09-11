@@ -9,7 +9,24 @@
   // full day of annotating used to accumulate thousands of them. 200 steps is far beyond any real
   // "hold Ctrl+Z" journey; older entries fall off the front.
   const UNDO_MAX = 200;
-  function pushU(e) { undoStack.push(e); if (undoStack.length > UNDO_MAX) undoStack.splice(0, undoStack.length - UNDO_MAX); }
+  // REVIEW FIX MEM-1: the cap was entries only, and a paint entry is an array of one [index, oldValue] JS
+  // array PER CHANGED PIXEL (~72 B each). One full-frame stroke on a 1432² frame is ~7 MB, so 200 of them
+  // is over a gigabyte held live — while the "200 entries" budget reads as if it were small. Cap the bytes
+  // too: the newest entries always survive, the oldest are dropped first, exactly like the count cap.
+  const UNDO_MAX_BYTES = 192 * 1024 * 1024;
+  const entryBytes = e => {
+    if (!e) return 0;
+    if (e.kind === 'paint') return 40 + (e.changes ? e.changes.length * 72 : 0);
+    if (e.kind === 'segbatch') return 40 + (e.changes ? e.changes.length * 120 : 0);
+    if (e.kind === 'pointbatch') return 40 + (e.removed ? e.removed.length * 120 : 0);
+    if (e.kind === 'layerclear' || e.kind === 'layerdel') return 200;   // snapshots reference live objects, not copies
+    return 120;
+  };
+  let undoBytes = 0;
+  function pushU(e) {
+    undoStack.push(e); undoBytes += entryBytes(e);
+    while (undoStack.length > UNDO_MAX || (undoBytes > UNDO_MAX_BYTES && undoStack.length > 1)) undoBytes -= entryBytes(undoStack.shift());
+  }
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let notes = {};    // caseUnit -> note text (mirrors note.json on disk)
   let noteMarkers = {}; // caseUnit -> [{id, xy:[x,y]}] : numbered circle markers referenced from the note
@@ -263,7 +280,8 @@
     const hadDirty = Object.keys(dirty).length > 0;
     const prev = datasetId;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
-    dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0;   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
+    dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0; undoBytes = 0;
+    dirtySeq = {};   // REVIEW FIX MEM-7: the ONE per-unit map this wipe used to miss — which is exactly why a cross-dataset markClean could pass its seq guard (see R2)   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
     staleUnits.clear();                // anything still marked stale is foreign now
     datasetId = newId;
     if (newId) loadUnits(newId);       // switch-back / second-tab recovery: adopt this dataset's surviving mirror
