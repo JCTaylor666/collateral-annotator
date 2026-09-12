@@ -39,6 +39,13 @@
   const unimportedUnits = new Set();
   // ANS-3: note.json EXISTS but could not be read. Its annotation is fine and saves normally; we simply
   // must not write a fresh note.json over a file whose contents we never saw.
+  // ROUND-4 REDESIGN. ANS-3's set conflated two different things — "the note file could not be read" and
+  // "State's note did not come from that file" — and round 4 showed every way that hurts: a hiccup refused
+  // the ANNOTATION too (OT-3), the background scan's later successful read cleared the flag even though it
+  // had SKIPPED the import, so the next write replaced a colleague's note with nothing (E2E-1, data loss),
+  // and a perfectly valid note was copied to note.json.corrupt as if damaged (NSL-2).
+  // Membership now means exactly one thing: note.json is on disk and its content has not been taken into
+  // State. It is cleared ONLY where the content is genuinely adopted.
   const noteUnreadableUnits = new Set();
   let classesFileCorrupt = false;             // classes.json exists but is unparseable — don't auto-overwrite it
   let classesRaw = null;                      // the parsed classes.json AS IT WAS ON DISK (UI-2: unknown fields round-trip)
@@ -214,8 +221,8 @@
     if (label) el.setAttribute('aria-label', label);
     el.addEventListener('keydown', ev => {
       if (ev.key !== 'Enter' && ev.key !== ' ') return;
-      ev.preventDefault(); ev.stopPropagation();
-      if (typeof el.onclick === 'function') el.onclick(ev);
+      ev.preventDefault();   // ROUND-4 FIX: stopPropagation() here also swallowed Space for the canvas pan
+      if (typeof el.onclick === 'function') el.onclick(ev);   // modifier; preventDefault alone stops the page scroll, which is all this needed
     });
     return el;
   }
@@ -226,7 +233,7 @@
     const h0 = view ? $('view').clientHeight : 0;
     const act = document.createElement('span');
     act.className = 'banner-act'; act.textContent = I18n.t(labelKey);
-    act.onclick = onClick;
+    act.onclick = ev => onClick(ev, act);   // ROUND-4/NSL-4: handlers get the LIVE span, never one captured in a closure that a language switch has since detached
     b.appendChild(act);
     if (view && $('view').clientHeight !== h0) onResize();
     return act;
@@ -240,9 +247,14 @@
   function clearUnitBannerActions() {
     if (!bannerActions.length) return;
     bannerActions = [];
+    // ROUND-4 FIX (found independently by all six lenses — the worst thing v90 shipped): the line that used
+    // to stand here ASSIGNED to `b.children`. In a real browser that is a getter-only HTMLCollection, so in
+    // strict mode — which this file is — it throws TypeError, and it sits on the navigation path: the first
+    // move off a frame carrying a [View backups] or [Copy diagnostic] link killed showUnit mid-flight. The
+    // test double happened to expose `children` as a plain array, which is exactly why the suite stayed
+    // green. removeChild/remove is the only correct way to detach, and the double now implements it.
     const b = $('banner');
-    for (const c of b.querySelectorAll('.banner-act')) { if (c.remove) c.remove(); }
-    if (b.children && b.children.length) b.children = b.children.filter(c => !c._hasClass || !c._hasClass('banner-act'));   // harness double
+    for (const c of Array.from(b.querySelectorAll('.banner-act'))) { if (c.remove) c.remove(); }
   }
   function clearUnitBanner() {
     clearUnitBannerActions();
@@ -250,7 +262,7 @@
     // but they sit at critical priority (they have to, to take the slot from the warning they retire) — so
     // "Kept the folder version." went on suppressing every ordinary per-frame warning on every frame the
     // doctor visited afterwards, until dismissed by hand. They are per-unit; clear them on navigation.
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'rescueFoundFmt',
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'rescueFoundFmt',
       'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
       'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
@@ -339,12 +351,14 @@
       // with, and State.getDatasetId() is simply the id restored from this dataset's own mirror — reminting
       // there would cut the folder off from its own crash-recovery records. Only an ALREADY-OPEN, DIFFERENT
       // folder makes a shared id a collision.
-      if (rootHandle && newId && newId === State.getDatasetId() && !(await isSameFolder(rootHandle, newRoot))) {
-        newId = await remintDatasetId(newRoot);
-        reminted = true;
-      }
-      if (newId !== State.getDatasetId() && State.dirtyCount() > 0 &&
+      // ROUND-4/R3D-2: remintDatasetId WRITES .annotator_dataset.json into the picked folder, and it ran
+      // BEFORE the unsaved-work confirm — so cancelling that dialog still left a brand-new id in a folder the
+      // doctor chose not to open, orphaning the crash mirror keyed to its old id. Decide here, write after
+      // the cancel point, and openFolderTxn's all-or-nothing promise holds again.
+      const willRemint = !!(rootHandle && newId && newId === State.getDatasetId() && !(await isSameFolder(rootHandle, newRoot)));
+      if ((willRemint || newId !== State.getDatasetId()) && State.dirtyCount() > 0 &&
           !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) return { restore: prevView };
+      if (willRemint) { newId = await remintDatasetId(newRoot); reminted = true; }
       const found = await Loader.discover(newRoot);
       // Nothing is committed yet, so an unusable pick leaves the dataset that IS open fully alive: its rows
       // still navigate, its classes.json is still the one that gets written.
@@ -529,6 +543,16 @@
   }
   // Raw bytes of one of a frame's files, or null when it cannot be read. The conflict resolver needs this:
   // a folder copy this build cannot PARSE still has to be preserved byte-for-byte before we overwrite it.
+  // Like rawFileText, but keeps "the file is not there" (safe to create) apart from "it is there and we
+  // could not read it" (must never be overwritten blind). ROUND-4: rawFileText collapses both into null,
+  // which would stall a frame whose note.json a colleague DELETED behind a stale unreadable flag.
+  async function rawFileProbe(unit, name) {
+    let fh;
+    try { fh = await unit.handle.getFileHandle(name); }
+    catch (e) { return (e && e.name === 'NotFoundError') ? { absent: true } : { failed: true }; }
+    try { return { text: await (await fh.getFile()).text() }; }
+    catch (e) { return { failed: true }; }
+  }
   async function rawFileText(unit, name) {
     try { return await (await (await unit.handle.getFileHandle(name)).getFile()).text(); }
     catch (e) { return null; }
@@ -609,11 +633,12 @@
     if (r.unreadable) return 'unreadable';                                 // …and the same when the read "succeeded" but the file could not be opened: seeding EMPTY here is what later lets a star/Save overwrite the real annotations
     if (tok !== dsToken) return 'aborted';                                 // folder switched during the read — this unit belongs to the OLD dataset
     if (r.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);             // UI-1: nothing was imported from it
-    if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
+    if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else { corruptUnits.delete(k); corruptBackedUp.delete(k); }   // ROUND-4/R4-GS-5: the "already backed up" flag was add-only, so a file that went corrupt, was fixed, then went corrupt AGAIN was overwritten with no backup   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
     const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
     if (rec === 'aborted') return 'aborted';
     evalImportProtection(c, u, r.annotation, r.versionAhead); // A1: unreadable-by-this-version content => the frame goes read-only
     if (r.noteCorrupt) noteCorruptUnits.add(k);               // A2: back the original up before any write replaces it
+    else if (!r.noteUnreadable) { noteCorruptUnits.delete(k); noteCorruptBackedUp.delete(k); }   // ROUND-4/R4-GS-5: parseable again — and a LATER corruption must be preserved afresh
     if (r.noteUnreadable) noteUnreadableUnits.add(k); else noteUnreadableUnits.delete(k);   // ANS-3
     if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
     lastSeenMtime.set(k, r.mtime || 0);
@@ -631,8 +656,8 @@
     if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
     if (data.annUnreadable) return data;   // this frame's annotation.json exists but could not be read: do NOT reset State from it and do NOT mark the unit seeded — every write path re-reads first (and refuses meanwhile)
     if (data.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);          // UI-1
-    if (data.noteUnreadable) noteUnreadableUnits.add(k); else noteUnreadableUnits.delete(k);   // ROUND-3 FIX: was only inside the !unchanged branch, so the flag never lifted once set
-    if (data.annCorrupt || data.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);
+    if (data.noteUnreadable) noteUnreadableUnits.add(k);   // ROUND-4/E2E-1: the CLEAR moved below, to the paths that actually take the file's note INTO State
+    if (data.annCorrupt || data.annDropped) corruptUnits.add(k); else { corruptUnits.delete(k); corruptBackedUp.delete(k); }   // ROUND-4/R4-GS-5
     // ROUND-3 FIX (SWG-5 symmetry): the write guard measures max(annotation, note); this must record the
     // same quantity, or a frame whose note.json is simply newer than its annotation.json is judged conflicted for ever.
     const m = Math.max(data.annMtime || 0, data.noteMtime || 0);
@@ -648,7 +673,12 @@
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       evalImportProtection(c, u, data.annotation, data.versionAhead);
       if (data.noteCorrupt) noteCorruptUnits.add(k);
+      else if (!data.noteUnreadable) { noteCorruptUnits.delete(k); noteCorruptBackedUp.delete(k); }   // ROUND-4/R4-GS-5
     }
+    // Cleared only where State now mirrors the file's note: after the reconcile above, or on the `unchanged`
+    // fast path — which is `!isDirty` AND the same mtime, i.e. already mirrored. A successful READ that is
+    // then skipped is not an IMPORT, and treating it as one is exactly how E2E-1 lost a colleague's note.
+    if (!data.noteUnreadable) noteUnreadableUnits.delete(k);
     // REVIEW FIX R7: this used to run for EVERY outcome, 'kept-dirty' included — and 'kept-dirty' is
     // returned by reconcile's FIRST guard, before any content comparison. So a colleague's differing file
     // whose mtime happens to sit below our editedAt (Drive preserves the source clock; the audit measured
@@ -892,7 +922,7 @@
     else if (cur.protected) {                                  // A1: read-only frame — say why, and offer a copyable diagnostic for an agent
       const k2 = State.key(c.id, u.id);
       setBanner('protectedFrameFmt', { id: u.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
-      const act2 = bannerAddAction('copyDiagBtn', async () => { if (await copyProtectedDiag(k2)) act2.textContent = I18n.t('copyDiagDone'); });
+      bannerAddAction('copyDiagBtn', async (ev, span) => { if (await copyProtectedDiag(k2) && span) span.textContent = I18n.t('copyDiagDone'); });
     }
     else if (data.annUnreadable) setBanner('annUnreadable', { id: u.id }, 'warn');  // exists but unreadable: nothing is shown FROM it and nothing may be written OVER it
     else if (data.noteUnreadable) setBanner('noteUnreadableFmt', { id: u.id }, 'warn');   // ANS-3: the NOTE alone — the annotation is fine and still saves
@@ -1393,13 +1423,15 @@
           continue;
         }
         if (annCorrupt) unimportedUnits.add(uk); else unimportedUnits.delete(uk);          // UI-1 (ROUND-3: the scan only ever ADDED, so a frame that became readable stayed blocked)
-        if (noteUnreadable) noteUnreadableUnits.add(uk); else noteUnreadableUnits.delete(uk);   // ROUND-3: the scan never maintained this at all
-        if (annCorrupt || annDropped) corruptUnits.add(uk);
+        if (noteUnreadable) noteUnreadableUnits.add(uk);   // ROUND-4/E2E-1: the clear lives in the reconcile block below — this loop SKIPS the import for units loadCur already seeded, and clearing there armed the next write to wipe the file it never read
+        if (annCorrupt || annDropped) corruptUnits.add(uk); else { corruptUnits.delete(uk); corruptBackedUp.delete(uk); }   // ROUND-4/R4-GS-5 (the scan only ever ADDED)
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
           const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
           if (gen !== openGen) return;
           evalImportProtection(c, u, ann, versionAhead);    // A1: the SCAN seeds most frames first — without this the loadCur fast path never re-evaluates
           if (noteCorrupt) noteCorruptUnits.add(uk);        // A2
+          else if (!noteUnreadable) { noteCorruptUnits.delete(uk); noteCorruptBackedUp.delete(uk); }   // ROUND-4/R4-GS-5
+          if (!noteUnreadable) noteUnreadableUnits.delete(uk);   // the note was actually imported just now
           if (rec === 'conflict') conflicts++;
           if (rec !== 'kept-dirty' && rec !== 'conflict' || !lastSeenMtime.has(uk)) lastSeenMtime.set(uk, annMtime);   // R7: same rule as loadCur (advance when State mirrors the file, or on a first sighting)
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
@@ -2491,7 +2523,12 @@
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
       if (tok !== dsToken) return;
       conflictedUnits.delete(k);
-      lastSeenMtime.set(k, (await annFileMtime(unit)) || 0);   // the file as it stands is KNOWN to us now — our write may proceed over it
+      // ROUND-4 FIX: v89 taught ensureSeeded/loadCur/the scan to record max(annotation, note) so the write
+      // guard measures like for like — and missed this one. Recording the annotation's mtime alone here
+      // meant that resolving a conflict on a frame whose note.json is newer immediately re-armed the guard:
+      // the write we were about to make was refused as a fresh conflict, right after telling the doctor
+      // their version had been kept.
+      lastSeenMtime.set(k, (await unitDiskMtime(unit)) || 0);   // the file as it stands is KNOWN to us now — our write may proceed over it
       hideConflictDialog();
       try { await writeUnit(cc, unit); } catch (e) { }         // failures land in the retry queue like any write
       highlightNav(); updateDirtyUI();
@@ -2897,8 +2934,11 @@
       // that ensureSeeded could not READ — those never enter the retry queue, so a recovered retry of some
       // OTHER frame retired a warning that was still entirely true for them. Only retire it when the retry
       // queue draining actually accounts for every frame still unsaved.
-      const stillUnsaved = State.dirtyCount();
-      if (lastBanner && (lastBanner.key === 'writeFailedBanner' || (lastBanner.key === 'savedPartial' && !stillUnsaved))) setBanner(null);
+      // ROUND-4 FIX: BAN-4 gated this on the DATASET-wide dirty count, so in any ordinary session — where
+      // the doctor is still editing other frames — savedPartial could never be retired at all and went on
+      // suppressing every per-frame warning for the rest of the day. What matters is narrower: are any of
+      // the frames this banner is ABOUT still unwritten? Those are the ones the retry queue was carrying.
+      if (lastBanner && (lastBanner.key === 'writeFailedBanner' || (lastBanner.key === 'savedPartial' && !retryQ.size))) setBanner(null);
       setSaveStatus('saved', { time: hhmm() });
     }
     else if (lastSaveStatus && lastSaveStatus.key === 'retryPending') setSaveStatus(null);   // REVIEW FIX SE-5: the queue drained without a recovery — don't freeze a red "retrying" line
@@ -2979,18 +3019,25 @@
     // we could not read is preserved byte-for-byte first; if even THAT read fails we refuse the whole unit
     // write, so the frame stays dirty, the retry queue takes it, and the write-failure banner says so.
     const hasNote = State.hasNoteData(caseId, unit.id);
+    let noteBlocked = false;
     if (hasNote && noteUnreadableUnits.has(k)) {
-      const raw = await rawFileText(unit, 'note.json');
-      if (raw === null) throw new Error('refusing to overwrite ' + k + ': its note.json could not be read, so it cannot be preserved');
+      const probe = await rawFileProbe(unit, 'note.json');
       if (tok !== dsToken) return;
-      if (!noteCorruptBackedUp.has(k)) {
-        try { await FS.writeText(unit.handle, 'note.json.corrupt', raw); noteCorruptBackedUp.add(k); setBanner('noteCorruptBackedUp', { id: unit.id }, 'warn'); }
-        catch (e) { throw new Error('refusing to overwrite ' + k + ': its unreadable note.json could not be backed up'); }
+      if (probe.absent) noteUnreadableUnits.delete(k);          // nothing on disk to lose — create it normally
+      else if (probe.failed) noteBlocked = true;
+      else {
+        // Keep the folder's copy under the EXTERNAL-backup name, the one that means "the version that was in
+        // the folder, kept before we wrote over it". NOT note.json.corrupt (ROUND-4/NSL-2): all we know is
+        // that one read failed, and calling a healthy file corrupt sends the doctor hunting a phantom.
+        try { await FS.writeText(unit.handle, 'note.external-backup.json', probe.text); noteUnreadableUnits.delete(k); setBanner('noteExternalBackedUp', { id: unit.id }, 'warn'); }
+        catch (e) { noteBlocked = true; }
       }
       if (tok !== dsToken) return;
-      noteUnreadableUnits.delete(k);     // we have just read it — the flag has done its job
     }
-    const needNote = hasNote;
+    // ROUND-4/OT-3: v89 THREW here, which refused the annotation too — one Drive hiccup on note.json and the
+    // doctor could not save the segments they had just drawn. The annotation always goes to disk. Only the
+    // note waits, and the frame deliberately stays dirty so the retry queue comes back for it.
+    const needNote = hasNote && !noteBlocked;
     if (!(await backupCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up');
     if (tok !== dsToken) return;
     if (needNote && !(await backupNoteCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt note.json could not be backed up');
@@ -3004,10 +3051,12 @@
     // note existed only in RAM. Record the annotation write the moment it lands.
     if (tok === dsToken) { const annMs = await annFileMtime(unit); if (annMs && tok === dsToken) { ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); } }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
     if (needNote) {
+      if (tok !== dsToken) return;   // ROUND-4 FIX: v89's B-2 guard was added to the annotation stamp above but not here — the note write itself could still land after a folder switch
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+      if (tok !== dsToken) return;
       noteCorruptUnits.delete(k); noteUnreadableUnits.delete(k);   // the file on disk is valid JSON again, and readable
     }
-    corruptUnits.delete(k);   // the file on disk is valid JSON again
+    corruptUnits.delete(k); unimportedUnits.delete(k);   // the file on disk is valid JSON again (ROUND-4: unimportedUnits is corruptUnits' new sibling and was left add-only)
     const fileMs = (await unitDiskMtime(unit)) || Date.now();   // the FILES' own clock, not ours (both — SWG-5)
     // A reconcile must never mistake OUR write for an externally-newer file — this session OR after a
     // reload — and a cross-open write must not pollute the NEW dataset's maps.
@@ -3020,7 +3069,16 @@
     // conflict check. Reproduced end to end: after a crash-reload the parked note came back as "".
     if (tok === dsToken) {
       ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs);
-      State.markClean(caseId, unit.id, seq, fileMs);
+      if (!noteBlocked) State.markClean(caseId, unit.id, seq, fileMs);   // a frame whose note could not be written is NOT saved — never let the header claim it was
+    }
+    // ROUND-4/OT-3 second half: the ANNOTATION is on disk and must never be rolled back or retried away —
+    // but the note is still only in memory, so this write is NOT a success. Hand the unit to the retry queue
+    // exactly like any other partial failure: the frame stays dirty, the status line says "retrying" instead
+    // of "Saved HH:MM", and the banner names the one file that is holding it up. `new Error` is deliberate —
+    // permanentWriteError() only retires NotAllowed/NotFound/Security, so this one keeps being retried.
+    if (noteBlocked) {
+      setBanner('noteUnreadableFmt', { id: unit.id }, 'warn');
+      throw new Error('wrote the annotation of ' + k + ', but its existing note.json could not be read, so the note was not written over it');
     }
   }
   async function runAutoSave() {

@@ -289,6 +289,7 @@
     dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0; undoBytes = 0;
     dirtySeq = {};   // REVIEW FIX MEM-7: the ONE per-unit map this wipe used to miss — which is exactly why a cross-dataset markClean could pass its seq guard (see R2)   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
     staleUnits.clear();                // anything still marked stale is foreign now
+    quotaBlocked.clear();              // ROUND-4/NSL-5: keyed by bare case/frame names, which the next dataset reuses — a blocked key carried over would silently skip a DIFFERENT study's frame
     datasetId = newId;
     if (newId) loadUnits(newId);       // switch-back / second-tab recovery: adopt this dataset's surviving mirror
     if (newId) datasets[newId] = Date.now();
