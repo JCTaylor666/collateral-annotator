@@ -139,16 +139,22 @@
   function metaOut() {
     return { datasetId, datasets, tool, brush, clickMode, selBrush, magSnap, geomFilter, perfSmooth, perfMask, coordOrder, window: win, loupe, autoSave, classColors, activeClass };
   }
+  const quotaBlocked = new Set();   // SM-3: unit keys whose record did not fit; skipped while the store stays full
   function persistNow() {
     if (persistTimer) { clearTimeout(persistTimer); persistTimer = 0; }
     let ok = true;
     if (datasetId) {
       for (const k of [...staleUnits]) {
+        if (quotaBlocked.has(k)) continue;                 // SM-3: known not to fit; retried when the latch clears
         const rec = unitSlice(k), kk = ukey(datasetId, k);
         try {
           if (rec) localStorage.setItem(kk, JSON.stringify(rec)); else localStorage.removeItem(kk);
           staleUnits.delete(k);
-        } catch (e) { ok = false; }   // REVIEW FIX SP-1: this used to `break`. staleUnits is a Set iterated in
+        // ROUND-3 FIX (SM-3): SP-1 correctly stopped one over-quota record from blocking the others, but with
+        // the store genuinely FULL every later persistNow then retried the whole stale set on every
+        // markClean/noteWritten — hundreds of throwing setItem calls per save. Remember what failed and skip
+        // it while the store stays full; any fully successful persist clears the latch.
+        } catch (e) { ok = false; quotaBlocked.add(k); }   // REVIEW FIX SP-1: this used to `break`. staleUnits is a Set iterated in
         // INSERTION order and the failing key is never deleted, so one record too big for the quota sat at the
         // head forever and every later persist — the 400 ms throttle, markClean/noteWritten's immediate write,
         // and the beforeunload/pagehide flush — broke on it again and wrote NOTHING for any other frame. The
@@ -161,7 +167,7 @@
     }
     // warn on ANY persist failure (quota, blocked storage, …) — from here on the localStorage backup is
     // stale, so the user must rely on save-to-folder; the open-time mtime check guards the reload path.
-    if (ok) quotaWarned = false;
+    if (ok) { quotaWarned = false; quotaBlocked.clear(); }   // SM-3: everything fits again — give the blocked records another chance
     else if (!quotaWarned) { quotaWarned = true; if (onPersistFail) onPersistFail(); }
   }
   function schedulePersist() {

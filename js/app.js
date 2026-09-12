@@ -170,7 +170,8 @@
     // v79: the three R3 resolution messages belong here for the same reason conflictKept* do — they RETIRE
     // the critical conflictFoundFmt warning, so they must be able to take the slot from it. Without this
     // the doctor resolved a conflict and the banner still said "the file in the folder is NEWER".
-    'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused']);
+    'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused',
+    'protectedScanFmt', 'casesSkippedFmt']);   // ROUND-3 FIX BAN-5: F9's read-only summary and LN-3's skipped-folder notice are open/save-time conclusions; at ordinary priority they were dropped in exactly the sessions that produce them
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
     const b = $('banner');
@@ -233,7 +234,18 @@
   // Per-unit warnings (shape mismatch / corrupt annotation / broken mask) describe ONE frame — they
   // must not linger after navigating away. Cleared at the start of every navigation; each unit that
   // still has the condition re-sets its own banner.
+  // ROUND-3 FIX (NL-6/GS-5): action links are per-FRAME even when the banner they ride on is not. Drop them
+  // on navigation whatever happens to the message itself, or a [View backups] link stays on a dataset-level
+  // warning pointing at a frame the doctor has left.
+  function clearUnitBannerActions() {
+    if (!bannerActions.length) return;
+    bannerActions = [];
+    const b = $('banner');
+    for (const c of b.querySelectorAll('.banner-act')) { if (c.remove) c.remove(); }
+    if (b.children && b.children.length) b.children = b.children.filter(c => !c._hasClass || !c._hasClass('banner-act'));   // harness double
+  }
   function clearUnitBanner() {
+    clearUnitBannerActions();
     // REVIEW FIX BT-4: the conflict/rescue RESOLUTION confirmations are one-shot messages about ONE frame,
     // but they sit at critical priority (they have to, to take the slot from the warning they retire) — so
     // "Kept the folder version." went on suppressing every ordinary per-frame warning on every frame the
@@ -336,8 +348,14 @@
       const found = await Loader.discover(newRoot);
       // Nothing is committed yet, so an unusable pick leaves the dataset that IS open fully alive: its rows
       // still navigate, its classes.json is still the one that gets written.
-      if (!found.length) { setBanner('errNoCases', null, 'warn'); return { restore: prevView }; }
       const skippedCases = found.skipped || [];   // LN-3: case folders that could not be listed at all
+      // ROUND-3 FIX (NL-7/BAN-6/E2E-4): when discovery could not LIST any case folder, errNoCases' wording
+      // ("check the folder names") sends the doctor to fix something that is not wrong. Say what happened.
+      if (!found.length) {
+        setBanner(skippedCases.length ? 'casesSkippedFmt' : 'errNoCases',
+          skippedCases.length ? { n: skippedCases.length, names: skippedCases.slice(0, 4).join(', ') + (skippedCases.length > 4 ? ' …' : '') } : null, 'warn');
+        return { restore: prevView };
+      }
       const cls = await Loader.loadClasses(newRoot);
       // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
       for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
@@ -1239,7 +1257,12 @@
       const merged = Object.assign({}, classesRaw || {}, {
         classes: classes.map(c => Object.assign({}, prevByIdx.get(c.index) || {}, { index: c.index, name: c.name })),
       });
-      await FS.writeText(rootHandle, 'classes.json', JSON.stringify(merged, null, 2));
+      // ROUND-3 FIX (GS-6/NL-4): UI-3 bound the handle once inside backupClassesOnce but its CALLER still
+      // re-read the live rootHandle on both sides of this await — so a folder switch landing in between
+      // wrote folder A's classes into folder B, and then cached A's raw object as "what is on disk" for B.
+      const root = rootHandle;
+      await FS.writeText(root, 'classes.json', JSON.stringify(merged, null, 2));
+      if (root !== rootHandle) return;         // the folder changed under us: do not adopt this as the new truth
       classesRaw = merged;                     // what is on disk now
       if (wasCorrupt) {   // the file parses again — and the "left untouched" banner has just become FALSE
         classesFileCorrupt = false; classesBackedUp = false;
@@ -1274,8 +1297,13 @@
     // markClean — and the rename was gone with no banner, no sidecar, and the mirror record erased. A name
     // the doctor typed is content.
     const layer = o => ({ name: o.name == null ? null : String(o.name), collaterals: norm(o.collaterals), points: norm(o.points), paint: (o.paint && o.paint.classes) || null });
-    if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => ({ id: l.id, ...layer(l) })) });
-    return JSON.stringify({ starred: !!a.starred, layer_name: a.layer_name == null ? null : String(a.layer_name), layers: [{ id: 0, ...layer(a) }] });
+    // ROUND-3 FIX (SM-5): SP-2's two branches were not symmetric — the flat form carried the layer's name
+    // in a top-level `layer_name` field while the layered form carried it inside the layer. The SAME
+    // annotations written flat (v5, one layer) and layered (v6) therefore compared UNEQUAL, so the quiet
+    // "identical content, only the timestamp moved" adoption never fired across that boundary. One shape.
+    if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => ({ id: Number(l.id), ...layer(l) })) });
+    const flatName = (a.layer_name == null || a.layer_name === 'Layer 1') ? null : String(a.layer_name);
+    return JSON.stringify({ starred: !!a.starred, layers: [{ id: 0, ...layer(a), name: flatName }] });
   }
   function collectAnnClasses(ann, used) {
     const cls = v => { if (v == null || v === '') return null; const n = Number(v); return Number.isFinite(n) ? n : null; };
@@ -2519,7 +2547,12 @@
       // navigation back to the frame, every re-render — and each call appended another [View backups] link.
       // They stacked up, and because only the last closure held the current key the earlier ones opened the
       // chooser for a frame that is no longer on screen. One link per banner.
-      if (!bannerActions.some(a => a.labelKey === 'rescueViewBtn')) bannerAddAction('rescueViewBtn', () => openRescueDialog(k));
+      // The closure must resolve the frame AT CLICK TIME: this link rides on a banner that may outlive the
+      // frame it was added for (a dataset-level warning is not cleared by navigation), and a stale closure
+      // opened the chooser for a frame no longer on screen.
+      if (!bannerActions.some(a => a.labelKey === 'rescueViewBtn')) {
+        bannerAddAction('rescueViewBtn', () => { if (cur) openRescueDialog(State.key(cur.caseId, cur.unitId)); });
+      }
     } catch (e) { /* listing is best-effort — a transient failure must never disturb annotating */ }
   }
   async function openRescueDialog(k) {
@@ -3027,7 +3060,7 @@
     undoBusy = true;
     try {
       await undoInner();
-      while (undoQueued > 0) { undoQueued--; await undoInner(); }
+      while (undoQueued > 0) { undoQueued--; if (painting || selecting) break; await undoInner(); }   // ROUND-3 FIX B-9: the queued replay skipped the guard the first press had — a stroke started while the first undo was fetching would have had an undo applied into it
     } finally { undoBusy = false; undoQueued = 0; }
   }
   async function undoInner() {
