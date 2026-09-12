@@ -126,7 +126,7 @@
 <li>Safe to delete — a new id is minted on next open, which resets only the browser-side state, never the annotations on disk. Safe to leave out of an archive.</li>
 </ul></div>
 <div class="doc-sec"><h4>Recovery files — output, written only when something is wrong</h4>
-<p class="doc-p">The tool never discards work silently. Four files exist purely so that a bad file or a lost race is always recoverable. In normal use you will never see any of them.</p>
+<p class="doc-p">The tool never discards work silently. The files below exist purely so that a bad file or a lost race is always recoverable. In normal use you will never see any of them.</p>
 <ul>
 <li><code>annotation.json.corrupt</code> (in the frame) — an <code>annotation.json</code> that cannot be parsed is copied here before anything overwrites it. The frame opens with a warning and shows no marks until the file is fixed. If the file is later fixed and then breaks <b>again</b> with different content, the second original goes to <code>annotation.json.corrupt-2</code>, and so on up to <code>-9</code>: a rescue copy is never overwritten by a later one. All of them appear in the [View backups] chooser.</li>
 <li><code>classes.json.corrupt</code> (at the root) — same, for an unparseable <code>classes.json</code>. The tool will not auto-overwrite it with placeholder names until the original is safely copied.</li>
@@ -136,7 +136,7 @@
 <li><code>note.unread-backup.json</code> (in the frame) — the folder already held a <code>note.json</code> that this session never managed to read (a Drive or permission hiccup), and you then wrote a note of your own. The unread original is preserved here before yours replaces it. It is NOT a damaged file: nothing is known to be wrong with it beyond one failed read.</li>
 </ul>
 <p class="doc-p"><b>Conflicts.</b> If a frame's file on disk is <b>newer</b> than this session's copy AND differs (a colleague's save, a copy from another machine, a sync), nothing is auto-resolved: the frame becomes write-protected and OPENING it shows a two-thumbnail chooser — keep the folder version or the session version; the loser always lands in one of the backup files above. Identical content with only a newer timestamp is adopted silently.</p>
-<p class="doc-p"><b>Recovery.</b> Opening a frame that has any of these backup files shows a banner with a <i>View</i> action: a chooser compares the current version with each backup, and restoring is a SWAP — the replaced version is written back into the same backup file, so nothing is ever lost.</p>
+<p class="doc-p"><b>Recovery.</b> Opening a frame that has any of these backup files shows a banner with a <i>View</i> action: a chooser compares the current version with each backup. Restoring is a TRADE, never a deletion: the version being replaced is written to a free backup slot of its own family first — the same name if that slot is empty, otherwise the next free <code>-2</code>…<code>-9</code> — so no existing backup is ever overwritten and everything stays listed in the chooser. If all nine slots of that family are taken by different content, the restore is refused rather than performed, and the banner says which files to move aside.</p>
 <p class="doc-p"><b>Version safety.</b> A file this app version cannot fully understand (a <code>schema_version</code> above its own, or an unknown <code>paint.encoding</code>) makes the frame READ-ONLY: it is never overwritten, and the banner offers a copyable diagnostic. Update the app or ask an agent — do not edit the file by hand.</p>
 <p class="doc-p"><b>Browser-local mirror.</b> Unsaved work is additionally mirrored in the browser's localStorage under <code>vessel_annotator_v2:*</code> keys (one small record per frame, full content only while a frame is unsaved). It is a crash net, not part of the dataset — nothing in the folder depends on it.</p></div>
 <div class="doc-sec"><h4>The <code>perfusion</code> unit — computed, not read from disk</h4><ul>
@@ -299,17 +299,17 @@
 <li>可以放心删除 — 下次打开会重新生成一个新 id，只会重置浏览器端的状态，<b>绝不影响</b>磁盘上的标注。打包时不带也没关系。</li>
 </ul></div>
 <div class="doc-sec"><h4>恢复文件 — 输出，只在出问题时产生</h4>
-<p class="doc-p">工具从不静默丢弃工作。下面四个文件存在的唯一目的，就是让「文件坏了」或「写入撞车」永远可恢复。正常使用时你一个都不会见到。</p>
+<p class="doc-p">工具从不静默丢弃工作。下面这些文件存在的唯一目的，就是让「文件坏了」或「写入撞车」永远可恢复。正常使用时你一个都不会见到。</p>
 <ul>
-<li><code>annotation.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>annotation.json</code> 会在被任何东西覆盖之前备份到这里。该帧带警告打开，在文件修好之前不显示任何标记。如果文件后来修好了、之后**又**坏了一次而且内容不同，第二份原件会写到 <code>annotation.json.corrupt-2</code>，依此类推直到 <code>-9</code>：已有的救援副本绝不会被后来的覆盖。它们都会出现在「查看备份」对话框里。</li>
+<li><code>annotation.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>annotation.json</code> 会在被任何东西覆盖之前备份到这里。该帧带警告打开，在文件修好之前不显示任何标记。如果文件后来修好了、之后<b>又</b>坏了一次而且内容不同，第二份原件会写到 <code>annotation.json.corrupt-2</code>，依此类推直到 <code>-9</code>：已有的救援副本绝不会被后来的覆盖。它们都会出现在「查看备份」对话框里。</li>
 <li><code>classes.json.corrupt</code>（在根目录）—— 同理，针对无法解析的 <code>classes.json</code>。在原文件被安全备份之前，工具不会用占位名去自动覆盖它。</li>
 <li><code>annotation.unsaved-backup.json</code> / <code>note.unsaved-backup.json</code>（在帧文件夹里）—— 冲突解决时的「会话」一侧:你选择保留文件夹版本时,本次会话的副本先保存到这里。</li>
 <li><code>annotation.external-backup.json</code> / <code>note.external-backup.json</code>（在帧文件夹里）—— 「文件夹」一侧:你选择保留会话版本时,文件夹里的原文件先保存到这里再被覆盖。</li>
 <li><code>note.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>note.json</code> 在任何保存替换它之前会先复制到这里（与 <code>annotation.json</code> 同等保护），后续不同的损坏同样按 <code>-2</code>…<code>-9</code> 编号。</li>
-<li><code>note.unread-backup.json</code>（在帧文件夹里）—— 文件夹里本来就有一份 <code>note.json</code>，但本次会话始终没能把它读出来（Drive 或权限的临时问题），而你又写了自己的笔记。那份没读到的原件会在被你的笔记覆盖之前保留到这里。它**不是**损坏文件：除了读取失败过一次，没有任何证据说明它有问题。</li>
+<li><code>note.unread-backup.json</code>（在帧文件夹里）—— 文件夹里本来就有一份 <code>note.json</code>，但本次会话始终没能把它读出来（Drive 或权限的临时问题），而你又写了自己的笔记。那份没读到的原件会在被你的笔记覆盖之前保留到这里。它<b>不是</b>损坏文件：除了读取失败过一次，没有任何证据说明它有问题。</li>
 </ul>
 <p class="doc-p"><b>冲突。</b>若磁盘上的文件比本次会话的副本<b>新</b>且内容不同(同事保存过、从别的机器拷来、同步所致),程序不会自动取舍:该帧进入写保护,<b>打开它</b>会弹出双缩略图对比,由你选择保留哪个版本;落选的一方总会存进上面的备份文件。内容相同、仅时间戳变新的情况会静默采纳,不打扰。</p>
-<p class="doc-p"><b>恢复。</b>打开带有上述备份文件的帧会出现横幅和「查看」按钮:对比当前版本与各备份,恢复是<b>交换</b>——被替换的版本写回同名备份文件,任何选择都不会销毁内容。</p>
+<p class="doc-p"><b>恢复。</b>打开带有上述备份文件的帧会出现横幅和「查看」按钮:对比当前版本与各备份。恢复是<b>置换</b>,绝不是删除:被替换下来的那一版会先写进同一族里空着的备份槽位 —— 同名槽位空着就用同名,否则用下一个空着的 <code>-2</code>…<code>-9</code> —— 所以已有的备份一个都不会被覆盖,而且全都留在对话框里可以再换回来。如果该族九个槽位都被不同的内容占满了,恢复会被拒绝而不是执行,横幅会告诉你该把哪些文件挪走。</p>
 <p class="doc-p"><b>版本安全。</b>本程序版本读不懂的文件(更高的 <code>schema_version</code>,或陌生的 <code>paint.encoding</code>)会使该帧变为只读:绝不覆盖,横幅提供可复制的诊断信息。请升级程序或交给 agent 判断,不要手工改文件。</p>
 <p class="doc-p"><b>浏览器本地镜像。</b>未保存的工作还会镜像在浏览器 localStorage 的 <code>vessel_annotator_v2:*</code> 键下(每帧一条小记录,仅未保存时保留全量内容)。它只是崩溃保险,不属于数据集——文件夹里的任何东西都不依赖它。</p></div>
 <div class="doc-sec"><h4><code>perfusion</code> 单元 — 计算得出，不来自磁盘</h4><ul>
