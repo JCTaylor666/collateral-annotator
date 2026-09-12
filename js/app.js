@@ -172,7 +172,8 @@
   const BANNER_CRITICAL = new Set(['conflictNoSlotFmt', 'rescueNoSlotFmt',   // ROUND-8/R8-3: a refusal the doctor cannot see is a dead end — and conflictFoundFmt, which is critical, is exactly what is standing when these fire
     'writeFailedBanner', 'saveAborted', 'savedPartial', 'saveFailedMsg',
     'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
-    'classesBackupFailed', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
+    'classesBackupFailed', 'classesNoSlotFmt', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
+    'errNoCases', 'rescueSupersededFmt',   // ROUND-10/R10-6: a dropped Restore click is a refusal too, and it was priority 1 — invisible in exactly the sessions (an unparseable classes.json) that keep a critical message standing all day   // ROUND-10/R10-2 (found by the new classification check): its ternary sibling casesSkippedFmt is critical, so "no case folders in that folder" was dropped whenever any critical message stood — and the doctor got no explanation at all for why the folder they picked did not open   // ROUND-10/R10-1: classesNoSlotFmt was in NEITHER table while its ternary sibling classesBackupFailed was critical — and it can only fire while the critical classesCorrupt is standing, so it was dropped every single time. Dataset-wide, so deliberately NOT per-unit.
     'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
     'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed', 'protectedFrameFmt',
     // v79: the three R3 resolution messages belong here for the same reason conflictKept* do — they RETIRE
@@ -184,10 +185,21 @@
   // warning they answer), so they must be cleared on navigation or they suppress every other frame's
   // warnings for the rest of the session. ROUND-9/R9-1: conflictNoSlotFmt was made critical in v95 and left
   // out of this list, which gagged the whole app after one refused resolution.
-  const PER_UNIT_BANNERS = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'conflictFoundFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'noteBackupBlockedFmt', 'rescueNoSlotFmt', 'conflictNoSlotFmt', 'rescueFoundFmt',
+  const PER_UNIT_BANNERS = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'conflictFoundFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'noteBackupBlockedFmt', 'rescueNoSlotFmt', 'conflictNoSlotFmt', 'rescueSupersededFmt', 'rescueFoundFmt',
     'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
     'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
   let displacedBanner = null;   // R9-2: the dataset-wide critical message a per-unit one pushed aside
+  // ROUND-10/R10-4: R9-2 put the displaced message back verbatim — including ones that had since become
+  // FALSE ("2 frames skipped" after the doctor resolved both), and being critical those then gagged every
+  // per-frame warning. Restore only messages whose truth we can re-check, and only while they are true;
+  // anything else is dropped, which is what the app did before R9-2.
+  let lastWriteFailKey = null;   // the frame writeFailedBanner is about, so we can ask whether it still is
+  const bannerStillTrue = {
+    conflictScanFmt: () => conflictedUnits.size > 0,
+    protectedScanFmt: () => protectedUnits.size > 0,
+    savedPartial: () => !savedPartialResolved(),
+    writeFailedBanner: () => { const i = (lastWriteFailKey || '').indexOf('/'); return i > 0 && State.isDirty(lastWriteFailKey.slice(0, i), lastWriteFailKey.slice(i + 1)); },
+  };
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
     const b = $('banner');
@@ -300,7 +312,8 @@
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) {
       const back = displacedBanner;
       setBanner(null);
-      if (back) setBanner(back.key, back.vars, back.kind);
+      const stillTrue = back && bannerStillTrue[back.key];
+      if (stillTrue && stillTrue()) setBanner(back.key, back.vars, back.kind);   // R10-4
     }
   }
 
@@ -963,7 +976,15 @@
     // keystroke — the doctor typed a paragraph of findings, navigated away and it was gone with no warning.
     $('note').value = State.getNote(c.id, u.id); $('note').disabled = !!cur.protected;
     updateDirtyUI(); updateCopyBtn();
-    if (conflictedUnits.has(State.key(c.id, u.id))) showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
+    if (conflictedUnits.has(State.key(c.id, u.id))) {
+      // ROUND-10/R10-3 (CRITICAL): v96 made conflictFoundFmt per-unit so a RESOLVED conflict's warning
+      // would stop following the doctor — but nothing re-raised it on a revisit, and the only other signal
+      // is the chooser, which "Decide later" dismisses. A frame whose every write is silently refused then
+      // looked exactly like a normal one: blank banner, blank status line, and a note typed into it going
+      // nowhere. The dialog asks; the banner is what remains after they close it.
+      setBanner('conflictFoundFmt', { id: u.id }, 'warn');
+      showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
+    }
     else if (cur.protected) {                                  // A1: read-only frame — say why, and offer a copyable diagnostic for an agent
       const k2 = State.key(c.id, u.id);
       setBanner('protectedFrameFmt', { id: u.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
@@ -2628,7 +2649,6 @@
         if (onFrame) { setSaveStatus(null); setBanner('conflictFoundFmt', { id: uu }, 'warn'); }   // ROUND-9/R9-5: the header speaks for the frame ON SCREEN
         return;
       }
-      if (!onFrame && lastBanner && lastBanner.key === 'conflictFoundFmt') setBanner(null);   // R9-9: the conflict really is gone — do not leave its warning up
       // REVIEW FIX CD-3/F3: on a read-only frame writeUnit returns without writing, so "Kept this
       // session's version." + "Saved" were both false — the edits lived only in the browser mirror.
       // ROUND-9/R9-9: conflictKeptLocal/conflictKeptDisk exist at critical priority precisely to RETIRE the
@@ -2636,7 +2656,13 @@
       // now not per-unit — stayed up for the rest of the session saying a frame was unsaved after it had in
       // fact been resolved, gagging every other frame's warnings. It is per-unit now, and an off-frame
       // resolution retires it explicitly if it is still the one standing.
-      if (!onFrame) { if (lastBanner && lastBanner.key === 'conflictFoundFmt') setBanner(null); return; }
+      // ROUND-10/R10-5: this matched on the KEY alone, so resolving frame A off-screen wiped the warning
+      // that belonged to frame B — which was still conflicted and still refusing every write, now with a
+      // blank banner. Retire only the message about the frame we actually resolved.
+      if (!onFrame) {
+        if (lastBanner && lastBanner.key === 'conflictFoundFmt' && lastBanner.vars && lastBanner.vars.id === uu) setBanner(null);
+        return;
+      }
       if (protectedUnits.has(k)) {
         setBanner('protectedFrameFmt', { id: uu, what: (protectedUnits.get(k) || {}).what || '?' }, 'warn');
         setSaveStatus(null);
@@ -3007,11 +3033,20 @@
   // "already preserved", which lost WHICH slot holds it, and callers then named slot 1 in a banner that
   // could be pointing at an unrelated backup.
   async function freeBackupName(unit, base, raw) {
-    for (let i = 1; i <= BACKUP_SLOTS; i++) {
-      const n = i === 1 ? base : base + '-' + i;
-      const cur = await rawFileProbe(unit, n);
-      if (cur.absent) return { name: n, write: true };
-      if (cur.text === raw) return { name: n, write: false };   // this exact content is already preserved, HERE
+    // ROUND-10: the common case is still ONE read — slot 1 is free almost always. When it is not, the
+    // remaining eight are independent, so ask for them at once instead of queueing nine sequential Drive
+    // round trips. The answer is identical (still the lowest free slot); what changes is that the async
+    // window shrinks from nine round trips to two, and every guard this project has had to add (R7-1,
+    // R8-4, R8-6, R9-4, R9-8) exists because the doctor can act inside that window.
+    const first = await rawFileProbe(unit, base);
+    if (first.absent) return { name: base, write: true };
+    if (first.text === raw) return { name: base, write: false };   // this exact content is already preserved, HERE
+    const names = [];
+    for (let i = 2; i <= BACKUP_SLOTS; i++) names.push(base + '-' + i);
+    const probes = await Promise.all(names.map(n => rawFileProbe(unit, n)));
+    for (let i = 0; i < names.length; i++) {
+      if (probes[i].absent) return { name: names[i], write: true };
+      if (probes[i].text === raw) return { name: names[i], write: false };
     }
     return null;
   }
@@ -3088,7 +3123,7 @@
   // folder gone) printed "retrying automatically" just because some OTHER frame was queued — promising a
   // retry that will never come for the frame the banner just named. Ask about THIS frame.
   function reportWriteFailure(err, id, failKey, k) {
-    if (!(err && err.noteBlocked)) setBanner('writeFailedBanner', { id }, 'warn');   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
+    if (!(err && err.noteBlocked)) { lastWriteFailKey = k || null; setBanner('writeFailedBanner', { id }, 'warn'); }   // R10-4: remember WHICH frame, so a later re-raise can ask whether it is still unsaved   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
     if (k && retryQ.has(k)) setSaveStatus('retryPending', { n: retryQ.size }, true);
     else setSaveStatus(failKey, null, true);                                          // nothing is coming back for this one: never leave the header on 'saving'
   }
