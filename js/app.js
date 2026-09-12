@@ -173,7 +173,7 @@
     'writeFailedBanner', 'saveAborted', 'savedPartial', 'saveFailedMsg',
     'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
     'classesBackupFailed', 'classesNoSlotFmt', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
-    'errNoCases', 'rescueSupersededFmt',   // ROUND-10/R10-6: a dropped Restore click is a refusal too, and it was priority 1 — invisible in exactly the sessions (an unparseable classes.json) that keep a critical message standing all day   // ROUND-10/R10-2 (found by the new classification check): its ternary sibling casesSkippedFmt is critical, so "no case folders in that folder" was dropped whenever any critical message stood — and the doctor got no explanation at all for why the folder they picked did not open   // ROUND-10/R10-1: classesNoSlotFmt was in NEITHER table while its ternary sibling classesBackupFailed was critical — and it can only fire while the critical classesCorrupt is standing, so it was dropped every single time. Dataset-wide, so deliberately NOT per-unit.
+    'errNoCases', 'casesAllSkippedFmt', 'rescueSupersededFmt',   // ROUND-10/R10-6: a dropped Restore click is a refusal too, and it was priority 1 — invisible in exactly the sessions (an unparseable classes.json) that keep a critical message standing all day   // ROUND-10/R10-2 (found by the new classification check): its ternary sibling casesSkippedFmt is critical, so "no case folders in that folder" was dropped whenever any critical message stood — and the doctor got no explanation at all for why the folder they picked did not open   // ROUND-10/R10-1: classesNoSlotFmt was in NEITHER table while its ternary sibling classesBackupFailed was critical — and it can only fire while the critical classesCorrupt is standing, so it was dropped every single time. Dataset-wide, so deliberately NOT per-unit.
     'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
     'conflictKeptLocal', 'conflictKeptLocalNoBackup', 'errLoadUnitFailed', 'protectedFrameFmt',
     // v79: the three R3 resolution messages belong here for the same reason conflictKept* do — they RETIRE
@@ -194,7 +194,10 @@
     // datasetReminted/datasetSwitched are deliberately NOT here: they are raised right after the open, and
     // the first showUnit that follows would clear them before the doctor could read them. They are ordinary
     // priority, so the next per-frame warning replaces them naturally — which is the behaviour we want.
-    'errNoCases', 'casesSkippedFmt', 'geomWriteFailedFmt',
+    // casesSkippedFmt is deliberately NOT here: after a SUCCESSFUL open it reports a permanent deficiency —
+    // N case folders are missing from this session's frame list — and v98 made it per-unit, so one arrow-key
+    // press deleted it and the doctor worked all day believing the dataset was complete (R12-1).
+    'errNoCases', 'casesAllSkippedFmt', 'geomWriteFailedFmt',
     'frameNotSeeded', 'copyFromProtected', 'copyNoAnnotations', 'copyDone',
     'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
     'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
@@ -204,6 +207,9 @@
   // per-frame warning. Restore only messages whose truth we can re-check, and only while they are true;
   // anything else is dropped, which is what the app did before R9-2.
   let lastWriteFailKey = null;   // the frame writeFailedBanner is about, so we can ask whether it still is
+  let skippedCaseCount = 0;       // R12-1: case folders left out of THIS session (latched per open)
+  let classesWasReplaced = false; // R12-5: classes.json really was overwritten with the reconstructed list
+  let protectedScanUnits = new Set();   // R12-7: the read-only frames the LAST save actually skipped
   // ROUND-11/R11-1: the first cut wrote only four predicates, so the other FOURTEEN dataset-wide critical
   // messages were thrown away for good the first time a per-unit one displaced them — including
   // classesCorrupt, which is raised in exactly one place (openFolder) and could then never be said again,
@@ -213,14 +219,21 @@
   // doctor has resolved one sends them hunting for a frame that no longer needs anything (R11-4).
   const bannerStillTrue = {
     conflictScanFmt: () => conflictedUnits.size > 0 && { n: conflictedUnits.size },
-    protectedScanFmt: () => protectedUnits.size > 0 && { n: protectedUnits.size },
-    savedPartial: () => !savedPartialResolved(),
+    // R12-7: protectedUnits holds every read-only frame in the DATASET; the message counts the ones a save
+    // actually skipped. Swapping one for the other turned "2 frames were not written" into "47".
+    protectedScanFmt: () => { const n = [...protectedScanUnits].filter(x => protectedUnits.has(x)).length; return n > 0 && { n }; },
+    // R12-6: "Saved n; m failed" is a counting message — replaying the ORIGINAL m sends the doctor after
+    // frames that have since been written. savedPartialUnits already holds the subjects; count them now.
+    savedPartial: () => { const f = [...savedPartialUnits].filter(x => { const i = x.indexOf('/'); return i > 0 && State.isDirty(x.slice(0, i), x.slice(i + 1)); }).length; return f > 0 && { failed: f }; },
     writeFailedBanner: () => { const i = (lastWriteFailKey || '').indexOf('/'); return i > 0 && State.isDirty(lastWriteFailKey.slice(0, i), lastWriteFailKey.slice(i + 1)); },
     // Still true exactly while the folder's classes.json is still the unreadable one.
     classesCorrupt: () => classesFileCorrupt,
     classesBackupFailed: () => classesFileCorrupt,
     classesNoSlotFmt: () => classesFileCorrupt,
-    classesReplaced: () => classesFileCorrupt,
+    // R12-5: classesFileCorrupt is set FALSE on the line before this message is raised, so tying it to that
+    // flag made the predicate permanently false — an entry that quieted the gate while the message was still
+    // dropped for good. Its own latch, cleared when a folder is opened.
+    classesReplaced: () => classesWasReplaced,
     classesIndexZero: () => classesIndexBad && { n: classesBadCount },
     // Latched conditions: nothing in the app ever clears them, so they stay true until the folder is reopened
     // (which clears the banner outright). Saying them again is the safe direction — each one means the
@@ -229,11 +242,20 @@
     errQuotaFull: () => true,
     errNoWritePermission: () => true,
     errUnsupportedBrowser: () => true,
-    // Still true while anything is unwritten; pointless once everything is on disk.
-    saveAborted: () => State.dirtyCount() > 0,
-    saveFailedMsg: () => State.dirtyCount() > 0,
+    // R12-1: latched for the session — N case folders really are missing from the frame list until reopened.
+    casesSkippedFmt: () => skippedCaseCount > 0 && { n: skippedCaseCount },
   };
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
+  // ROUND-12/R12-3: the ✕ used to run the same path as any dismissal, so clearing a PER-UNIT message also
+  // forgot the dataset-wide one it was sitting on top of — and that one was never read. The ✕ dismisses what
+  // the doctor is looking at; anything underneath it comes back (if it is still true).
+  function dismissBanner() {
+    const back = displacedBanner, showing = lastBanner;
+    setBanner(null);
+    if (!back || !showing || PER_UNIT_BANNERS.indexOf(showing.key) < 0) return;
+    const st = bannerStillTrue[back.key], fresh = st && st();
+    if (fresh) setBanner(back.key, fresh === true ? back.vars : Object.assign({}, back.vars, fresh), back.kind);
+  }
   function setBanner(key, vars, kind) {
     const b = $('banner');
     if (key && lastBanner && bannerPrio(lastBanner.key, lastBanner.kind) === 2 && bannerPrio(key, kind) < 2) return;
@@ -251,7 +273,7 @@
     if (key && bannerPrio(key, kind) === 2) {   // critical messages are dismissable by hand — sticky must never mean stuck
       const x = document.createElement('span');
       x.className = 'banner-x'; x.textContent = '✕'; x.title = I18n.t('bannerDismiss');
-      x.onclick = () => setBanner(null);
+      x.onclick = dismissBanner;
       b.appendChild(x);
     }
     b.className = cls;
@@ -350,7 +372,7 @@
       // that no longer needs anything.
       const stillTrue = back && bannerStillTrue[back.key];
       const fresh = stillTrue && stillTrue();
-      if (fresh) setBanner(back.key, fresh === true ? back.vars : fresh, back.kind);
+      if (fresh) setBanner(back.key, fresh === true ? back.vars : Object.assign({}, back.vars, fresh), back.kind);   // R12-6: a predicate may refresh SOME of the numbers
     }
   }
 
@@ -456,8 +478,12 @@
         // cleared on the next navigation — but the restore below IS a navigation, and setting the banner
         // here meant it cleared itself before the doctor could read it (the P0-3 gate caught that). Hand it
         // to the caller and let it speak after the view is back.
+        // ROUND-12/R12-1+R12-8: casesSkippedFmt was doing two opposite jobs. Here NOTHING opened — the
+        // doctor is still in the previous study — yet its wording ends "everything else opened normally",
+        // which is a lie that can convince them they are annotating the folder they just picked. Its own
+        // key, and its own honest sentence.
         return { restore: prevView, banner: skippedCases.length
-          ? { key: 'casesSkippedFmt', vars: { n: skippedCases.length, names: skippedCases.slice(0, 4).join(', ') + (skippedCases.length > 4 ? ' …' : '') } }
+          ? { key: 'casesAllSkippedFmt', vars: { n: skippedCases.length, names: skippedCases.slice(0, 4).join(', ') + (skippedCases.length > 4 ? ' …' : '') } }
           : { key: 'errNoCases', vars: null } };
       }
       // ROUND-5/R5-3: v91 moved the remint past the unsaved-work confirm but left it ahead of discover(),
@@ -484,7 +510,7 @@
       // F1: entries loadClasses had to DISCARD (no usable index) count as "this file is not trustworthy"
       // exactly like an index-0 entry does — otherwise the file is auto-regenerated over the real names.
       const badCount = badIdx.length + (cls.dropped || 0);
-      classesFileCorrupt = !cls.ok || badCount > 0; classesBackedUp = false; classesOverwriteOK = false;
+      classesFileCorrupt = !cls.ok || badCount > 0; classesBackedUp = false; classesOverwriteOK = false; classesWasReplaced = false;   // R12-5: a fresh folder, a fresh latch
       classesIndexBad = cls.ok && badCount > 0; classesBadCount = badCount;   // parseable but with unusable entries: same protection, its own (accurate) banner
       classesRaw = (cls.ok && cls.raw && typeof cls.raw === 'object') ? cls.raw : null;   // UI-2: preserve unknown fields on write (assigned inside the synchronous COMMIT block, so it always belongs to the folder being committed)
       dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
@@ -511,8 +537,13 @@
       return { show: true, sw, reminted, skippedCases };
     } catch (e) {
       if (committed) return { show: true, sw, reminted, skippedCases: [] };   // the synchronous commit already ran: the new dataset IS open
-      if (!(e && e.name === 'AbortError')) setBanner('errOpenFailed', { msg: e.message }, 'warn');   // AbortError = the doctor closed the picker
-      return prevView ? { restore: prevView } : null;               // nothing was committed — put the frozen view back
+      // ROUND-12/R12-4: v98 deferred errNoCases/casesAllSkippedFmt past the restore navigation and left
+      // their sibling behind — so the ONE message explaining why the picked folder did not open was
+      // overwritten by the restored frame's own banner, before the doctor could read it.
+      const bn = (e && e.name === 'AbortError') ? null : { key: 'errOpenFailed', vars: { msg: e.message } };   // AbortError = the doctor closed the picker
+      if (prevView) return { restore: prevView, banner: bn };       // nothing was committed — put the frozen view back
+      if (bn) setBanner(bn.key, bn.vars, 'warn');
+      return null;
     }
   }
   async function openFolder() {
@@ -549,6 +580,7 @@
     // screen the doctor never saw "classes.json is unreadable", "this folder was re-identified" or the
     // skipped-folder notice — precisely the session where something was already wrong.
     if (shown) {
+      skippedCaseCount = (act.skippedCases || []).length;   // R12-1: latched for the whole session, so the notice can be re-raised after it is displaced
       if (classesIndexBad) setBanner('classesIndexZero', { n: classesBadCount }, 'warn');
       else if (classesFileCorrupt) setBanner('classesCorrupt', null, 'warn');
       else if (act.skippedCases && act.skippedCases.length) setBanner('casesSkippedFmt', { n: act.skippedCases.length, names: act.skippedCases.slice(0, 4).join(', ') + (act.skippedCases.length > 4 ? ' …' : '') }, 'warn');   // LN-3
@@ -1416,7 +1448,7 @@
       if (root !== rootHandle) return;         // the folder changed under us: do not adopt this as the new truth
       classesRaw = merged;                     // what is on disk now
       if (wasCorrupt) {   // the file parses again — and the "left untouched" banner has just become FALSE
-        classesFileCorrupt = false; classesBackedUp = false;
+        classesFileCorrupt = false; classesBackedUp = false; classesWasReplaced = true;   // R12-5
         setBanner('classesReplaced', { file: classesBackupName }, 'warn');
       }
       setSaveStatus('classesSaved', { time: hhmm() });
@@ -2977,6 +3009,7 @@
     const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
     let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0, skippedProtected = 0;
     const failedKeys = new Set();   // R5-1: which frames the savedPartial banner will be ABOUT
+    const protectedKeys = new Set();   // R12-7: …and which read-only frames THIS save skipped
     saveRunning = true;
     saveModalOpen(caseId ? 'savingCaseFmt' : 'savingAllTitle', caseId ? { id: caseId } : null);
     $('btnSave').disabled = true; $('btnSaveCase').disabled = true; $('btnOpen').disabled = true;
@@ -3000,7 +3033,7 @@
         // Both halves are false for a read-only frame: there is no newer file, and opening it shows the
         // read-only banner, never a chooser. Count them apart and say the right thing about each.
         if (conflictedUnits.has(k)) { skippedConflicts++; continue; }        // chooser-owned
-        if (protectedUnits.has(k)) { skippedProtected++; continue; }          // read-only: this build cannot fully read it
+        if (protectedUnits.has(k)) { skippedProtected++; protectedKeys.add(k); continue; }          // read-only: this build cannot fully read it
         try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else n++; }   // the write itself may detect a fresh conflict and refuse
         catch (e) { failed++; failedKeys.add(k); }   // a single unloadable/broken unit must not abort saving the rest
       }
@@ -3019,7 +3052,7 @@
         ? I18n.t('saveDoneProtectedFmt', { n, c: skippedConflicts, p: skippedProtected })
         : I18n.t('saveDoneConflictsFmt', { n, c: skippedConflicts + skippedProtected }));
       if (skippedConflicts) setBanner('conflictScanFmt', { n: skippedConflicts }, 'warn');
-      else setBanner('protectedScanFmt', { n: skippedProtected }, 'warn');
+      else { protectedScanUnits = protectedKeys; setBanner('protectedScanFmt', { n: skippedProtected }, 'warn'); }   // R12-7
     }
     else {
       saveModalFinish(I18n.t('saveDoneFmt', { n }));
