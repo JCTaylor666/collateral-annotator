@@ -110,7 +110,15 @@
   }
 
   function resetOrder() {
-    try { localStorage.removeItem(LSKEY); } catch (e) { }
+    // ROUND-5/RL-1: this removed the WHOLE vessel_annotator_ui_v1 object, while writeOrder() only MERGES
+    // railOrder into it — so the first other UI preference stored under that key would be wiped by a button
+    // labelled "Reset layout". Drop only what this button owns.
+    try {
+      let o = null;
+      try { o = JSON.parse(localStorage.getItem(LSKEY) || '{}'); } catch (e) { }
+      if (o && typeof o === 'object' && !Array.isArray(o)) { delete o.railOrder; localStorage.setItem(LSKEY, JSON.stringify(o)); }
+      else localStorage.removeItem(LSKEY);
+    } catch (e) { }
     const byKey = new Map(sections().map(el => [el.dataset.sec, el]));
     defaultOrder.forEach(k => { const el = byKey.get(k); if (el) rail.appendChild(el); });
   }
