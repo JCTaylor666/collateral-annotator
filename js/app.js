@@ -186,6 +186,16 @@
   // warnings for the rest of the session. ROUND-9/R9-1: conflictNoSlotFmt was made critical in v95 and left
   // out of this list, which gagged the whole app after one refused resolution.
   const PER_UNIT_BANNERS = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'conflictFoundFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'noteBackupBlockedFmt', 'rescueNoSlotFmt', 'conflictNoSlotFmt', 'rescueSupersededFmt', 'rescueFoundFmt',
+    // ROUND-11/R11-2: one-shot notices. errNoCases/casesSkippedFmt are about a folder that was NOT opened;
+    // v97 made them critical so they could be seen, and nothing retired them — one mis-clicked Open then
+    // dropped every per-frame warning for the rest of the session. datasetReminted/datasetSwitched are the
+    // same shape. geomWriteFailedFmt and the four copy/seed notices below NAME a frame, so they must not
+    // outlive the visit either (R11-3).
+    // datasetReminted/datasetSwitched are deliberately NOT here: they are raised right after the open, and
+    // the first showUnit that follows would clear them before the doctor could read them. They are ordinary
+    // priority, so the next per-frame warning replaces them naturally — which is the behaviour we want.
+    'errNoCases', 'casesSkippedFmt', 'geomWriteFailedFmt',
+    'frameNotSeeded', 'copyFromProtected', 'copyNoAnnotations', 'copyDone',
     'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
     'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
   let displacedBanner = null;   // R9-2: the dataset-wide critical message a per-unit one pushed aside
@@ -194,11 +204,34 @@
   // per-frame warning. Restore only messages whose truth we can re-check, and only while they are true;
   // anything else is dropped, which is what the app did before R9-2.
   let lastWriteFailKey = null;   // the frame writeFailedBanner is about, so we can ask whether it still is
+  // ROUND-11/R11-1: the first cut wrote only four predicates, so the other FOURTEEN dataset-wide critical
+  // messages were thrown away for good the first time a per-unit one displaced them — including
+  // classesCorrupt, which is raised in exactly one place (openFolder) and could then never be said again,
+  // leaving the doctor labelling vessels against invented placeholder class names all day. The gate check
+  // now requires an entry here for every such key, so this table cannot fall behind again.
+  // Counting messages recompute their numbers at restore time: replaying "2 frames skipped" after the
+  // doctor has resolved one sends them hunting for a frame that no longer needs anything (R11-4).
   const bannerStillTrue = {
-    conflictScanFmt: () => conflictedUnits.size > 0,
-    protectedScanFmt: () => protectedUnits.size > 0,
+    conflictScanFmt: () => conflictedUnits.size > 0 && { n: conflictedUnits.size },
+    protectedScanFmt: () => protectedUnits.size > 0 && { n: protectedUnits.size },
     savedPartial: () => !savedPartialResolved(),
     writeFailedBanner: () => { const i = (lastWriteFailKey || '').indexOf('/'); return i > 0 && State.isDirty(lastWriteFailKey.slice(0, i), lastWriteFailKey.slice(i + 1)); },
+    // Still true exactly while the folder's classes.json is still the unreadable one.
+    classesCorrupt: () => classesFileCorrupt,
+    classesBackupFailed: () => classesFileCorrupt,
+    classesNoSlotFmt: () => classesFileCorrupt,
+    classesReplaced: () => classesFileCorrupt,
+    classesIndexZero: () => classesIndexBad && { n: classesBadCount },
+    // Latched conditions: nothing in the app ever clears them, so they stay true until the folder is reopened
+    // (which clears the banner outright). Saying them again is the safe direction — each one means the
+    // doctor's work may not be reaching disk or the crash net.
+    multiTabWarn: () => true,
+    errQuotaFull: () => true,
+    errNoWritePermission: () => true,
+    errUnsupportedBrowser: () => true,
+    // Still true while anything is unwritten; pointless once everything is on disk.
+    saveAborted: () => State.dirtyCount() > 0,
+    saveFailedMsg: () => State.dirtyCount() > 0,
   };
   const bannerPrio = (key, kind) => key == null ? -1 : (BANNER_CRITICAL.has(key) ? 2 : (kind === 'ok' ? 0 : 1));
   function setBanner(key, vars, kind) {
@@ -312,8 +345,12 @@
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) {
       const back = displacedBanner;
       setBanner(null);
+      // R10-4 + ROUND-11/R11-4: a predicate may answer `true`, or answer with FRESH vars — a counting
+      // message replayed with its original number ("2 frames skipped") sends the doctor hunting for a frame
+      // that no longer needs anything.
       const stillTrue = back && bannerStillTrue[back.key];
-      if (stillTrue && stillTrue()) setBanner(back.key, back.vars, back.kind);   // R10-4
+      const fresh = stillTrue && stillTrue();
+      if (fresh) setBanner(back.key, fresh === true ? back.vars : fresh, back.kind);
     }
   }
 
@@ -415,9 +452,13 @@
       // ROUND-3 FIX (NL-7/BAN-6/E2E-4): when discovery could not LIST any case folder, errNoCases' wording
       // ("check the folder names") sends the doctor to fix something that is not wrong. Say what happened.
       if (!found.length) {
-        setBanner(skippedCases.length ? 'casesSkippedFmt' : 'errNoCases',
-          skippedCases.length ? { n: skippedCases.length, names: skippedCases.slice(0, 4).join(', ') + (skippedCases.length > 4 ? ' …' : '') } : null, 'warn');
-        return { restore: prevView };
+        // ROUND-11/R11-2: these are one-shot notices about a folder that was NOT opened, so they must be
+        // cleared on the next navigation — but the restore below IS a navigation, and setting the banner
+        // here meant it cleared itself before the doctor could read it (the P0-3 gate caught that). Hand it
+        // to the caller and let it speak after the view is back.
+        return { restore: prevView, banner: skippedCases.length
+          ? { key: 'casesSkippedFmt', vars: { n: skippedCases.length, names: skippedCases.slice(0, 4).join(', ') + (skippedCases.length > 4 ? ' …' : '') } }
+          : { key: 'errNoCases', vars: null } };
       }
       // ROUND-5/R5-3: v91 moved the remint past the unsaved-work confirm but left it ahead of discover(),
       // the "no case folders" bail-out and loadClasses — every one of which can still end this transaction
@@ -484,6 +525,7 @@
     if (!act) return;                           // picker cancelled and nothing was open — nothing to restore
     if (act.restore) {
       if (act.restore.had) await showUnit(act.restore.ci, act.restore.ui);   // un-freeze: back to the dataset that is still open
+      if (act.banner) setBanner(act.banner.key, act.banner.vars, 'warn');    // ROUND-11/R11-2: after the restore navigation, or it clears itself
       return;                                   // openGen never moved, so that dataset's background scan is still running — do NOT start a second one
     }
     // REVIEW FIX F2: openBusy is released in the finally ABOVE, before this await, so a second Open can
@@ -982,7 +1024,7 @@
       // is the chooser, which "Decide later" dismisses. A frame whose every write is silently refused then
       // looked exactly like a normal one: blank banner, blank status line, and a note typed into it going
       // nowhere. The dialog asks; the banner is what remains after they close it.
-      setBanner('conflictFoundFmt', { id: u.id }, 'warn');
+      setBanner('conflictFoundFmt', { id: u.id, k: State.key(c.id, u.id) }, 'warn');   // ROUND-11/R11-3: `k` is not shown; it is how a later retire knows WHICH frame this is about
       showConflictDialog(State.key(c.id, u.id));   // opening a conflicted frame asks which version to keep (4.2) — every revisit, until resolved
     }
     else if (cur.protected) {                                  // A1: read-only frame — say why, and offer a copyable diagnostic for an agent
@@ -1915,14 +1957,14 @@
     // saveNote then wrote THIS frame's annotation.json and note.json into the NEXT frame's folder.
     const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u);
     if (!sessionLoaded.has(k)) { setBanner('frameNotSeeded', { id: u }, 'warn'); return; }   // same rule as writeUnit: never overwrite an annotation.json this session could not read
-    if (conflictedUnits.has(k)) { setBanner('conflictFoundFmt', { id: u }, 'warn'); showConflictDialog(k); return; }   // unresolved conflict: choosing comes first, no write may touch the file
+    if (conflictedUnits.has(k)) { setBanner('conflictFoundFmt', { id: u, k }, 'warn'); showConflictDialog(k); return; }   // unresolved conflict: choosing comes first, no write may touch the file
     State.setNote(c, u, $('note').value);
     try {
       setSaveStatus('saving');
       await writeUnit(c, unit);
       if (conflictedUnits.has(k)) {                           // the write itself found a NEWER file on disk and refused
         setSaveStatus(null);                                  // the frame is NOT saved — never claim it is
-        setBanner('conflictFoundFmt', { id: u }, 'warn');
+        setBanner('conflictFoundFmt', { id: u, k }, 'warn');
         showConflictDialog(k);
         return;
       }
@@ -1987,7 +2029,7 @@
       try {
         setSaveStatus('saving'); await writeUnit(c.id, u); updateDirtyUI();
         if (conflictedUnits.has(State.key(c.id, u.id))) {   // REVIEW FIX CONF-4: refused, not saved
-          setSaveStatus(null); setBanner('conflictFoundFmt', { id: u.id }, 'warn');
+          setSaveStatus(null); setBanner('conflictFoundFmt', { id: u.id, k: State.key(c.id, u.id) }, 'warn');
         } else setSavedStatus();
       }
       catch (e) { reportWriteFailure(e, u.id, 'saveFailed', State.key(c.id, u.id)); }
@@ -2605,7 +2647,13 @@
       // the meantime. At critical priority the message then sat on ANOTHER frame, suppressing that frame's
       // own warnings until dismissed by hand. Say it only to the frame it is about; a doctor who has moved
       // on sees the frame's real state when they come back.
+      // ROUND-11/R11-5: R9-9 taught the "keep my version" branch to retire the stale conflictFoundFmt when
+      // the doctor has walked away — and this branch, which does exactly the same thing, never got it. A
+      // resolution completed off-screen left "this frame has a newer file — nothing was saved" standing for
+      // the rest of the session, at critical priority, gagging every other frame's warnings. Matched on the
+      // full key, because frame names repeat in every case folder (R11-3).
       if (cur && State.key(cur.caseId, cur.unitId) === k) setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', { file: keptFiles.join(' + ') }, 'ok');
+      else if (lastBanner && lastBanner.key === 'conflictFoundFmt' && lastBanner.vars && lastBanner.vars.k === k) setBanner(null);
     } else {
       // REVIEW FIX R3: `if (r.ann)` meant that exactly when the folder copy could NOT be parsed — the one
       // case where it is irreplaceable — no external-backup was written and writeUnit overwrote it anyway.
@@ -2646,7 +2694,7 @@
       // and the banner then said "Kept this session's version." + "Saved" over a frame nothing was written to.
       const onFrame = !!(cur && State.key(cur.caseId, cur.unitId) === k);   // ROUND-8/R8-8
       if (conflictedUnits.has(k)) {
-        if (onFrame) { setSaveStatus(null); setBanner('conflictFoundFmt', { id: uu }, 'warn'); }   // ROUND-9/R9-5: the header speaks for the frame ON SCREEN
+        if (onFrame) { setSaveStatus(null); setBanner('conflictFoundFmt', { id: uu, k }, 'warn'); }   // ROUND-9/R9-5: the header speaks for the frame ON SCREEN
         return;
       }
       // REVIEW FIX CD-3/F3: on a read-only frame writeUnit returns without writing, so "Kept this
@@ -2660,7 +2708,10 @@
       // that belonged to frame B — which was still conflicted and still refusing every write, now with a
       // blank banner. Retire only the message about the frame we actually resolved.
       if (!onFrame) {
-        if (lastBanner && lastBanner.key === 'conflictFoundFmt' && lastBanner.vars && lastBanner.vars.id === uu) setBanner(null);
+        // ROUND-11/R11-3: matching on the frame NAME alone was not enough — ids like `frame_1` repeat in
+        // every case folder, so resolving one case's frame_1 wiped another case's frame_1 warning, on a
+        // frame that was still conflicted and still refusing every write. Compare the full key.
+        if (lastBanner && lastBanner.key === 'conflictFoundFmt' && lastBanner.vars && lastBanner.vars.k === k) setBanner(null);
         return;
       }
       if (protectedUnits.has(k)) {
@@ -3147,7 +3198,7 @@
   // success. REVIEW FIX CONF-4: every caller must re-check conflictedUnits before claiming "Saved" —
   // runAutoSave and saveNote already did; the retry queue, the star and cross-frame undo did not.
   async function runRetries() {
-    let recovered = false, conflicted = null;
+    let recovered = false, conflicted = null, conflictedKey = null;   // ROUND-11/R11-3: the full key, so a later retire knows which frame
     for (const e of [...retryQ.values()]) {
       const k = State.key(e.caseId, e.unit.id);
       if (e.tok !== dsToken) { retryQ.delete(k); continue; }                          // queued against a dataset that is no longer open
@@ -3158,7 +3209,7 @@
       try {
         await writeUnit(e.caseId, e.unit);
         retryQ.delete(k);
-        if (conflictedUnits.has(k)) { if (!conflicted) conflicted = e.unit.id; }   // REFUSED, not recovered
+        if (conflictedUnits.has(k)) { if (!conflicted) { conflicted = e.unit.id; conflictedKey = k; } }   // REFUSED, not recovered
         else recovered = true;
       }
       catch (err) { }                          // writeUnit's own hook has already re-queued (or dropped) it
@@ -3166,7 +3217,7 @@
     if (retryQ.size) { setSaveStatus('retryPending', { n: retryQ.size }, true); armRetry(RETRY_DELAYS[RETRY_DELAYS.length - 1]); }
     else if (conflicted) {                     // the retry found a NEWER file and refused: nothing was written
       setSaveStatus(null);                     // never claim Saved
-      setBanner('conflictFoundFmt', { id: conflicted }, 'warn');
+      setBanner('conflictFoundFmt', { id: conflicted, k: conflictedKey }, 'warn');
     }
     else if (recovered) {
       // REVIEW FIX RS-5: only writeFailedBanner was retired here, so the sticky critical "Saved n — 2
@@ -3395,7 +3446,7 @@
       const k2 = State.key(p.c, p.unit.id);
       if (conflictedUnits.has(k2)) {                  // the write refused: a newer differing file appeared on disk
         setSaveStatus(null);                          // the frame is NOT saved — never claim it is
-        setBanner('conflictFoundFmt', { id: p.unit.id }, 'warn');
+        setBanner('conflictFoundFmt', { id: p.unit.id, k: k2 }, 'warn');
         if (cur && cur.caseId === p.c && cur.unitId === p.unit.id) showConflictDialog(k2);
       } else if (protectedUnits.has(k2)) {            // REVIEW FIX BT-6: read-only is the OTHER silent refusal
         setSaveStatus(null);
@@ -3494,7 +3545,7 @@
           updateDirtyUI();
           const uk = State.key(e.c, e.u);
           if (conflictedUnits.has(uk)) {                   // REVIEW FIX CONF-4: refused, not saved
-            setSaveStatus(null); setBanner('conflictFoundFmt', { id: e.u }, 'warn');
+            setSaveStatus(null); setBanner('conflictFoundFmt', { id: e.u, k: uk }, 'warn');
           } else if (protectedUnits.has(uk)) {             // REVIEW FIX F7: read-only frame — also refused
             setSaveStatus(null); setBanner('protectedFrameFmt', { id: e.u, what: (protectedUnits.get(uk) || {}).what || '?' }, 'warn');
           } else setSavedStatus();
