@@ -123,7 +123,7 @@
              // without seeding, and EVERY write to that frame was refused for the rest of the session — while
              // Finder showed a perfectly healthy annotation.json. They are separate files with separate fates.
              annDropped: a.dropped || 0, annUnreadable: !!a.unreadable, noteUnreadable: !!n.unreadable,
-             annMtime: a.mtime || 0, note: n.note, geometry };
+             annMtime: a.mtime || 0, noteMtime: n.mtime || 0, note: n.note, geometry };
   }
 
   // read annotation.json, distinguishing absent (annotation:null, corrupt:false) from
@@ -162,15 +162,19 @@
     const dropped = (root.State && root.State.annotationDropped) ? root.State.annotationDropped(ann) : 0;
     return { annotation: ann, corrupt: false, dropped, mtime };
   }
+  // ROUND-3 FIX (SWG-5 symmetry): the write guard compares against max(annotation, note) mtime, so every
+  // READ path has to be able to record the same thing — otherwise a frame whose note.json is simply newer
+  // than its annotation.json is measured against an annotation-only "last seen" and declared conflicted
+  // for ever, refusing every legitimate save. Report the note's mtime alongside its contents.
   async function readNote(unit) {
     let fh;
     try { fh = await unit.handle.getFileHandle('note.json'); }
-    catch (e) { return (e && e.name === 'NotFoundError') ? { note: null } : { note: null, unreadable: true }; }   // absent vs. present-but-unreachable
-    let text;
-    try { text = await (await fh.getFile()).text(); }
-    catch (e) { return { note: null, unreadable: true }; }
-    try { return { note: JSON.parse(text) }; }
-    catch (e) { return { note: null, corrupt: true }; }   // present but not JSON: flagged so the app backs the original up to note.json.corrupt before any write replaces it (A2)
+    catch (e) { return (e && e.name === 'NotFoundError') ? { note: null, mtime: 0 } : { note: null, unreadable: true, mtime: 0 }; }   // absent vs. present-but-unreachable
+    let text, mtime = 0;
+    try { const f = await fh.getFile(); mtime = f.lastModified || 0; text = await f.text(); }
+    catch (e) { return { note: null, unreadable: true, mtime: 0 }; }
+    try { return { note: JSON.parse(text), mtime }; }
+    catch (e) { return { note: null, corrupt: true, mtime }; }   // present but not JSON: flagged so the app backs the original up to note.json.corrupt before any write replaces it (A2)
   }
   // Optional geometry.json: per-segment named metrics that drive the stats + filter UI.
   // { segments: { "<segId>": { "<metric>": <number>, ... } }, filter?: {metric,min,max} }.
@@ -213,7 +217,8 @@
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
     return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0, versionAhead: a.versionAhead || 0,
-             unreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, note: n.note, noteCorrupt: !!n.corrupt, mtime: a.mtime || 0 };   // ANS-3: the note's fate is its own
+             unreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, note: n.note, noteCorrupt: !!n.corrupt,
+             mtime: Math.max(a.mtime || 0, n.mtime || 0), annMtime: a.mtime || 0, noteMtime: n.mtime || 0 };   // `mtime` is now the UNIT's newest file — symmetric with unitDiskMtime()   // ANS-3: the note's fate is its own
   }
 
   // read the dataset-level class definitions from classes.json at the root.

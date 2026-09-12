@@ -211,7 +211,13 @@ body.sel-brush-mode .single-opts{display:none}
 /* REVIEW FIX HCW-5: the header was a fixed-height overflow:hidden strip, so #curLabel was silently clipped
    and below ~1250px the cursor readout, the panel toggle and the language buttons were cut out of reach
    altogether. Let it wrap instead of swallowing its own controls. */
-header.strip{flex-wrap:wrap;height:auto;min-height:44px;overflow:visible}
+/* ROUND-3 FIX (CB-1): making the header height-variable meant the live cursor readout could push it onto a
+   second line mid-gesture — and #view's height then changed on pointer MOVE, re-running layout() and the
+   dpr transform while the doctor was drawing. Keep it one fixed-height row at normal widths (where the
+   clipping HCW-5 fixed does not occur) and only allow wrapping on genuinely narrow windows. */
+header.strip{height:40px;overflow:visible;flex-wrap:nowrap}
+header.strip #cursor{min-width:11ch;text-align:right;white-space:nowrap}
+@media (max-width:1250px){header.strip{flex-wrap:wrap;height:auto;min-height:40px}}
 /* REVIEW FIX HCW-6: .modal had no max-height and .modal-overlay did not scroll, so below a ~554px viewport
    the rescue chooser's Close button sat off-screen and could not be clicked at all. */
 .modal-overlay{overflow:auto;padding:12px}

@@ -494,6 +494,8 @@
   const peekUndo = () => undoStack.length ? undoStack[undoStack.length - 1] : null;   // read-only: lets the app pre-load an evicted unit's dims BEFORE popping a paint entry
   function undo() {
     const e = undoStack.pop(); if (!e) return null;
+    undoBytes -= entryBytes(e);   // ROUND-3 FIX: pushU charged the byte counter but nothing ever refunded it,
+    if (undoBytes < 0) undoBytes = 0;   // so after enough undone work the cap evicted real history on every push.
     const L = e.layer || 0;   // the layer this entry belongs to (marker is frame-level; L unused there)
     if (e.kind === 'point') {
       const a = ptsLW(e.c, e.u, L);
@@ -551,7 +553,10 @@
     delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
     // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
     // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
-    undoStack = undoStack.filter(e => !(e.c === c && e.u === u)); persistUnit(c, u);
+    // ROUND-3 FIX: same refund on the other path that drops entries.
+    undoStack = undoStack.filter(e => { if (e.c === c && e.u === u) { undoBytes -= entryBytes(e); return false; } return true; });
+    if (undoBytes < 0) undoBytes = 0;
+    persistUnit(c, u);
   }
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
