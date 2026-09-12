@@ -223,13 +223,15 @@
     // modifier — but the two destructive controls (layer ✕, frame ☆) call stopPropagation() in their OWN
     // onclick, on this very event, so it never did. The real problem is upstream: a MOUSE click left focus
     // sitting on the span, and the Space the doctor then held to pan fired the control instead, once per
-    // auto-repeat, each one a real annotation.json write. Take no focus from a pointer press (what a real
-    // <button> does for accessibility anyway) and ignore auto-repeat. Tab + Enter/Space still work.
+    // auto-repeat, each one a real annotation.json write. Do not take focus from a pointer press. (Chrome
+    // and Edge DO focus a native button on mousedown, so this is a deliberate difference, not a
+    // restoration of platform behaviour — the accidental writes are worse than the inconsistency.)
+    // Tab + Enter/Space still work for keyboard users.
     el.addEventListener('mousedown', ev => { if (ev && ev.preventDefault) ev.preventDefault(); });
     el.addEventListener('keydown', ev => {
       if (ev.key !== 'Enter' && ev.key !== ' ') return;
-      if (ev.repeat) return;   // holding the key must never fire one write per repeat
-      ev.preventDefault();     // preventDefault alone stops the page scroll, which is all this needed
+      ev.preventDefault();     // ROUND-6/R6-3: this must come FIRST — v92 returned on auto-repeat before cancelling, so a held Space on a focused ☆ scrolled the whole page out from under the doctor
+      if (ev.repeat) return;   // …but only the first press acts: one write per repeat is never what was meant
       if (typeof el.onclick === 'function') el.onclick(ev);
     });
     return el;
@@ -1935,7 +1937,7 @@
           setSaveStatus(null); setBanner('conflictFoundFmt', { id: u.id }, 'warn');
         } else setSavedStatus();
       }
-      catch (e) { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: u.id }, 'warn'); }
+      catch (e) { reportWriteFailure(e, u.id, 'saveFailed'); }
     }
   }
   // REVIEW FIX SW-1: this built the NAV TARGET's rows (curCase()) while the canvas, the header, and
@@ -2593,10 +2595,11 @@
     'annotation.json.corrupt', 'note.json.corrupt'];
   // …plus the numbered siblings freeBackupName() creates for a SECOND, different corruption. A rescue file
   // the chooser cannot see is a rescue file that does not exist, so match the family, not just the name.
-  const rescueBase = n => (n.indexOf('annotation.json.corrupt') === 0 ? 'annotation.json.corrupt'
-    : n.indexOf('note.json.corrupt') === 0 ? 'note.json.corrupt' : n);
-  const isRescueName = n => RESCUE_NAMES.indexOf(n) >= 0 ||
-    (RESCUE_NAMES.indexOf(rescueBase(n)) >= 0 && /^-[0-9]+$/.test(n.slice(rescueBase(n).length)));
+  // ROUND-6/R6-10: the first cut matched any digits after the prefix, so a colleague's `note.json.corrupt-0`
+  // or a script's `-42` was adopted into the chooser as if this app had written it. freeBackupName only ever
+  // produces `-2`…`-9` on a name that is already in the list — match exactly that, and nothing else.
+  const rescueBase = n => { const m = /^(.*)-([2-9])$/.exec(n); return (m && RESCUE_NAMES.indexOf(m[1]) >= 0) ? m[1] : n; };
+  const isRescueName = n => RESCUE_NAMES.indexOf(rescueBase(n)) >= 0;
   const rescueFound = new Map();   // State.key() -> [names present at last check] (session cache)
   let rescueShownFor = null, rescueFiles = [], rescueSel = 0;
   async function checkRescueFiles(c, u) {
@@ -2694,7 +2697,12 @@
   function rescueSwapTarget(name) {
     // ROUND-5: the numbered .corrupt siblings and the new note.unread-backup.json have the same property as
     // the originals — their whole value is content this session could not otherwise produce — so the
-    // displaced version goes to the .unsaved-backup sidecar and both survive.
+    // displaced version must NOT be written back over them; it goes to the .unsaved-backup sidecar.
+    // ROUND-6/R6-5: …but that sidecar can already hold something real (a note parked by an earlier conflict
+    // resolution), and v92 overwrote it — a restore that used to be a reversible self-swap became a one-way
+    // move that ate a different backup, and widening the chooser to the numbered siblings gave the doctor
+    // ten tabs all funnelling into the same two files. This returns the BASE now; restoreRescue resolves it
+    // to a FREE slot, so no restore can destroy anything, whichever tab the doctor tries.
     if (rescueBase(name) === 'annotation.json.corrupt') return 'annotation.unsaved-backup.json';
     if (rescueBase(name) === 'note.json.corrupt') return 'note.unsaved-backup.json';
     if (name === 'note.unread-backup.json') return 'note.unsaved-backup.json';
@@ -2715,10 +2723,17 @@
       setBanner('rescueRefusedFmt', { id: u, file: f.name }, 'warn');
       return;
     }
-    const swapTo = rescueSwapTarget(f.name);
+    const swapBase = rescueSwapTarget(f.name);
+    // ROUND-6/R6-5: BOTH branches park the version they displace, and both must land on a FREE slot — the
+    // .unsaved-backup sidecars can already hold something real. Resolve it once, before the swap.
+    const body = f.isNote ? JSON.stringify(State.buildNote(c, u), null, 2)
+                          : JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2);
+    const swapTo = await freeBackupName(unit, swapBase, body);
+    if (swapTo === null) { hideRescueDialog(); setBanner('rescueRefusedFmt', { id: u, file: f.name }, 'warn'); return; }
+    if (tok !== dsToken) return;
     try {
       if (f.isNote) {
-        await FS.writeText(unit.handle, swapTo, JSON.stringify(State.buildNote(c, u), null, 2));
+        if (swapTo) await FS.writeText(unit.handle, swapTo, body);
         if (tok !== dsToken) return;
         for (const m of State.markerList(c, u)) State.removeMarker(c, u, m.id);   // clear, then adopt (importNoteJson only fills empty)
         State.setNote(c, u, '');
@@ -2727,7 +2742,7 @@
         $('note').value = State.getNote(c, u);
         refreshMarkers(); buildMarkerChips();
       } else {
-        await FS.writeText(unit.handle, swapTo, JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2));
+        if (swapTo) await FS.writeText(unit.handle, swapTo, body);
         if (tok !== dsToken) return;
         const keepNote = State.buildNote(c, u);                                   // annotation restore must not touch the note
         State.resetUnit(c, u);
@@ -2741,7 +2756,7 @@
       State.markDirty(c, u);
       highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
       hideRescueDialog();
-      setBanner('rescueRestoredFmt', { file: swapTo }, 'ok');   // name the file the displaced version actually went to
+      setBanner('rescueRestoredFmt', { file: swapTo || swapBase }, 'ok');   // name the file the displaced version actually went to ('' means an identical copy was already parked there)
     } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); }
   }
 
@@ -2929,7 +2944,7 @@
       if (name === null) return false;
       if (name) await FS.writeText(unit.handle, name, raw);
       noteCorruptBackedUp.add(k);
-      setBanner('noteCorruptBackedUp', { id: unit.id }, 'warn');
+      if (name) setBanner('noteCorruptBackedUp', { id: unit.id, file: name }, 'warn');   // ROUND-6/R6-9: name the file we ACTUALLY wrote — it may be a numbered slot, and on the '' branch we wrote none
       return true;
     } catch (e) { return false; }
   }
@@ -2942,6 +2957,14 @@
   const RETRY_DELAYS = [2000, 5000, 15000, 60000];   // after the last attempt we stop; the unit stays dirty and the warning stays up
   // Errors a retry cannot fix: permission withdrawn, the folder/file is gone. Retrying those forever would
   // only bury the real problem — report them instead.
+  // ROUND-6/R6-7: three separate writers report a failed write, and R5-7's "a blocked NOTE already said
+  // something more precise, and retryLater already said whether anything is still coming" exception reached
+  // only one of them. One helper, so the next writer cannot diverge either.
+  function reportWriteFailure(err, id, failKey) {
+    if (!(err && err.noteBlocked)) setBanner('writeFailedBanner', { id }, 'warn');   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
+    if (retryQ.size) setSaveStatus('retryPending', { n: retryQ.size }, true);
+    else setSaveStatus(failKey, null, true);                                          // the ladder gave up: never leave the header on 'saving'
+  }
   const permanentWriteError = e => !!e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError' || e.name === 'SecurityError');
   function retryLater(caseId, unit, tok, err) {
     const k = State.key(caseId, unit.id);
@@ -3097,7 +3120,18 @@
         // version". So an ordinary conflict resolution later overwrote the colleague's preserved note with
         // the doctor's own, and the only copy was gone while the file name still claimed to be the folder's
         // version. Its own name, and like .corrupt it is never overwritten by the rescue swap.
-        try { await FS.writeText(unit.handle, 'note.unread-backup.json', probe.text); noteUnreadableUnits.delete(k); setBanner('noteExternalBackedUp', { id: unit.id }, 'warn'); }
+        // ROUND-6/R6-4: v92 wrote this name unconditionally. A frame can reach here twice — one hiccup
+        // preserves a colleague's note, and a LATER hiccup on the same (now dirty) frame preserves whatever
+        // note.json holds by then, straight over the first copy, which existed nowhere else. Same hazard
+        // R5-11 built freeBackupName for; this was the one writer that did not use it.
+        try {
+          const nb = await freeBackupName(unit, 'note.unread-backup.json', probe.text);
+          if (nb === null) noteBlocked = true;                    // every slot holds DIFFERENT content: defer the note rather than destroy one
+          else {
+            if (nb) { await FS.writeText(unit.handle, nb, probe.text); setBanner('noteExternalBackedUp', { id: unit.id, file: nb }, 'warn'); }
+            noteUnreadableUnits.delete(k);
+          }
+        }
         catch (e) { noteBlocked = true; }
       }
       if (tok !== dsToken) return;
@@ -3105,10 +3139,13 @@
     // ROUND-4/OT-3: v89 THREW here, which refused the annotation too — one Drive hiccup on note.json and the
     // doctor could not save the segments they had just drawn. The annotation always goes to disk. Only the
     // note waits, and the frame deliberately stays dirty so the retry queue comes back for it.
-    const needNote = hasNote && !noteBlocked;
+    let needNote = hasNote && !noteBlocked;
     if (!(await backupCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up');
     if (tok !== dsToken) return;
-    if (needNote && !(await backupNoteCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt note.json could not be backed up');
+    // ROUND-6/R6-6: this used to throw, which refused the ANNOTATION too — the doctor could not save the
+    // segments they had just drawn because a sidecar for a DIFFERENT file could not be written. Same rule as
+    // OT-3: defer the note, land the annotation, keep the frame dirty and let the retry queue come back.
+    if (needNote && !(await backupNoteCorruptOnce(k, unit))) { noteBlocked = true; needNote = false; }
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     // REVIEW FIX SE-1: the "this file on disk is OURS" stamp lived only at the very end, after BOTH writes.
@@ -3117,7 +3154,8 @@
     // fresh mtime. The 2 s retry then measured that file against zero, declared the frame CONFLICTED
     // against OUR OWN write, and returned "successfully" — runRetries printed "Saved" over a frame whose
     // note existed only in RAM. Record the annotation write the moment it lands.
-    if (tok === dsToken) { const annMs = await annFileMtime(unit); if (annMs && tok === dsToken) { ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); } }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
+    let annWriteMs = 0;   // ROUND-6: kept, because the noteBlocked path below must stamp THIS and not the unit-wide max
+    if (tok === dsToken) { const annMs = await annFileMtime(unit); if (annMs && tok === dsToken) { annWriteMs = annMs; ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); } }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
     if (needNote) {
       if (tok !== dsToken) return;   // ROUND-4 FIX: v89's B-2 guard was added to the annotation stamp above but not here — the note write itself could still land after a folder switch
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
@@ -3127,12 +3165,18 @@
     corruptUnits.delete(k); unimportedUnits.delete(k);   // the file on disk is valid JSON again (ROUND-4: unimportedUnits is corruptUnits' new sibling and was left add-only)
     // ROUND-5/R5-6 (CRITICAL): these stamps are UNIT-wide — unitDiskMtime is max(annotation, note), and
     // ownWriteAt/lastSeenMtime cover the whole frame. On the noteBlocked path we wrote annotation.json and
-    // deliberately did NOT write note.json, so claiming the unit as "our own recent write" tells
-    // reconcileUnitFromDisk and the M4 guard that a colleague's LATER note.json is ours: reconcile returns
-    // 'kept-dirty' from its first guard, before it ever compares content, and the chooser that would have
-    // kept both versions never opens. Each retry re-stamped it to "now", widening that blind window to the
-    // whole retry ladder. The annotation's own stamp is already recorded above, where it was earned.
-    const fileMs = noteBlocked ? 0 : ((await unitDiskMtime(unit)) || Date.now());   // the FILES' own clock, not ours (both — SWG-5)
+    // deliberately did NOT write note.json, so stamping the unit-wide MAX told reconcileUnitFromDisk and the
+    // M4 guard that a colleague's LATER note.json was ours: reconcile returned 'kept-dirty' from its first
+    // guard, before it ever compared content, and the chooser that would have kept both versions never
+    // opened.
+    // ROUND-6/R6-1: v92 fixed that by dropping the stamps ALTOGETHER, which over-corrected — the
+    // annotation.json we really did write was then left unaccounted for, and because writtenAt is the
+    // PERSISTED half, a reload declared the frame conflicted against our own file: the chooser popped on
+    // every visit, Save-all said "a NEWER file is in the folder", and the only way out reset State to disk
+    // and pushed the doctor's note into a sidecar. Stamp the ANNOTATION's own mtime instead. It is strictly
+    // older than any note.json a colleague writes afterwards, so that stays detectable, while our own write
+    // is accounted for in this session AND across a reload.
+    const fileMs = noteBlocked ? (annWriteMs || Date.now()) : ((await unitDiskMtime(unit)) || Date.now());   // the FILES' own clock, not ours (both — SWG-5)
     // A reconcile must never mistake OUR write for an externally-newer file — this session OR after a
     // reload — and a cross-open write must not pollute the NEW dataset's maps.
     // REVIEW FIX R2: markClean used to sit OUTSIDE this guard. Since v61 it also writes the PERSISTED
@@ -3142,9 +3186,9 @@
     // dirty flag gone, its fat mirror record rewritten skinny (the unsaved content dropped out of the crash
     // net), writtenAt stamped with the OLD dataset's file mtime — which then feeds ownWriteMs into the M4
     // conflict check. Reproduced end to end: after a crash-reload the parked note came back as "".
-    if (tok === dsToken && !noteBlocked) {
+    if (tok === dsToken) {
       ownWriteAt.set(k, fileMs); lastSeenMtime.set(k, fileMs); State.noteWritten(caseId, unit.id, fileMs);
-      State.markClean(caseId, unit.id, seq, fileMs);
+      if (!noteBlocked) State.markClean(caseId, unit.id, seq, fileMs);   // the note never landed: the frame is NOT saved, whatever the annotation did
     }
     // ROUND-4/OT-3 second half: the ANNOTATION is on disk and must never be rolled back or retried away —
     // but the note is still only in memory, so this write is NOT a success. Hand the unit to the retry queue
@@ -3179,7 +3223,12 @@
     // list, so it buried the precise "note.json is the file holding this up" message and then followed the
     // doctor to every other frame until dismissed by hand. A blocked NOTE already raised its own banner,
     // and retryLater has already put "retrying" on the status line.
-    catch (e) { if (e && e.noteBlocked) return; setSaveStatus('autoSaveFailed', null, true); setBanner('writeFailedBanner', { id: p.unit.id }, 'warn'); }   // a failed write must be IMPOSSIBLE to miss — the work stays dirty + in the browser
+    // ROUND-6/R6-2: v92 returned early here, assuming retryLater had already written "retrying" — but on
+    // the LAST rung retryLater drops the entry and returns false without touching the status line, so the
+    // header sat on the 'saving' set two lines above, for ever, with an empty queue and a dirty frame.
+    // Skip only the BANNER (the blocked note raised its own, more precise one); always tell the truth about
+    // whether anything is still coming.
+    catch (e) { reportWriteFailure(e, p.unit.id, 'autoSaveFailed'); }
   }
 
   // REVIEW FIX R10: undo() is async — when the top entry is a paint change on an OFF-SCREEN frame that the
@@ -3266,7 +3315,7 @@
           } else if (protectedUnits.has(uk)) {             // REVIEW FIX F7: read-only frame — also refused
             setSaveStatus(null); setBanner('protectedFrameFmt', { id: e.u, what: (protectedUnits.get(uk) || {}).what || '?' }, 'warn');
           } else setSavedStatus();
-        }).catch(() => { setSaveStatus('saveFailed', null, true); setBanner('writeFailedBanner', { id: e.u }, 'warn'); });
+        }).catch(err => { reportWriteFailure(err, e.u, 'saveFailed'); });
       }
       return;
     }

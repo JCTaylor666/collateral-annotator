@@ -296,11 +296,17 @@ RECOVERY FILES -- written only when something needs protecting; the app can
 show and RESTORE them from the UI (opening the frame offers a "View" banner;
 restoring is a swap, nothing is destroyed):
   annotation.json.corrupt / note.json.corrupt / classes.json.corrupt -- an
-    unparseable file is copied here ONCE before anything overwrites it.
+    unparseable file is copied here before anything overwrites it. A second,
+    DIFFERENT breakage of the same file goes to ...corrupt-2, and so on up to
+    -9: a rescue copy is never overwritten by a later one.
   annotation.unsaved-backup.json / note.unsaved-backup.json -- the session's
     side of a resolved conflict (you kept the folder's version).
   annotation.external-backup.json / note.external-backup.json -- the folder's
     side of a resolved conflict (you kept the session's version).
+  note.unread-backup.json -- the folder held a note.json this session never
+    managed to READ (a Drive or permission hiccup) and you then wrote a note of
+    your own; the unread original is preserved here first. It is not a damaged
+    file -- nothing is known to be wrong with it beyond one failed read.
 CONFLICTS: a file on disk NEWER than the session's copy and different in
 content is never auto-resolved -- the frame goes write-protected and opening
 it shows a two-thumbnail chooser. A file with a schema_version above the app's
