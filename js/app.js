@@ -198,7 +198,7 @@
     // N case folders are missing from this session's frame list — and v98 made it per-unit, so one arrow-key
     // press deleted it and the doctor worked all day believing the dataset was complete (R12-1).
     'errNoCases', 'casesAllSkippedFmt', 'geomWriteFailedFmt',
-    'frameNotSeeded', 'copyFromProtected', 'copyNoAnnotations', 'copyDone',
+    'frameNotSeeded', 'copyFromProtected', 'copyNoAnnotations', 'copyDone', 'undoOtherFrameFmt',
     'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
     'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
   let displacedBanner = null;   // R9-2: the dataset-wide critical message a per-unit one pushed aside
@@ -253,7 +253,9 @@
     const back = displacedBanner, showing = lastBanner;
     setBanner(null);
     if (!back || !showing || PER_UNIT_BANNERS.indexOf(showing.key) < 0) return;
-    const st = bannerStillTrue[back.key], fresh = st && st();
+    const st = bannerStillTrue[back.key];
+    let fresh = false;
+    try { fresh = st ? st() : false; } catch (e) { fresh = false; }   // ROUND-12: same guard as clearUnitBanner
     if (fresh) setBanner(back.key, fresh === true ? back.vars : Object.assign({}, back.vars, fresh), back.kind);
   }
   function setBanner(key, vars, kind) {
@@ -370,8 +372,13 @@
       // R10-4 + ROUND-11/R11-4: a predicate may answer `true`, or answer with FRESH vars — a counting
       // message replayed with its original number ("2 frames skipped") sends the doctor hunting for a frame
       // that no longer needs anything.
+      // ROUND-12: these predicates run on the NAVIGATION path with nothing catching them, and no test had
+      // ever executed one — a planted typo (`State.dirtCount`) froze the doctor on a single frame while all
+      // 41 test files stayed green. Guarded here so a predicate bug costs a message instead of the app, and
+      // executed for real by test-fix-v100.js so the bug is still caught.
       const stillTrue = back && bannerStillTrue[back.key];
-      const fresh = stillTrue && stillTrue();
+      let fresh = false;
+      try { fresh = stillTrue ? stillTrue() : false; } catch (e) { fresh = false; }
       if (fresh) setBanner(back.key, fresh === true ? back.vars : Object.assign({}, back.vars, fresh), back.kind);   // R12-6: a predicate may refresh SOME of the numbers
     }
   }
