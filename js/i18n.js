@@ -54,7 +54,8 @@
       conflictScanFmt: '{n} frame(s) have a newer file in the folder — opening each will ask which version to keep.',
       conflictKeptDisk: 'Kept the folder version. This session\u2019s copy was backed up to {file}.',
       conflictKeptDiskNoBackup: 'Kept the folder version.',
-      conflictKeptLocal: 'Kept this session\u2019s version. The folder\u2019s file was backed up to annotation.external-backup.json.',
+      conflictKeptLocal: 'Kept this session\u2019s version. The folder\u2019s file was backed up to {file}.',
+      conflictNoSlotFmt: '{id}: nothing was changed. Before either version can be kept, the one being replaced has to be preserved \u2014 and every {file} slot in that frame folder is already taken by different content, so no backup was touched and the frame is still marked as conflicting. Move or delete some of those files and choose again.',
       conflictKeptLocalNoBackup: 'Kept this session\u2019s version.',
       saveDoneConflictsFmt: 'Saved {n} — {c} frame(s) skipped: a newer file on disk, or content this version cannot understand. Open them for details.',
 
@@ -308,7 +309,8 @@
       conflictScanFmt: '{n} 帧在文件夹里有更新的文件 —— 打开这些帧时会让你选择保留哪个版本。',
       conflictKeptDisk: '已保留文件夹版本。本次会话的内容已备份到 {file}。',
       conflictKeptDiskNoBackup: '已保留文件夹版本。',
-      conflictKeptLocal: '已保留本次会话版本。文件夹里的原文件已备份到 annotation.external-backup.json。',
+      conflictKeptLocal: '已保留本次会话版本。文件夹里的原文件已备份到 {file}。',
+      conflictNoSlotFmt: '{id}:什么都没有改动。要保留任何一个版本,都必须先把被替换掉的那一份保存好 —— 而该帧文件夹里 {file} 的槽位已经全部被不同的内容占满,所以没有动任何备份,这一帧仍然标记为有冲突。请把其中几个文件移走或删掉,然后重新选择。',
       conflictKeptLocalNoBackup: '已保留本次会话版本。',
       saveDoneConflictsFmt: '已保存 {n} —— 跳过 {c} 帧:文件夹里有更新的文件,或含本版本无法理解的内容。打开这些帧查看详情。',
 

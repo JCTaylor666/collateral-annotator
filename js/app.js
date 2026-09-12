@@ -169,7 +169,8 @@
   // The set also contains the RESOLUTION messages of critical situations (classesReplaced, conflictKept*):
   // they must be able to take the slot from the warning they retire — P0-9's own gate caught that leaving
   // them ordinary lets a stale "left untouched" banner keep lying after the file was in fact replaced.
-  const BANNER_CRITICAL = new Set(['writeFailedBanner', 'saveAborted', 'savedPartial', 'saveFailedMsg',
+  const BANNER_CRITICAL = new Set(['conflictNoSlotFmt', 'rescueNoSlotFmt',   // ROUND-8/R8-3: a refusal the doctor cannot see is a dead end — and conflictFoundFmt, which is critical, is exactly what is standing when these fire
+    'writeFailedBanner', 'saveAborted', 'savedPartial', 'saveFailedMsg',
     'errQuotaFull', 'multiTabWarn', 'errNoWritePermission', 'errOpenFailed', 'errUnsupportedBrowser',
     'classesBackupFailed', 'classesIndexZero', 'classesCorrupt', 'classesReplaced',
     'conflictFoundFmt', 'conflictScanFmt', 'conflictKeptDisk', 'conflictKeptDiskNoBackup',
@@ -279,7 +280,7 @@
     // but they sit at critical priority (they have to, to take the slot from the warning they retire) — so
     // "Kept the folder version." went on suppressing every ordinary per-frame warning on every frame the
     // doctor visited afterwards, until dismissed by hand. They are per-unit; clear them on navigation.
-    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'noteBackupBlockedFmt', 'rescueFoundFmt',
+    const perUnit = ['shapeMismatchBanner', 'annCorrupt', 'annUnreadable', 'noteUnreadableFmt', 'annLayersDropped', 'maskBad', 'paintSizeBad', 'errLoadUnitFailed', 'perfFailed', 'perfMaskUnavailable', 'protectedFrameFmt', 'noteCorruptBackedUp', 'noteExternalBackedUp', 'noteBackupBlockedFmt', 'rescueNoSlotFmt', 'rescueFoundFmt',
       'conflictKeptDisk', 'conflictKeptDiskNoBackup', 'conflictKeptLocal', 'conflictKeptLocalNoBackup',
       'conflictDiskUnreadable', 'conflictDiskUnsavable', 'conflictKeptDiskRefused', 'rescueRestoredFmt', 'rescueRefusedFmt'];
     if (lastBanner && perUnit.indexOf(lastBanner.key) >= 0) setBanner(null);
@@ -1280,7 +1281,15 @@
     try {
       const fh = await root.getFileHandle('classes.json');
       if (root !== rootHandle) return false;
-      await FS.writeText(root, 'classes.json.corrupt', await (await fh.getFile()).text());
+      // ROUND-8/R8-7: the last unconditional sidecar write in the app. classesBackedUp is cleared whenever
+      // classes.json parses again (and starts false after a reload), so a SECOND, different corruption
+      // overwrote the first preserved original — which existed nowhere else. The Data format page says that
+      // cannot happen; now it cannot.
+      const raw = await (await fh.getFile()).text();
+      if (root !== rootHandle) return false;
+      const slot = await freeBackupName({ handle: root }, 'classes.json.corrupt', raw);
+      if (slot === null) return false;
+      if (slot.write) await FS.writeText(root, slot.name, raw);
       if (root !== rootHandle) return false;
       classesBackedUp = true;
       return true;
@@ -2497,18 +2506,14 @@
         // a colleague's only copy is not undoable.
         const localAnn = State.buildAnnotation(cc, uu, sz[0], sz[1]);
         if (State.unitHasContent(cc, uu) && annContentSig(localAnn) !== annContentSig(r.ann)) {
-          const body = JSON.stringify(localAnn, null, 2);
-          const slot = await freeBackupName(unit, 'annotation.unsaved-backup.json', body);
-          if (slot === null) { setBanner('rescueNoSlotFmt', { id: uu, file: 'annotation.unsaved-backup.json' }, 'warn'); return; }
-          if (slot.write) await FS.writeText(unit.handle, slot.name, body);
-          backedUp = true; keptFiles.push(slot.name);
+          const nm = await parkCopy(unit, 'annotation.unsaved-backup.json', () => JSON.stringify(State.buildAnnotation(cc, uu, sz[0], sz[1]), null, 2));
+          if (nm === null) { hideConflictDialog(); setBanner('conflictNoSlotFmt', { id: uu, file: 'annotation.unsaved-backup.json' }, 'warn'); return; }
+          backedUp = true; keptFiles.push(nm);
         }
         if (State.hasNoteData(cc, uu) && noteContentSig(State.buildNote(cc, uu)) !== noteContentSig(r.note)) {
-          const body = JSON.stringify(State.buildNote(cc, uu), null, 2);
-          const slot = await freeBackupName(unit, 'note.unsaved-backup.json', body);
-          if (slot === null) { setBanner('rescueNoSlotFmt', { id: uu, file: 'note.unsaved-backup.json' }, 'warn'); return; }
-          if (slot.write) await FS.writeText(unit.handle, slot.name, body);
-          backedUp = true; keptFiles.push(slot.name);
+          const nm = await parkCopy(unit, 'note.unsaved-backup.json', () => JSON.stringify(State.buildNote(cc, uu), null, 2));
+          if (nm === null) { hideConflictDialog(); setBanner('conflictNoSlotFmt', { id: uu, file: 'note.unsaved-backup.json' }, 'warn'); return; }
+          backedUp = true; keptFiles.push(nm);
         }
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
       if (tok !== dsToken) return;
@@ -2545,24 +2550,31 @@
         $('note').value = State.getNote(cc, uu);
       }
       highlightNav(); updateDirtyUI();
-      setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', { file: keptFiles.join(' + ') }, 'ok');
+      // ROUND-8/R8-8: these land after every await, and Escape / "Decide later" let the doctor walk away in
+      // the meantime. At critical priority the message then sat on ANOTHER frame, suppressing that frame's
+      // own warnings until dismissed by hand. Say it only to the frame it is about; a doctor who has moved
+      // on sees the frame's real state when they come back.
+      if (cur && State.key(cur.caseId, cur.unitId) === k) setBanner(backedUp ? 'conflictKeptDisk' : 'conflictKeptDiskNoBackup', { file: keptFiles.join(' + ') }, 'ok');
     } else {
       // REVIEW FIX R3: `if (r.ann)` meant that exactly when the folder copy could NOT be parsed — the one
       // case where it is irreplaceable — no external-backup was written and writeUnit overwrote it anyway.
       // Preserve the RAW BYTES instead; if even that fails, resolve nothing rather than destroy it.
+      // ROUND-8/R8-5: the folder copy can now land in a NUMBERED slot, and the two banners below named
+      // slot 1 regardless — which by construction holds different, older content. The doctor would open the
+      // file the app told them held the irreplaceable bytes and find something else.
+      let extAnnName = 'annotation.external-backup.json';
       try {
         // ROUND-7/R7-7: same allocator for the FOLDER side — this is the path that used to destroy the
         // unread-note copy before it was given a name of its own.
-        let body = r.ann ? JSON.stringify(r.ann, null, 2) : await rawFileText(unit, 'annotation.json');
+        const body = r.ann ? JSON.stringify(r.ann, null, 2) : await rawFileText(unit, 'annotation.json');
         if (body === null) { hideConflictDialog(); setBanner('conflictDiskUnsavable', null, 'warn'); return; }
-        let slot = await freeBackupName(unit, 'annotation.external-backup.json', body);
-        if (slot === null) { setBanner('rescueNoSlotFmt', { id: uu, file: 'annotation.external-backup.json' }, 'warn'); return; }
-        if (slot.write) await FS.writeText(unit.handle, slot.name, body);
+        const nm = await parkCopy(unit, 'annotation.external-backup.json', () => body);
+        if (nm === null) { hideConflictDialog(); setBanner('conflictNoSlotFmt', { id: uu, file: 'annotation.external-backup.json' }, 'warn'); return; }
+        extAnnName = nm;
         const bodyN = r.note ? JSON.stringify(r.note, null, 2) : await rawFileText(unit, 'note.json');
         if (bodyN !== null) {
-          slot = await freeBackupName(unit, 'note.external-backup.json', bodyN);
-          if (slot === null) { setBanner('rescueNoSlotFmt', { id: uu, file: 'note.external-backup.json' }, 'warn'); return; }
-          if (slot.write) await FS.writeText(unit.handle, slot.name, bodyN);
+          const nmN = await parkCopy(unit, 'note.external-backup.json', () => bodyN);
+          if (nmN === null) { hideConflictDialog(); setBanner('conflictNoSlotFmt', { id: uu, file: 'note.external-backup.json' }, 'warn'); return; }
         }
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
       if (tok !== dsToken) return;
@@ -2580,21 +2592,22 @@
       // runAutoSave, saveNote, runRetries, toggleStar and cross-frame undo — and missed the one caller that
       // most needs it. writeUnit can refuse again here (the file moved on between the backup and the write),
       // and the banner then said "Kept this session's version." + "Saved" over a frame nothing was written to.
+      const onFrame = !!(cur && State.key(cur.caseId, cur.unitId) === k);   // ROUND-8/R8-8
       if (conflictedUnits.has(k)) {
         setSaveStatus(null);
-        setBanner('conflictFoundFmt', { id: uu }, 'warn');
+        if (onFrame) setBanner('conflictFoundFmt', { id: uu }, 'warn');
         return;
       }
       // REVIEW FIX CD-3/F3: on a read-only frame writeUnit returns without writing, so "Kept this
       // session's version." + "Saved" were both false — the edits lived only in the browser mirror.
       if (protectedUnits.has(k)) {
-        setBanner('protectedFrameFmt', { id: uu, what: (protectedUnits.get(k) || {}).what || '?' }, 'warn');
+        if (onFrame) setBanner('protectedFrameFmt', { id: uu, what: (protectedUnits.get(k) || {}).what || '?' }, 'warn');
         setSaveStatus(null);
       } else if (r.opaque) {                               // R3: the bytes we could not read are safe in the sidecar
-        setBanner('conflictDiskUnreadable', { file: 'annotation.external-backup.json' }, 'warn');
+        if (onFrame) setBanner('conflictDiskUnreadable', { file: extAnnName }, 'warn');
         if (!retryQ.size) setSavedStatus();
       } else {
-        setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', null, 'ok');
+        if (onFrame) setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', r.ann ? { file: extAnnName } : null, 'ok');
         if (!retryQ.size) setSavedStatus();
       }
     }
@@ -2758,8 +2771,16 @@
     // screen and scheduled an auto-save for it. One keystroke later that frame's note.json was overwritten
     // with another frame's note, with no backup and no banner. Re-check everything the doctor can change:
     // the dataset, the frame, whether the chooser is still open, and which tab it is on.
-    if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k ||
-        rescueShownFor !== k || rescueFiles[rescueSel] !== f) { hideRescueDialog(); return; }
+    // ROUND-8/R8-6: v94 closed the chooser on EVERY abandonment. Two ways that hurt. Clicking another tab
+    // to compare, while a restore was still probing, silently cancelled it AND dismissed the dialog. Worse,
+    // a dead attempt from a frame the doctor had already left closed the chooser they had just opened on
+    // the NEW frame — and nulling rescueShownFor then aborted the restore they were in the middle of.
+    // Abandon this attempt; touch the screen only when what is on it is ours.
+    if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k) {
+      if (rescueShownFor === k) hideRescueDialog();
+      return;
+    }
+    if (rescueShownFor !== k || rescueFiles[rescueSel] !== f) return;   // the doctor moved to another tab, or reopened the chooser: leave what they are looking at exactly as it is
     if (slot === null) { hideRescueDialog(); setBanner('rescueNoSlotFmt', { id: u, file: swapBase }, 'warn'); return; }
     const swapTo = slot.name;
     try {
@@ -2955,6 +2976,19 @@
     }
     return null;
   }
+  // ROUND-8/R8-4: freeBackupName performs up to nine sequential reads, and on a slow folder the doctor goes
+  // on typing during them. v93 built the body and wrote it in ONE expression; v94 put those reads in
+  // between, so the snapshot taken BEFORE them was parked and State.resetUnit then wiped everything typed
+  // since — under a banner saying it had been preserved. Build the body again once the slot is known, and
+  // write it even when the probe matched, because what the probe matched was the STALE version.
+  async function parkCopy(unit, base, build) {
+    const probe = build();
+    const slot = await freeBackupName(unit, base, probe);
+    if (slot === null) return null;
+    const body = build();
+    if (slot.write || body !== probe) await FS.writeText(unit.handle, slot.name, body);
+    return slot.name;
+  }
   async function backupCorruptOnce(k, unit) {
     if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return true;
     try {
@@ -2970,13 +3004,16 @@
   // A2: a note.json that exists but does not parse is preserved as note.json.corrupt exactly once
   // before any write replaces it — the same protection annotation.json has had since P0.
   const noteCorruptUnits = new Set(), noteCorruptBackedUp = new Set();
+  // ROUND-8/R8-1: returns true | 'slots' (every backup slot taken by different content — permanent until the
+  // doctor frees one) | false (a transient I/O failure — retrying really does clear it). v94 collapsed all of
+  // these into one message that told the doctor to go delete rescue files that were not the problem.
   async function backupNoteCorruptOnce(k, unit) {   // same contract as backupCorruptOnce (REVIEW FIX SE-2)
     if (!noteCorruptUnits.has(k) || noteCorruptBackedUp.has(k)) return true;
     try {
       const fh = await unit.handle.getFileHandle('note.json');
       const raw = await (await fh.getFile()).text();
       const slot = await freeBackupName(unit, 'note.json.corrupt', raw);   // ROUND-5/R5-11
-      if (slot === null) return false;
+      if (slot === null) return 'slots';
       if (slot.write) await FS.writeText(unit.handle, slot.name, raw);
       noteCorruptBackedUp.add(k);
       if (slot.write) setBanner('noteCorruptBackedUp', { id: unit.id, file: slot.name }, 'warn');   // ROUND-6/R6-9: name the file we ACTUALLY wrote — it may be a numbered slot
@@ -3183,7 +3220,8 @@
     // ROUND-6/R6-6: this used to throw, which refused the ANNOTATION too — the doctor could not save the
     // segments they had just drawn because a sidecar for a DIFFERENT file could not be written. Same rule as
     // OT-3: defer the note, land the annotation, keep the frame dirty and let the retry queue come back.
-    if (needNote && !(await backupNoteCorruptOnce(k, unit))) { noteBlocked = true; noteBlockReason = 'slots'; needNote = false; }
+    const noteBk = needNote ? await backupNoteCorruptOnce(k, unit) : true;
+    if (noteBk !== true) { noteBlocked = true; noteBlockReason = (noteBk === 'slots' ? 'slots' : 'read'); needNote = false; }   // ROUND-8/R8-1: only a FULL family is permanent
     if (tok !== dsToken) return;
     await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     // REVIEW FIX SE-1: the "this file on disk is OURS" stamp lived only at the very end, after BOTH writes.
@@ -3193,7 +3231,17 @@
     // against OUR OWN write, and returned "successfully" — runRetries printed "Saved" over a frame whose
     // note existed only in RAM. Record the annotation write the moment it lands.
     let annWriteMs = 0;   // ROUND-6: kept, because the noteBlocked path below must stamp THIS and not the unit-wide max
-    if (tok === dsToken) { const annMs = await annFileMtime(unit); if (annMs && tok === dsToken) { annWriteMs = annMs; ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); } }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
+    // ROUND-8/R8-2: R7-5 correctly stopped inventing a timestamp from this machine's clock, but left the
+    // read-back-failed case with NO account of our own write — and on the noteBlocked path State differs
+    // from disk by the note, so the very next attempt declared the frame conflicted against the
+    // annotation.json this session had just written, froze auto-save behind a chooser, and offered a
+    // "keep the folder version" that empties the note box. The file is ours and it is right there: ask
+    // again before giving up. Only if all three reads fail do we leave it unstamped (still never a fake).
+    for (let i = 0; i < 3 && tok === dsToken && !annWriteMs; i++) {
+      if (i) await new Promise(r => setTimeout(r, 120));
+      const annMs = await annFileMtime(unit);
+      if (annMs && tok === dsToken) { annWriteMs = annMs; ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); }
+    }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
     if (needNote) {
       if (tok !== dsToken) return;   // ROUND-4 FIX: v89's B-2 guard was added to the annotation stamp above but not here — the note write itself could still land after a folder switch
       await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
