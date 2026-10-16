@@ -29,6 +29,7 @@
   }
   let points = {};   // caseUnit -> [[x,y], ...] : background clicks (no segment), shown as red dots
   let notes = {};    // caseUnit -> note text (mirrors note.json on disk)
+  const seededNote = {};                           // v101: per unit, the note text a pipeline-written note.json ("origin":"pipeline") seeded — information FOR the doctor, not work BY the doctor
   let noteMarkers = {}; // caseUnit -> [{id, xy:[x,y]}] : numbered circle markers referenced from the note
   let dirty = {};    // caseUnit -> true : has edits not yet written to disk (persisted so unsaved work survives reload)
   let editedAt = {}; // caseUnit -> ms of the LAST edit (persisted). Lets open-time reconciliation detect a STALE
@@ -127,6 +128,7 @@
       rec.d = 1;
       if (starred[k]) rec.st = 1;
       if (k in notes) rec.n = notes[k];
+      if (k in seededNote) rec.sn = seededNote[k];
       if (k in noteMarkers) rec.m = noteMarkers[k];
       if (unitLayers[k]) rec.ly = unitLayers[k];
     }
@@ -215,6 +217,7 @@
         if (rec.st) starred[k] = true;
         if (Number.isFinite(rec.w)) writtenAt[k] = rec.w;
         if ('n' in rec) notes[k] = String(rec.n);
+        if ('sn' in rec) seededNote[k] = String(rec.sn);
         if ('m' in rec && Array.isArray(rec.m)) noteMarkers[k] = rec.m;
         if (Array.isArray(rec.ly) && rec.ly.length) unitLayers[k] = rec.ly;
         if (Number.isFinite(rec.al)) activeLayerByUnit[k] = rec.al;
@@ -417,6 +420,12 @@
   const getNote = (c, u) => notes[noteKey(c, u)] || '';
   function setNote(c, u, text) { notes[noteKey(c, u)] = text; persistUnit(c, u); }
   function importNote(c, u, text) { if (!hasNote(c, u) && typeof text === 'string') { notes[noteKey(c, u)] = text; persistUnit(c, u); } }
+  // v101: the dataset pipeline pre-fills note.json with the "patient | view | acquisition time | run x/N" line and marks it
+  // "origin":"pipeline". That text is information FOR the doctor, not work BY the doctor: it must not light the annotated dot
+  // and must not pull the unit into Save all. The moment the text differs from what was seeded it is the doctor's note and
+  // counts exactly as before. Markers always count.
+  const noteSeeded = (c, u) => { const k = noteKey(c, u); return k in seededNote && (notes[k] || '') === seededNote[k]; };
+  const noteAuthored = (c, u) => { const k = noteKey(c, u); return !!(notes[k] && notes[k].length) && !noteSeeded(c, u); };
 
   // ---- note markers: numbered circles on the image, saved inside note.json ----
   const mksGet = (c, u) => noteMarkers[key(c, u)] || [];                                  // read: never creates the key
@@ -440,10 +449,13 @@
   // note.json (schema v1): { schema_version, coord_order, text, markers:[{id, click}] }
   function buildNote(c, u) {
     const enc = xy => coordOrder === 'xy' ? [xy[0], xy[1]] : [xy[1], xy[0]];
-    return { schema_version: 1, coord_order: coordOrder, text: getNote(c, u), markers: mksGet(c, u).map(m => ({ id: m.id, click: enc(m.xy) })) };
+    const out = { schema_version: 1, coord_order: coordOrder, text: getNote(c, u), markers: mksGet(c, u).map(m => ({ id: m.id, click: enc(m.xy) })) };
+    if (noteSeeded(c, u)) out.origin = 'pipeline';   // v101: the annotator rewrites the whole file on save — keep the marker while the text is untouched
+    return out;
   }
   function importNoteJson(c, u, o) {
     if (!o || typeof o !== 'object') return;
+    if (o.origin === 'pipeline' && typeof o.text === 'string') seededNote[key(c, u)] = o.text;   // v101
     if (typeof o.text === 'string') importNote(c, u, o.text);
     const k = key(c, u);
     if (!mksGet(c, u).length && Array.isArray(o.markers)) {
@@ -557,7 +569,7 @@
     // scan stripped it from the whole dataset on every open, after which the first reconcile of each frame
     // could mistake our own last write for an external change. Re-seeding a unit from disk does not make
     // our past write somebody else's.
-    delete notes[k]; delete noteMarkers[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
+    delete notes[k]; delete noteMarkers[k]; delete seededNote[k]; delete starred[k]; delete unitLayers[k]; delete editedAt[k];
     // activeLayerByUnit is a VIEW preference, not content — keep it so a clean-unit reimport (loadCur)
     // doesn't bounce the reviewer back to the layer recorded in the file. activeLayerId() validates it.
     // ROUND-3 FIX: same refund on the other path that drops entries.
@@ -841,7 +853,8 @@
     const addStrip = k => set.add(k.replace(/#\d+$/, ''));
     [...Object.keys(selections), ...Object.keys(points), ...Object.keys(paintR)].forEach(addStrip);
     // dirty is included so a unit whose ONLY pending change is a removal (e.g. un-star) still reaches Save
-    [...Object.keys(visited), ...Object.keys(notes), ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(dirty)].forEach(k => set.add(k));
+    const authoredNotes = Object.keys(notes).filter(k => !(k in seededNote && (notes[k] || '') === seededNote[k]));   // v101
+    [...Object.keys(visited), ...authoredNotes, ...Object.keys(noteMarkers), ...Object.keys(starred), ...Object.keys(dirty)].forEach(k => set.add(k));
     return [...set];
   };
   // annotation content on ANY layer (segments / points / paint)? — frame-level star/note/markers excluded
@@ -859,7 +872,7 @@
     const k = key(c, u);
     if (unitHasLayerContent(c, u)) return true;
     if (starred[k]) return true;
-    if (notes[k] && notes[k].length) return true;
+    if (noteAuthored(c, u)) return true;                    // v101: a pipeline-seeded, untouched note is not content
     if (noteMarkers[k] && noteMarkers[k].length) return true;
     return false;
   }
@@ -868,7 +881,7 @@
   function unitAnnotated(c, u) {
     const k = key(c, u);
     if (unitHasLayerContent(c, u)) return true;
-    if (notes[k] && notes[k].length) return true;
+    if (noteAuthored(c, u)) return true;                    // v101
     if (noteMarkers[k] && noteMarkers[k].length) return true;
     return false;
   }
@@ -876,7 +889,7 @@
   root.State = { load, getCoordOrder, setCoordOrder, getWindow, setWindow, getLoupe, setLoupe, setLoupePins, getAutoSave, setAutoSave, hasLocal, selectedIds, count,
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo, peekUndo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
-    markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
+    markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson, noteSeeded, noteAuthored,
     isDirty, markDirty, markClean, getDirtySeq, getEditedAt, getWrittenAt, noteWritten, dirtyCount, isMirrorKey, resetUnit, isStarred, setStarred, caseStarred,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getPerfMask, setPerfMask, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, unknownPaintEncodings, decodeRLE: rleDecode,

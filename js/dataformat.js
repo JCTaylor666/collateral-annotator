@@ -494,6 +494,9 @@ FILE: note.json   (tool OUTPUT)
 { "schema_version": 1, "coord_order": "xy",
   "text": "free-text note",
   "markers": [ { "id": 1, "click": [321, 187] } ] }   // numbered circle markers; id = the shown number
+// Optional "origin": "pipeline" (V2 datasets): the text was pre-filled by the dataset pipeline (patient | view |
+// acquisition time | run x/N), not typed by the doctor. The annotator keeps the key while the text is unchanged and
+// drops it once edited; such a note does NOT count as "annotated" and does not pull the unit into Save all (v101).
 
 ========================================
 FILE: classes.json   (tool OUTPUT, at the dataset ROOT)
