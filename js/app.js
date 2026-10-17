@@ -722,7 +722,10 @@
       return 'clean';
     }
     const ea = State.getEditedAt(c.id, u.id);
-    if (!(ann && annMtime && ea && annMtime > ea)) return 'kept-dirty';
+    // v102/R102-1: a note-only frame has no annotation.json (v102 no longer creates a bare one), so a note.json alone must be
+    // enough to compare — otherwise a colleague's newer note was kept-dirty here, its mtime then recorded as seen, and our
+    // stale note written over it with no chooser and no backup.
+    if (!((ann || note) && annMtime && ea && annMtime > ea)) return 'kept-dirty';
     if (annMtime <= ownWriteMs(c.id, u.id, k) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale (persisted, so this still holds after a reload)
     if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
     // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
@@ -730,14 +733,14 @@
     // for a Drive re-sync that only touched the timestamp.
     let same = true;
     try {
-      const sz = (Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
+      const sz = (ann && Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
       const localAnn = State.buildAnnotation(c.id, u.id, sz[0], sz[1]);
-      if (annContentSig(localAnn) !== annContentSig(ann)) same = false;
+      if (ann ? annContentSig(localAnn) !== annContentSig(ann) : !State.annotationEmpty(c.id, u.id)) same = false;   // no file == an empty annotation
       if (State.hasNoteData(c.id, u.id) && noteContentSig(State.buildNote(c.id, u.id)) !== noteContentSig(note)) same = false;
     } catch (e) { return 'kept-dirty'; }
     if (same) {
       State.resetUnit(c.id, u.id);
-      try { State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
+      try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }
       State.markClean(c.id, u.id, undefined, annMtime);   // State mirrors the file as of annMtime
       return 'stale-clean';
     }
@@ -1042,7 +1045,10 @@
     if (gen !== navGen) return false;            // superseded while loading: drop this stale result entirely
     if (data.shapeMismatch) return showMismatchUnit(c, u, data);   // image/label/mask sizes disagree: grey placeholder
     State.markVisited(c.id, u.id);
-    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u, protected: protectedUnits.has(State.key(c.id, u.id)) };
+    // v102: `unseeded` — this frame's annotation.json exists but could not be read this session, so State does not hold its
+    // content. It is view-only like a protected frame until it has been read: an edit made now (even only to the note) used
+    // to be kept-dirty by the later reconcile and then written as an EMPTY annotation over the unread segments.
+    cur = { W: data.W, H: data.H, caseId: c.id, unitId: u.id, unit: u, protected: protectedUnits.has(State.key(c.id, u.id)), unseeded: !sessionLoaded.has(State.key(c.id, u.id)) };
     curGeom = data.geometry || null;                          // per-segment radius (drives the geometry stats + filter panel)
     perfShownDims = '';                       // MEM-3: a REAL frame invalidates the perfusion fast path
     view.setUnit(data.img, data.W, data.H, data.label, data.mask);
@@ -1055,7 +1061,7 @@
     refreshMeta(); buildFrameList(); refreshGeomPanel(); buildLayerBar();
     // REVIEW FIX F6: the box used to stay enabled on a read-only frame while onNoteInput dropped every
     // keystroke — the doctor typed a paragraph of findings, navigated away and it was gone with no warning.
-    $('note').value = State.getNote(c.id, u.id); $('note').disabled = !!cur.protected;
+    $('note').value = State.getNote(c.id, u.id); $('note').disabled = !!(cur.protected || cur.unseeded);
     updateDirtyUI(); updateCopyBtn();
     if (conflictedUnits.has(State.key(c.id, u.id))) {
       // ROUND-10/R10-3 (CRITICAL): v96 made conflictFoundFmt per-unit so a RESOLVED conflict's warning
@@ -1195,7 +1201,7 @@
   // ---- layers (per-frame): switch / add / rename / delete ----
   function buildLayerBar() {
     const bar = $('layerBar'), sec = $('layerSec'); if (!bar || !sec) return;
-    if (!cur || cur.virtual || cur.mismatch || cur.protected) { sec.classList.add('hidden'); bar.innerHTML = ''; return; }
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) { sec.classList.add('hidden'); bar.innerHTML = ''; return; }
     sec.classList.remove('hidden');
     const layers = State.getLayers(cur.caseId, cur.unitId), active = State.getActiveLayer(cur.caseId, cur.unitId);
     bar.innerHTML = '';
@@ -1214,7 +1220,7 @@
     }
   }
   function renderActiveLayer() {   // re-render the canvas for the current unit's ACTIVE layer (selection/paint/dots)
-    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return;
     view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));
     refreshCanvasSelection();   // setSelected(selColorMap) + refreshDots + render
     refreshMeta();
@@ -1226,7 +1232,7 @@
     renderActiveLayer(); buildLayerBar(); updateDirtyUI(); updateCopyBtn();
   }
   function addLayerAction() {
-    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return;
     commitActiveStroke();
     State.addLayer(cur.caseId, cur.unitId);   // creates an empty layer + switches active to it
     renderActiveLayer(); buildLayerBar(); updateDirtyUI(); highlightNav(); scheduleAutoSave();
@@ -1753,7 +1759,7 @@
   }
   function updateCopyBtn() {
     const b = $('btnCopyFrom'); if (!b) return;
-    b.disabled = !cur || cur.virtual || cur.mismatch || cur.protected || copyTargetBusy(cur.caseId, cur.unitId);
+    b.disabled = !cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded || copyTargetBusy(cur.caseId, cur.unitId);
     b.textContent = copyPickMode ? I18n.t('btnCancelCopy') : I18n.t('btnCopyFrom');
   }
   function enterCopyPick() {
@@ -1893,7 +1899,7 @@
         // REVIEW FIX R6/F2: this was the ONE edit entry point with no guard. On a read-only frame it
         // removed the marker from State while every writer refused the file, so the panel and the disk
         // disagreed and the frame stayed unsaved forever. (placeMarker/enterMarkerArm were guarded.)
-        if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
+        if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return;
         State.removeMarker(cur.caseId, cur.unitId, m.id);
         view.setMarkerHighlight(0);
         State.markDirty(cur.caseId, cur.unitId);
@@ -1905,7 +1911,7 @@
     }
   }
   function enterMarkerArm() {
-    if (!cur || cur.virtual || cur.mismatch || cur.protected || markerArm) return;   // perfusion / shape-mismatch units are view-only
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded || markerArm) return;   // perfusion / shape-mismatch units are view-only
     exitCopyPick();                                         // the two click-capturing modes are mutually exclusive
     markerArm = true;
     document.body.classList.add('marker-arming');
@@ -1926,7 +1932,7 @@
     refreshMarkers(); view.render(); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave();
   }
 
-  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch || cur.protected) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
+  function onNoteInput() { if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return; State.setNote(cur.caseId, cur.unitId, $('note').value); State.markDirty(cur.caseId, cur.unitId); updateFrameDot(cur.caseId, cur.unitId); updateDirtyUI(); scheduleAutoSave(); }
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
@@ -1989,7 +1995,7 @@
   // ONE write path that carries every guard (conflict, protection, mtime, corrupt backups, per-unit
   // serialisation, retry) — and reports honestly when the write was refused as a conflict.
   async function saveNote() {
-    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;   // view-only units have no editable files
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return;   // view-only units have no editable files
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     // The handle MUST come from the unit captured atomically in `cur`. curUnit() resolves ci/ui, which
     // showUnit advances BEFORE its await, so during a slow load it names the frame being navigated TO —
@@ -2162,7 +2168,7 @@
   }
   function onClick(ev) {
     if (suppressClick) { suppressClick = false; return; }   // this click ended a pan-drag / brush stroke, not an annotate
-    if (cur && (cur.virtual || cur.mismatch || cur.protected)) return;   // perfusion / shape-mismatch / read-only-protected units take no annotation
+    if (cur && (cur.virtual || cur.mismatch || cur.protected || cur.unseeded)) return;   // perfusion / shape-mismatch / read-only-protected units take no annotation
     if (copyPickMode) return;                               // while picking a copy source, canvas clicks must not annotate
     if (markerArm && cur) { placeMarker(ev); return; }      // marker placement takes priority over any tool
     if (State.getTool() === 'brush') return;                // paint mode: clicks paint, not select
@@ -2385,7 +2391,7 @@
     // view-only situations where a drag may pan but must never paint/select: perfusion & shape-mismatch
     // units, a frame load in flight (the stroke would straddle two frames), and copy-source picking
     // (painting here would make the copy target busy and the pick then fails)
-    const viewOnly = cur.virtual || cur.mismatch || cur.protected || navBusy || copyPickMode;
+    const viewOnly = cur.virtual || cur.mismatch || cur.protected || cur.unseeded || navBusy || copyPickMode;
     // while marker-armed, skip only the brush branch: the normal pan-drag path below keeps
     // panning working, and its click suppression stops a drag-release from placing a marker
     if (!viewOnly && !markerArm && State.getTool() === 'brush' && !spaceHeld) {   // paint mode: left-drag paints (space+drag still pans)
@@ -2670,8 +2676,8 @@
       if (r.ann) {
         evalImportProtection(cRef, unit, r.ann, 0);
         if (cur && cur.caseId === cc && cur.unitId === uu) {
-          cur.protected = protectedUnits.has(k);
-          $('note').disabled = !!cur.protected;   // ROUND-3 FIX: re-locking the frame left the note box enabled, and onNoteInput silently drops every keystroke on a protected frame — exactly the F6 hole, re-opened by F8's own fix
+          cur.protected = protectedUnits.has(k); cur.unseeded = !sessionLoaded.has(k);
+          $('note').disabled = !!(cur.protected || cur.unseeded);   // ROUND-3 FIX: re-locking the frame left the note box enabled, and onNoteInput silently drops every keystroke on a protected frame — exactly the F6 hole, re-opened by F8's own fix
         }
       }
       conflictedUnits.delete(k);
@@ -2704,16 +2710,19 @@
       try {
         // ROUND-7/R7-7: same allocator for the FOLDER side — this is the path that used to destroy the
         // unread-note copy before it was given a name of its own.
-        const body = r.ann ? JSON.stringify(r.ann, null, 2) : await rawFileText(unit, 'annotation.json');
+        // v102/R102-2: a note-only frame has no annotation.json at all — nothing to preserve, which is not the same as
+        // "could not be read" (that refusal used to block 'keep this session' on every note-only conflict).
+        let body;
+        if (r.ann) body = JSON.stringify(r.ann, null, 2);
+        else { const pr = await rawFileProbe(unit, 'annotation.json'); body = pr.absent ? undefined : (pr.failed ? null : pr.text); }
         if (body === null) { hideConflictDialog(); setBanner('conflictDiskUnsavable', null, 'warn'); return; }
-        const planA = await parkPlan(unit, 'annotation.external-backup.json', () => body);
-        if (planA === null) { refuseNoSlot(k, uu, 'annotation.external-backup.json'); return; }
+        const planA = body === undefined ? null : await parkPlan(unit, 'annotation.external-backup.json', () => body);
+        if (body !== undefined && planA === null) { refuseNoSlot(k, uu, 'annotation.external-backup.json'); return; }
         const bodyN = r.note ? JSON.stringify(r.note, null, 2) : await rawFileText(unit, 'note.json');
         const planN = bodyN === null ? null : await parkPlan(unit, 'note.external-backup.json', () => bodyN);
         if (bodyN !== null && planN === null) { refuseNoSlot(k, uu, 'note.external-backup.json'); return; }
         const stillOurs = () => tok === dsToken;   // R9-8 (these two closures are constants, but the guard costs nothing and the next edit may not be)
-        const nmA = await parkWrite(unit, planA, stillOurs); if (nmA === null) return;
-        extAnnName = nmA;
+        if (planA) { const nmA = await parkWrite(unit, planA, stillOurs); if (nmA === null) return; extAnnName = nmA; }
         if (planN && (await parkWrite(unit, planN, stillOurs)) === null) return;
       } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
       if (tok !== dsToken) return;
@@ -3340,7 +3349,10 @@
     // it — that silently destroyed a colleague's (or another machine's) work with a stale in-memory copy
     // while the banner reported success. A newer-but-changed file makes this frame CONFLICTED instead:
     // the write is skipped, the frame stays dirty, and opening it shows the two-version chooser.
-    const diskMs = await unitDiskMtime(unit);   // SWG-5: annotation.json OR note.json, whichever is newer
+    // SWG-5: annotation.json OR note.json, whichever is newer. v102: while our note.json read failed, measure annotation.json only —
+    // the unread-backup path below preserves whatever note.json holds before writing over it, and on a note-only frame (no
+    // annotation.json, nothing stamped) the unread note's own mtime would otherwise turn every retry into a false conflict.
+    const diskMs = (State.hasNoteData(caseId, unit.id) && noteUnreadableUnits.has(k)) ? await annFileMtime(unit) : await unitDiskMtime(unit);
     if (tok !== dsToken) return;
     if (diskMs && diskMs > Math.max(ownWriteMs(caseId, unit.id, k), lastSeenMtime.get(k) || 0) + 2000) {
       conflictedUnits.set(k, null);                   // parsed lazily when the chooser opens
@@ -3401,7 +3413,18 @@
     const noteBk = needNote ? await backupNoteCorruptOnce(k, unit) : true;
     if (noteBk !== true) { noteBlocked = true; noteBlockReason = (noteBk === 'slots' ? 'slots' : 'read'); needNote = false; }   // ROUND-8/R8-1: only a FULL family is permanent
     if (tok !== dsToken) return;
-    await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+    // v102: never CREATE a bare annotation.json. A note-only edit (or a marker) on a frame that has no annotation.json
+    // used to write {collaterals:[],points:[]} next to it, and every tool that reads the folder counts that file as
+    // "annotated". The file is written when the frame has something to store, or when one already exists (so clearing a
+    // frame's last segment still clears it on disk). Only a definite NotFoundError counts as absent: any other failure to
+    // look keeps the old behaviour and writes.
+    let writeAnn = true;
+    if (State.annotationEmpty(caseId, unit.id)) {
+      try { await unit.handle.getFileHandle('annotation.json'); }
+      catch (e) { if (e && e.name === 'NotFoundError') writeAnn = false; }
+      if (tok !== dsToken) return;
+    }
+    if (writeAnn) await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
     // REVIEW FIX SE-1: the "this file on disk is OURS" stamp lived only at the very end, after BOTH writes.
     // If note.json's write then failed — creating a new file is a different operation from replacing one —
     // the throw left ownWriteAt/lastSeenMtime/writtenAt at 0 even though annotation.json WAS on disk with a
@@ -3415,7 +3438,7 @@
     // annotation.json this session had just written, froze auto-save behind a chooser, and offered a
     // "keep the folder version" that empties the note box. The file is ours and it is right there: ask
     // again before giving up. Only if all three reads fail do we leave it unstamped (still never a fake).
-    for (let i = 0; i < 3 && tok === dsToken && !annWriteMs; i++) {
+    for (let i = 0; writeAnn && i < 3 && tok === dsToken && !annWriteMs; i++) {   // v102: nothing to read back when no annotation.json was written
       if (i) await new Promise(r => setTimeout(r, 120));
       const annMs = await annFileMtime(unit);
       if (annMs && tok === dsToken) { annWriteMs = annMs; ownWriteAt.set(k, annMs); lastSeenMtime.set(k, annMs); }
@@ -3446,6 +3469,13 @@
     // (a colleague's included) as our own write, and the next save overwrote it with no chooser and no
     // backup. On this path prefer NO stamp: the worst that costs is a conflict chooser against our own
     // frame, which preserves both versions and asks. Masking a colleague's file is not recoverable.
+    // v102: if NEITHER file was written (an empty frame with no note to write) there is no write of ours to account for.
+    // Stamping a file time here would be this machine's clock (R7-5): mark the frame clean against the stamp it already had.
+    // Decided BEFORE any further await, so a folder switch cannot slip in between (the corrupt flags were already cleared above).
+    if (!writeAnn && !needNote && !noteBlocked) {
+      if (tok === dsToken) State.markClean(caseId, unit.id, seq, lastSeenMtime.get(k) || State.getWrittenAt(caseId, unit.id) || 1);
+      return;
+    }
     const fileMs = noteBlocked ? annWriteMs : ((await unitDiskMtime(unit)) || Date.now());   // the FILES' own clock, not ours (both — SWG-5)
     // A reconcile must never mistake OUR write for an externally-newer file — this session OR after a
     // reload — and a cross-open write must not pollute the NEW dataset's maps.
@@ -3596,10 +3626,10 @@
     refreshMarkers();
     refreshCanvasSelection(); refreshMeta(); highlightNav(); updateDirtyUI(); updateCopyBtn(); scheduleAutoSave();
   }
-  function askClear() { if (!cur || cur.virtual || cur.mismatch || cur.protected) return; $('confirmClear').classList.remove('hidden'); }   // view-only units have nothing to clear (and must never be marked dirty)
+  function askClear() { if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return; $('confirmClear').classList.remove('hidden'); }   // view-only units have nothing to clear (and must never be marked dirty)
   function closeClear() { $('confirmClear').classList.add('hidden'); }
   function clear() {
-    if (!cur || cur.virtual || cur.mismatch || cur.protected) return;
+    if (!cur || cur.virtual || cur.mismatch || cur.protected || cur.unseeded) return;
     State.clearUnit(cur.caseId, cur.unitId);
     view.setPaint(State.paintDense(cur.caseId, cur.unitId, cur.W, cur.H));   // wipe the canvas paint layer too, else the next stroke re-encodes & re-saves the "cleared" paint
     State.markDirty(cur.caseId, cur.unitId);

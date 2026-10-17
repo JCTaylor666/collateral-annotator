@@ -445,6 +445,8 @@ FILE: geometry.json   (INPUT + OUTPUT, optional) -- per-segment metrics + saved 
 
 ========================================
 FILE: annotation.json   (tool OUTPUT -- format for reference)
+// Written only when the frame has something to store (segments, points, paint, a star, a named or second layer),
+// or when the file already exists (so clearing a frame really clears it). A note-only edit writes note.json alone (v102).
 ========================================
 {
   "schema_version": 5,
@@ -494,9 +496,8 @@ FILE: note.json   (tool OUTPUT)
 { "schema_version": 1, "coord_order": "xy",
   "text": "free-text note",
   "markers": [ { "id": 1, "click": [321, 187] } ] }   // numbered circle markers; id = the shown number
-// Optional "origin": "pipeline" (V2 datasets): the text was pre-filled by the dataset pipeline (patient | view |
-// acquisition time | run x/N), not typed by the doctor. The annotator keeps the key while the text is unchanged and
-// drops it once edited; such a note does NOT count as "annotated" and does not pull the unit into Save all (v101).
+// The note (text and markers) is information only: it never makes a frame count as annotated (frame-list dot,
+// Save all). A frame counts as annotated only when annotation.json holds segments, points or paint (v102).
 
 ========================================
 FILE: classes.json   (tool OUTPUT, at the dataset ROOT)
