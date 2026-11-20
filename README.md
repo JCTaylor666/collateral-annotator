@@ -16,7 +16,7 @@ A browser tool for labeling collateral vessel segments on DSA (digital subtracti
 
 Turns a folder of DSA DICOM files into a data folder this annotator opens directly. Everything runs in the browser (Chrome / Edge); no file is uploaded.
 
-1. **Open folder…** — every DICOM in the folder and its subfolders is listed with its patient, view, acquisition time and run.
+1. **Open folder…** — every DICOM in the folder and its subfolders is listed with its patient, view, acquisition time and run. The patient is taken from the file name, up to the first `_` (`0029f95f919fb2ed_Lateral_….dcm` → `0029f95f919fb2ed`); the DICOM PatientID is not used, since every source fills it differently.
 2. Choose the settings: remove the black border (one crop box per DICOM, so its frames keep one size), add a `minip` unit, the vessel-model folds and mirroring.
 3. **Prepare dataset.** The first run downloads the vessel model (5 folds, about 185 MB each); it is cached afterwards.
 

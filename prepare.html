@@ -7,7 +7,7 @@
   <meta name="description" content="Turn a folder of DSA DICOM files into a dataset the Collateral Annotator can open: frames, vessel masks, segment partitions and metrics, computed in the browser.">
   <!-- Bump ?v= on both assets with every release: GitHub Pages lets browsers cache files for 10 minutes, and a
        new page with old scripts breaks it. app.js passes the same tag on to the worker and every module. -->
-  <link rel="stylesheet" href="./prepare/style.css?v=1">
+  <link rel="stylesheet" href="./prepare/style.css?v=2">
 </head>
 <body>
   <header class="top">
@@ -59,15 +59,8 @@
           <label for="startNum">First case number</label>
           <input type="number" id="startNum" min="0" step="1" value="0">
         </div>
-        <div class="row">
-          <label for="patientFrom">Patient from</label>
-          <select id="patientFrom">
-            <option value="tag">DICOM PatientID</option>
-            <option value="file">File name (text before the first “_”)</option>
-          </select>
-        </div>
         <label class="check"><input type="checkbox" id="seedNotes" checked> Write <code>note.json</code>: patient | view | time | run x/N</label>
-        <p class="meta tight">Cases are numbered <code>s_0, s_1, …</code> by patient, then acquisition time, AP before LAT, so one patient's runs are consecutive. <code>case_mapping.csv</code> records which DICOM each case came from.</p>
+        <p class="meta tight">The patient is the file name up to the first “_” (<code>0029f95f919fb2ed_Lateral_….dcm</code> → <code>0029f95f919fb2ed</code>). Cases are numbered <code>s_0, s_1, …</code> by patient, then acquisition time, AP before LAT, so one patient's runs are consecutive. <code>case_mapping.csv</code> records which DICOM each case came from.</p>
       </section>
 
       <section>
@@ -125,6 +118,6 @@
     </section>
   </main>
 
-  <script type="module" src="./prepare/app.js?v=1"></script>
+  <script type="module" src="./prepare/app.js?v=2"></script>
 </body>
 </html>

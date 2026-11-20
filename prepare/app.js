@@ -30,7 +30,7 @@ const $ = (id) => document.getElementById(id);
 const el = {
   modelInfo: $('modelInfo'), unsupported: $('unsupported'), openFolder: $('openFolder'), inputInfo: $('inputInfo'),
   crop: $('crop'), minip: $('minip'), backend: $('backend'), folds: $('folds'), foldInfo: $('foldInfo'), mirror: $('mirror'),
-  startNum: $('startNum'), patientFrom: $('patientFrom'), seedNotes: $('seedNotes'),
+  startNum: $('startNum'), seedNotes: $('seedNotes'),
   chooseOut: $('chooseOut'), chooseCont: $('chooseCont'), outInfo: $('outInfo'),
   run: $('run'), cancel: $('cancel'), progressWrap: $('progressWrap'), bar: $('bar'), status: $('status'),
   opacity: $('opacity'), previewInfo: $('previewInfo'), cacheInfo: $('cacheInfo'), clearCache: $('clearCache'),
@@ -72,7 +72,7 @@ function refreshButtons() {
   const n = todoCases().length;
   el.run.disabled = busy || !manifest || !n || !destOk || selectedFolds().length === 0;
   el.run.textContent = n ? `Prepare dataset (${plural(n, 'case')})` : 'Prepare dataset';
-  for (const i of [el.crop, el.minip, el.backend, el.mirror, el.startNum, el.patientFrom, el.seedNotes,
+  for (const i of [el.crop, el.minip, el.backend, el.mirror, el.startNum, el.seedNotes,
     ...el.folds.querySelectorAll('input'), ...document.querySelectorAll('input[name=outMode]')]) i.disabled = busy;
   el.startNum.disabled = busy || mode === 'continue';
   el.clearCache.disabled = busy || !cacheState.files;
@@ -210,12 +210,14 @@ function viewOf(name, h) {
   if (h.primaryAngle != null) { const a = Math.abs(h.primaryAngle); return a <= 45 || a >= 135 ? 'AP' : 'LAT'; }
   return '';
 }
+// The patient is the file name up to the first "_", as in the earlier datasets. The DICOM PatientID is not
+// used: different sources fill it differently.
 function patientOf(e) {
-  const fromFile = e.name.includes('_') ? e.name.split('_')[0] : e.name.replace(/\.[^.]*$/, '');
-  return el.patientFrom.value === 'file' ? (fromFile || e.header.patientId || 'unknown') : (e.header.patientId || fromFile || 'unknown');
+  const stem = e.name.replace(/\.(dcm|dicom)$/i, '');
+  return (stem.includes('_') ? stem.split('_')[0] : stem) || 'unknown';
 }
 
-// Order: patient, then run time (runs = PatientID + StudyInstanceUID + SeriesNumber, as in the earlier
+// Order: patient, then run time (runs = patient + StudyInstanceUID + SeriesNumber, as in the earlier
 // datasets), AP before LAT. Existing cases (continue mode) keep their numbers; new ones follow the highest.
 function buildPlan() {
   const ok = scanned.filter((e) => !e.error);
@@ -423,7 +425,7 @@ async function runAll() {
     const params = {
       generator: GENERATOR, generator_release: V, created: new Date().toISOString(), input_folder: inputDir.name,
       settings: { remove_black_border: el.crop.checked, minip_unit: el.minip.checked, folds: folds.map((f) => f.fold), mirroring: el.mirror.checked,
-        backend: runtimeLabel, seed_notes: el.seedNotes.checked, patient_from: el.patientFrom.value },
+        backend: runtimeLabel, seed_notes: el.seedNotes.checked, patient_from: 'file name up to the first "_"' },
       model: { name: manifest.name, weights: REPO_PAGE, files: folds.map((f) => ({ file: f.file, sha256: f.sha256 })), minip_mask: 'same nnU-Net as the frames' },
       formats: { case_fmt: 's_{}', frame_fmt: 'f_{}', label_dtype: '<u2', mask_dtype: '|u1', schema_version: 5, coord_order: 'xy', px: 1.0, py: 1.0, unit_suffix: 'px' },
       notes: [
@@ -619,7 +621,7 @@ el.openFolder.addEventListener('click', openFolder);
 el.chooseOut.addEventListener('click', chooseOut);
 el.chooseCont.addEventListener('click', chooseCont);
 document.querySelectorAll('input[name=outMode]').forEach((r) => r.addEventListener('change', onModeChange));
-for (const i of [el.startNum, el.patientFrom, el.minip]) i.addEventListener('change', () => { if (scanned.length) buildPlan(); });
+for (const i of [el.startNum, el.minip]) i.addEventListener('change', () => { if (scanned.length) buildPlan(); });
 el.run.addEventListener('click', runAll);
 el.cancel.addEventListener('click', cancelRun);
 el.backend.addEventListener('change', () => { if (worker && !busy) { worker.terminate(); worker = null; workerBackend = null; loadedKeys = new Set(); refreshFoldInfo(); } });

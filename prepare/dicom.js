@@ -121,7 +121,6 @@ export async function readDicomHeader(file) {
   const ts = str('x00020010') || '1.2.840.10008.1.2';
   const spacing = str('x00181164') || str('x00280030');
   return {
-    patientId: str('x00100020'),
     studyUid: str('x0020000d'),
     seriesNumber: str('x00200011'),
     acqDate: str('x00080022'), acqTime: str('x00080032'),
