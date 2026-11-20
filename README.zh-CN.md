@@ -32,7 +32,7 @@ s_<N>/f_<k>/  s_<N>/minip/      frames.png · mask.npy · label.npy · geometry.
 
 - case 会改名为 `s_0, s_1, …`,因为标注工具只认名字里带数字的文件夹(见下文);`case_mapping.csv` 记录每个 case 来自哪个原文件。排序为:病人 → 采集时间 → 先正位后侧位,同一个病人的几次 run 编号连续。
 - 帧转 8-bit 的方法和之前的预处理脚本完全一样(第一个 WindowCenter / WindowWidth);血管 mask 用 5-fold nnU-Net(logits 平均);`label.npy` 和 `geometry.json` 由之前 `partition.py` / `metrics.py` 的 JavaScript 移植生成,segment、编号、长度都和原来一样,只有到两条分支距离完全相等的像素可能归到另一条。
-- 中途停止或中断的任务,用 **Continue an existing dataset** 接着做:已完成的 case 跳过,新的 DICOM 接着编号,已经有标注的 unit 绝不会被改写。
+- 每次运行都生成一个完整的新文件夹。如果中途停止或中断,删掉那个文件夹重新运行即可。
 
 ---
 

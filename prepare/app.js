@@ -31,7 +31,7 @@ const el = {
   modelInfo: $('modelInfo'), unsupported: $('unsupported'), openFolder: $('openFolder'), inputInfo: $('inputInfo'),
   crop: $('crop'), minip: $('minip'), backend: $('backend'), folds: $('folds'), foldInfo: $('foldInfo'), mirror: $('mirror'),
   startNum: $('startNum'), seedNotes: $('seedNotes'),
-  chooseOut: $('chooseOut'), chooseCont: $('chooseCont'), outInfo: $('outInfo'),
+  chooseOut: $('chooseOut'), outInfo: $('outInfo'),
   run: $('run'), cancel: $('cancel'), progressWrap: $('progressWrap'), bar: $('bar'), status: $('status'),
   opacity: $('opacity'), previewInfo: $('previewInfo'), cacheInfo: $('cacheInfo'), clearCache: $('clearCache'),
   stage: $('stage'), empty: $('empty'), view: $('view'), weightsLink: $('weightsLink'),
@@ -43,7 +43,7 @@ let worker = null, workerBackend = null, loadedKeys = new Set(), runtimeLabel = 
 let msgId = 0;
 const waiting = new Map();
 let inputDir = null, scanned = [], plan = [];
-let outParent = null, contDir = null, contMapping = null, contManifest = null;
+let outParent = null;
 let busy = false, cancelRequested = false, preview = null;
 let cacheState = { files: 0, bytes: 0 }, disarmTimer = 0;
 
@@ -61,20 +61,17 @@ function setProgress(frac) {
 }
 const selectedFolds = () => manifest ? manifest.folds.filter((f) => el.folds.querySelector(`input[value="${f.fold}"]`).checked) : [];
 const keyOf = (f) => `fold${f.fold}`;
-const todoCases = () => plan.filter((c) => c.status !== 'done');
 
 function refreshButtons() {
   const supported = 'showDirectoryPicker' in window;
   el.openFolder.disabled = busy || !supported;
-  el.chooseOut.disabled = el.chooseCont.disabled = busy || !supported;
-  const mode = outMode();
-  const destOk = mode === 'new' ? !!inputDir : mode === 'elsewhere' ? !!outParent : !!contDir;
-  const n = todoCases().length;
+  el.chooseOut.disabled = busy || !supported;
+  const destOk = outMode() === 'new' ? !!inputDir : !!outParent;
+  const n = plan.length;
   el.run.disabled = busy || !manifest || !n || !destOk || selectedFolds().length === 0;
   el.run.textContent = n ? `Prepare dataset (${plural(n, 'case')})` : 'Prepare dataset';
   for (const i of [el.crop, el.minip, el.backend, el.mirror, el.startNum, el.seedNotes,
     ...el.folds.querySelectorAll('input'), ...document.querySelectorAll('input[name=outMode]')]) i.disabled = busy;
-  el.startNum.disabled = busy || mode === 'continue';
   el.clearCache.disabled = busy || !cacheState.files;
 }
 function refreshFoldInfo() {
@@ -218,7 +215,7 @@ function patientOf(e) {
 }
 
 // Order: patient, then run time (runs = patient + StudyInstanceUID + SeriesNumber, as in the earlier
-// datasets), AP before LAT. Existing cases (continue mode) keep their numbers; new ones follow the highest.
+// datasets), AP before LAT; numbered from "First case number".
 function buildPlan() {
   const ok = scanned.filter((e) => !e.error);
   const infos = ok.map((e) => {
@@ -241,23 +238,16 @@ function buildPlan() {
   infos.sort((a, b) => cmp(a.patient, b.patient) || cmp(runs.get(a.runKey), runs.get(b.runKey))
     || cmp(a.runKey, b.runKey) || vr[a.view] - vr[b.view] || natural(a.e.path, b.e.path));
 
-  const known = new Map();                                   // source path -> existing mapping row
   let next = Math.max(0, parseInt(el.startNum.value, 10) || 0);
-  if (outMode() === 'continue' && contMapping) {
-    for (const r of contMapping) known.set(r.source_path, r);
-    next = contMapping.reduce((m, r) => Math.max(m, (parseInt(r.sid, 10) || 0) + 1), 0);
-  }
   plan = infos.map((i) => {
     const { x, n } = rank.get(i.runKey);
-    const prev = known.get(i.e.path);
-    const sid = prev ? parseInt(prev.sid, 10) : next++;
+    const sid = next++;
     return {
       sid, case: `s_${sid}`, e: i.e, patient: i.patient, view: i.view, dt: i.dt, runRank: x, nRuns: n,
       runLabel: n === 1 ? 'only' : x === 1 ? 'pre' : x === n ? 'post' : 'mid',
-      status: prev && prev.status === 'done' ? 'done' : 'planned', message: prev && prev.status === 'done' ? 'already in the dataset' : '',
-      w: prev ? prev.width : '', h: prev ? prev.height : '', box: prev ? prev.crop_box : '', units: prev ? prev.units : '', seconds: prev ? prev.seconds : '',
+      status: 'planned', message: '', w: '', h: '', box: '', units: '', seconds: '',
     };
-  }).sort((a, b) => a.sid - b.sid);
+  });
   renderPlan();
 }
 
@@ -279,10 +269,9 @@ function renderPlan() {
     ['—', e.path, '', '', '', '', '', '', `skipped: ${e.error}`].forEach((v, k) => { const td = document.createElement('td'); td.textContent = v; if (k === 1) td.className = 'file'; if (k === 8) td.className = 'st'; td.title = v; tr.appendChild(td); });
     el.planBody.appendChild(tr);
   }
-  const frames = plan.reduce((s, c) => s + (c.status === 'done' ? 0 : c.e.header.frames + (el.minip.checked && c.e.header.frames > 1 ? 1 : 0)), 0);
-  const done = plan.filter((c) => c.status === 'done').length;
+  const units = plan.reduce((s, c) => s + c.e.header.frames + (el.minip.checked && c.e.header.frames > 1 ? 1 : 0), 0);
   el.planTitle.textContent = plan.length ? `Cases s_${plan[0].sid} … s_${plan[plan.length - 1].sid}` : 'Cases';
-  el.planSummary.textContent = plan.length ? `${plural(plan.length, 'case')}${done ? ` (${done} already done)` : ''} · ${plural(frames, 'unit')} to prepare` : '';
+  el.planSummary.textContent = plan.length ? `${plural(plan.length, 'case')} · ${plural(units, 'unit')} to prepare` : '';
   refreshButtons();
 }
 
@@ -325,56 +314,21 @@ async function chooseOut() {
   } catch (e) { if (e.name !== 'AbortError') setStatus(`Could not open that folder (${e.message}).`, true); }
 }
 
-async function chooseCont() {
-  let dir;
-  try { dir = await window.showDirectoryPicker({ id: 'prepareContinue', mode: 'readwrite' }); }
-  catch (e) { if (e.name !== 'AbortError') setStatus(`Could not open that folder (${e.message}).`, true); return; }
-  try {
-    contMapping = parseCsv(await readText(dir, 'case_mapping.csv'));
-    try { contManifest = parseCsv(await readText(dir, 'manifest.csv')); } catch (e) { contManifest = []; }
-  } catch (e) {
-    setStatus(`“${dir.name}” has no case_mapping.csv, so it was not made by this page. Pick the dataset folder itself.`, true);
-    return;
-  }
-  contDir = dir;
-  document.querySelector('input[name=outMode][value=continue]').checked = true;
-  onModeChange();
-}
-
 function onModeChange() {
-  if (scanned.length) buildPlan();
   refreshOutInfo(); refreshButtons();
 }
 
 function refreshOutInfo() {
-  const mode = outMode();
-  if (mode === 'new') el.outInfo.textContent = inputDir ? `A new folder “${DATASET_PREFIX}<date>-<time>” is created inside “${inputDir.name}”.` : 'A new dataset folder is created inside the DICOM folder.';
-  else if (mode === 'elsewhere') el.outInfo.textContent = outParent ? `A new folder “${DATASET_PREFIX}<date>-<time>” is created inside “${outParent.name}”.` : 'Choose where the new dataset folder should go.';
-  else el.outInfo.textContent = contDir
-    ? `Adding to “${contDir.name}” (${plural(contMapping.length, 'case')} recorded). Finished cases are skipped; unfinished ones are redone; new DICOMs get the next numbers. Units that already hold annotations are never touched.`
-    : 'Choose a dataset folder made by this page to finish or extend it.';
+  const parent = outMode() === 'new' ? inputDir : outParent;
+  el.outInfo.textContent = parent
+    ? `Each run creates a new folder “${DATASET_PREFIX}<date>-<time>” inside “${parent.name}”.`
+    : outMode() === 'new' ? 'Each run creates a new dataset folder inside the DICOM folder.' : 'Choose where the new dataset folder should go.';
 }
 
 // ---------------------------------------------------------------- CSV + file helpers
 
 const csvCell = (v) => { const s = v == null ? '' : String(v); return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
 const toCsv = (rows, fields) => [fields.join(','), ...rows.map((r) => fields.map((f) => csvCell(r[f])).join(','))].join('\r\n') + '\r\n';
-function parseCsv(text) {
-  const rows = []; let row = [], cell = '', q = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (q) { if (ch === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += ch; }
-    else if (ch === '"') q = true;
-    else if (ch === ',') { row.push(cell); cell = ''; }
-    else if (ch === '\n' || ch === '\r') { if (ch === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
-    else cell += ch;
-  }
-  if (cell || row.length) { row.push(cell); rows.push(row); }
-  const [head, ...body] = rows.filter((r) => r.length > 1 || r[0]);
-  return body.map((r) => Object.fromEntries(head.map((h, k) => [h, r[k] ?? ''])));
-}
-async function readText(dir, name) { return (await (await dir.getFileHandle(name)).getFile()).text(); }
-async function exists(dir, name) { try { await dir.getFileHandle(name); return true; } catch (e) { return false; } }
 async function writeFile(dir, name, data) {
   const fh = await dir.getFileHandle(name, { create: true });
   const w = await fh.createWritable();
@@ -403,25 +357,26 @@ function mappingRow(c) {
 
 // ---------------------------------------------------------------- the run
 
+// Every run builds a complete new dataset folder from all DICOMs in the plan.
 async function runAll() {
   if (busy) return;
-  const folds = selectedFolds(), mode = outMode();
-  if (!folds.length || !todoCases().length) return;
+  const folds = selectedFolds();
+  if (!folds.length || !plan.length) return;
   busy = true; cancelRequested = false;
   el.cancel.hidden = false; el.cancel.disabled = false;
+  for (const c of plan) { c.status = 'planned'; c.message = ''; c.w = c.h = c.box = c.units = c.seconds = ''; setCaseState(c, 'planned', 'planned'); }
   refreshButtons();
   const t0 = performance.now();
   let root = null, nDone = 0, nFail = 0, nUnits = 0, stopped = false;
   const unitTimes = [];
   try {
-    const parent = mode === 'new' ? inputDir : mode === 'elsewhere' ? outParent : contDir;
+    const parent = outMode() === 'new' ? inputDir : outParent;
     if (!(await ensureWritable(parent))) throw new Error(`no permission to write into “${parent.name}”`);
     setStatus('Loading the vessel model…'); setProgress(0);
     await ensureLoaded(folds);
-    root = mode === 'continue' ? contDir : await parent.getDirectoryHandle(stamp(), { create: true });
+    root = await parent.getDirectoryHandle(stamp(), { create: true });
 
-    if (!(await exists(root, 'classes.json')))
-      await writeFile(root, 'classes.json', JSON.stringify({ classes: [{ index: 1, name: 'Collateral' }] }, null, 2));
+    await writeFile(root, 'classes.json', JSON.stringify({ classes: [{ index: 1, name: 'Collateral' }] }, null, 2));
     const params = {
       generator: GENERATOR, generator_release: V, created: new Date().toISOString(), input_folder: inputDir.name,
       settings: { remove_black_border: el.crop.checked, minip_unit: el.minip.checked, folds: folds.map((f) => f.fold), mirroring: el.mirror.checked,
@@ -434,16 +389,15 @@ async function runAll() {
         'label.npy / geometry.json: JavaScript port of prepare_dataset partition.py / metrics.py; identical except where a pixel is exactly as far from two branches.',
       ],
     };
-    if (!(await exists(root, 'build_params.json'))) await writeFile(root, 'build_params.json', JSON.stringify(params, null, 2));
+    await writeFile(root, 'build_params.json', JSON.stringify(params, null, 2));
 
-    // every case is recorded before any is processed, so an interrupted run can always be resumed
-    const keepRows = (mode === 'continue' && contMapping ? contMapping : []).filter((r) => !plan.some((c) => c.case === r.case));
-    const saveMapping = () => writeFile(root, 'case_mapping.csv', toCsv([...keepRows, ...plan.map(mappingRow)].sort((a, b) => a.sid - b.sid), MAPPING_FIELDS));
-    let manifestRows = mode === 'continue' && contManifest ? contManifest.slice() : [];
-    const saveManifest = () => writeFile(root, 'manifest.csv', toCsv(manifestRows.slice().sort((a, b) => (a.sid - b.sid) || (a.fid - b.fid)), MANIFEST_FIELDS));
+    // the mapping is written first and rewritten after every case, so it always says what is in the folder
+    const saveMapping = () => writeFile(root, 'case_mapping.csv', toCsv(plan.map(mappingRow), MAPPING_FIELDS));
+    const manifestRows = [];
+    const saveManifest = () => writeFile(root, 'manifest.csv', toCsv(manifestRows, MANIFEST_FIELDS));
     await saveMapping();
 
-    const todo = todoCases(), totalUnits = todo.reduce((s, c) => s + c.e.header.frames + (el.minip.checked && c.e.header.frames > 1 ? 1 : 0), 0);
+    const todo = plan, totalUnits = todo.reduce((s, c) => s + c.e.header.frames + (el.minip.checked && c.e.header.frames > 1 ? 1 : 0), 0);
     let unitsSoFar = 0;
     for (let ci = 0; ci < todo.length; ci++) {
       if (cancelRequested) { stopped = true; break; }
@@ -451,15 +405,12 @@ async function runAll() {
       const tc = performance.now();
       setCaseState(c, 'working', 'decoding…');
       const caseDir = await root.getDirectoryHandle(c.case, { create: true });
-      const skipUnits = [];                                  // units someone already annotated: never rewritten
-      for await (const [name, h] of caseDir.entries()) if (h.kind === 'directory' && (await exists(h, 'annotation.json'))) skipUnits.push(name);
-      manifestRows = manifestRows.filter((r) => r.case !== c.case || skipUnits.includes(r.unit));
       let writes = Promise.resolve(), units = 0, count = 0, info = null, warnings = [];
       const note = JSON.stringify({ schema_version: 1, coord_order: 'xy', text: `${c.patient} | ${c.view} | ${c.dt} | ${c.runRank}/${c.nRuns}`, markers: [] }, null, 2);
       try {
         const file = await c.e.handle.getFile();
         let lastUnitAt = performance.now();
-        await ask({ type: 'process', file, crop: el.crop.checked, minip: el.minip.checked, mirror: el.mirror.checked, keys: folds.map(keyOf), skipUnits }, (m) => {
+        await ask({ type: 'process', file, crop: el.crop.checked, minip: el.minip.checked, mirror: el.mirror.checked, keys: folds.map(keyOf) }, (m) => {
           if (m.type === 'caseinfo') { info = m; count = m.count; c.w = m.w; c.h = m.h; c.box = m.box ? m.box.join(' ') : ''; }
           else if (m.type === 'run') {
             setProgress((unitsSoFar + m.index + m.done / m.total) / Math.max(1, totalUnits));
@@ -467,8 +418,6 @@ async function runAll() {
             const eta = per ? ` · about ${fmtS(per * (totalUnits - unitsSoFar - m.index))} left` : '';
             setStatus(`Case ${ci + 1}/${todo.length} (${c.case}) · unit ${m.index + 1}/${m.count}${eta}`);
             setCaseState(c, 'working', `${m.index + 1}/${m.count}`);
-          } else if (m.type === 'skipped') {
-            warnings.push(`${m.name} kept (has annotations)`);
           } else if (m.type === 'unit') {
             const now = performance.now(); unitTimes.push(now - lastUnitAt); lastUnitAt = now;
             units++;
@@ -479,7 +428,7 @@ async function runAll() {
               await writeFile(u, 'label.npy', m.labelNpy);
               await writeFile(u, 'mask.npy', m.maskNpy);
               await writeFile(u, 'geometry.json', m.geometry);
-              if (el.seedNotes.checked && !(await exists(u, 'note.json'))) await writeFile(u, 'note.json', note);
+              if (el.seedNotes.checked) await writeFile(u, 'note.json', note);
             });
             manifestRows.push({ case: c.case, unit: m.name, sid: c.sid, fid: m.name === 'minip' ? MINIP_FID : parseInt(m.name.slice(2), 10),
               height: m.h, width: m.w, segments: m.segments, vessel_px: m.vessel, seconds: m.seconds.toFixed(3),
@@ -501,7 +450,7 @@ async function runAll() {
       } catch (err) {
         await writes.catch(() => {});
         if (err.message === 'cancelled') {
-          c.status = 'partial'; c.message = 'stopped; run again with “Continue an existing dataset” to finish';
+          c.status = 'partial'; c.message = 'stopped (this case is incomplete)';
           setCaseState(c, 'failed', c.message); stopped = true;
         } else {
           c.status = 'failed'; c.message = err.message; setCaseState(c, 'failed', err.message); nFail++;
@@ -519,15 +468,6 @@ async function runAll() {
     setStatus(e.message, true); setProgress(null);
   } finally {
     busy = false; el.cancel.hidden = true;
-    if (root) {                                               // a second press finishes / extends this same dataset
-      try {
-        contMapping = parseCsv(await readText(root, 'case_mapping.csv'));
-        try { contManifest = parseCsv(await readText(root, 'manifest.csv')); } catch (e) { contManifest = []; }
-        contDir = root;
-        document.querySelector('input[name=outMode][value=continue]').checked = true;
-        refreshOutInfo();
-      } catch (e) { /* nothing was recorded yet */ }
-    }
     refreshButtons(); refreshCacheInfo();
   }
 }
@@ -619,7 +559,6 @@ async function clearCache() {
 
 el.openFolder.addEventListener('click', openFolder);
 el.chooseOut.addEventListener('click', chooseOut);
-el.chooseCont.addEventListener('click', chooseCont);
 document.querySelectorAll('input[name=outMode]').forEach((r) => r.addEventListener('change', onModeChange));
 for (const i of [el.startNum, el.minip]) i.addEventListener('change', () => { if (scanned.length) buildPlan(); });
 el.run.addEventListener('click', runAll);
@@ -633,7 +572,6 @@ el.clearCache.addEventListener('blur', disarmClear);
 // Hooks for automated checks (the folder pickers cannot be scripted): window.__prepare
 window.__prepare = {
   useInputFolder, runAll, isBusy: () => busy, plan: () => plan.map((c) => ({ case: c.case, path: c.e.path, patient: c.patient, view: c.view, dt: c.dt, run: `${c.runRank}/${c.nRuns}`, status: c.status, message: c.message })),
-  continueWith: async (dir) => { contMapping = parseCsv(await readText(dir, 'case_mapping.csv')); try { contManifest = parseCsv(await readText(dir, 'manifest.csv')); } catch (e) { contManifest = []; } contDir = dir; document.querySelector('input[name=outMode][value=continue]').checked = true; onModeChange(); },
 };
 
 if (!('showDirectoryPicker' in window)) el.unsupported.hidden = false;

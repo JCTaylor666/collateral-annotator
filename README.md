@@ -32,7 +32,7 @@ s_<N>/f_<k>/  s_<N>/minip/      frames.png · mask.npy · label.npy · geometry.
 
 - Cases are renamed `s_0, s_1, …` because the annotator only finds folders whose name carries a number (see below); `case_mapping.csv` keeps the link to the original files. They are ordered by patient, then acquisition time, AP before LAT, so one patient's runs are consecutive.
 - Frames are converted to 8 bit exactly like the earlier preprocessing scripts (first WindowCenter / WindowWidth); the vessel mask is a 5-fold nnU-Net (logits averaged); `label.npy` and `geometry.json` come from a JavaScript port of the earlier `partition.py` / `metrics.py`, which gives the same segments, ids and lengths — only a pixel exactly as far from two branches may land in the other one.
-- A run that was stopped or interrupted is finished with **Continue an existing dataset**: completed cases are skipped, new DICOMs get the next numbers, and units that already hold annotations are never rewritten.
+- Every run writes a complete new folder. If a run is stopped or interrupted, delete that folder and start again.
 
 ---
 

@@ -7,7 +7,7 @@
   <meta name="description" content="Turn a folder of DSA DICOM files into a dataset the Collateral Annotator can open: frames, vessel masks, segment partitions and metrics, computed in the browser.">
   <!-- Bump ?v= on both assets with every release: GitHub Pages lets browsers cache files for 10 minutes, and a
        new page with old scripts breaks it. app.js passes the same tag on to the worker and every module. -->
-  <link rel="stylesheet" href="./prepare/style.css?v=2">
+  <link rel="stylesheet" href="./prepare/style.css?v=3">
 </head>
 <body>
   <header class="top">
@@ -67,7 +67,6 @@
         <h2>5 · Output</h2>
         <label class="check"><input type="radio" name="outMode" value="new" checked> New dataset inside the DICOM folder</label>
         <label class="check"><input type="radio" name="outMode" value="elsewhere"> New dataset in another folder <button id="chooseOut" class="inline">Choose…</button></label>
-        <label class="check"><input type="radio" name="outMode" value="continue"> Continue an existing dataset <button id="chooseCont" class="inline">Choose…</button></label>
         <p class="meta tight" id="outInfo"></p>
         <button class="primary" id="run" disabled>Prepare dataset</button>
         <button id="cancel" hidden>Stop</button>
@@ -118,6 +117,6 @@
     </section>
   </main>
 
-  <script type="module" src="./prepare/app.js?v=2"></script>
+  <script type="module" src="./prepare/app.js?v=3"></script>
 </body>
 </html>
