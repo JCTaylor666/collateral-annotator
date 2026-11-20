@@ -42,7 +42,7 @@ body{display:flex;flex-direction:column;font:14px/1.5 -apple-system,Segoe UI,Rob
 .lang-switch{display:flex;gap:4px;flex:none}
 
 /* main split: left rail + central stage */
-.body{flex:1;display:grid;grid-template-columns:288px 1fr 264px;min-height:0}
+.body{flex:1;display:grid;grid-template-columns:288px 1fr 264px;grid-template-rows:minmax(0,1fr);min-height:0}
 body.rail-collapsed .body{grid-template-columns:0 1fr 264px}
 body.rpanel-collapsed .body{grid-template-columns:288px 1fr 0}
 body.rail-collapsed.rpanel-collapsed .body{grid-template-columns:0 1fr 0}

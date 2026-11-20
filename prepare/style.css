@@ -124,7 +124,7 @@ button.primary { width: 100%; margin-top: 8px; background: var(--accent); color:
 
 /* ---- prepare.html additions ---- */
 .layout { grid-template-columns: 340px 1fr; }
-.main { display: grid; grid-template-rows: minmax(260px, 1fr) minmax(160px, 38%); min-height: 0; }
+.main { display: grid; grid-template-rows: minmax(260px, 1fr) minmax(160px, 38%); grid-template-columns: minmax(0, 1fr); min-height: 0; min-width: 0; }
 .main .stage { min-height: 0; }
 .plan { display: flex; flex-direction: column; min-height: 0; background: var(--panel); border-top: 1px solid var(--line); }
 .plan-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 8px 14px; border-bottom: 1px solid var(--line); font-weight: 600; }
