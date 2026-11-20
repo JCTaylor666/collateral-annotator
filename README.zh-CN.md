@@ -10,6 +10,32 @@
 
 ---
 
+## 从 DICOM 准备数据文件夹
+
+**https://jctaylor666.github.io/collateral-annotator/prepare.html** —— 标注工具里"打开数据文件夹"下方的 **从 DICOM 准备数据 ↗** 按钮也会打开它。
+
+把一个装 DSA DICOM 的文件夹,直接做成本标注工具能打开的数据文件夹。全部在浏览器里完成(Chrome / Edge),不上传任何文件。
+
+1. **Open folder…**:文件夹及其子文件夹里的所有 DICOM 都会列出来,并显示病人、体位、采集时间和第几次 run。
+2. 选设置:是否去黑边(每个 DICOM 一个裁剪框,同一个 DICOM 的帧尺寸一致)、是否加 `minip` unit、血管模型用哪几个 fold、是否镜像 TTA。
+3. **Prepare dataset**。第一次运行会下载血管模型(5 个 fold,每个约 185 MB),之后从浏览器缓存读取。
+
+结果是一个新文件夹 `annotator_dataset_<日期>-<时间>/`(默认在 DICOM 文件夹里,也可以选别的位置):
+
+```
+classes.json        index 1 = "Collateral"
+case_mapping.csv    s_<N>  <->  原 DICOM、病人、体位、采集时间、run x/N、尺寸、裁剪框
+manifest.csv        每个 unit 一行
+build_params.json   本次用的设置
+s_<N>/f_<k>/  s_<N>/minip/      frames.png · mask.npy · label.npy · geometry.json · note.json
+```
+
+- case 会改名为 `s_0, s_1, …`,因为标注工具只认名字里带数字的文件夹(见下文);`case_mapping.csv` 记录每个 case 来自哪个原文件。排序为:病人 → 采集时间 → 先正位后侧位,同一个病人的几次 run 编号连续。
+- 帧转 8-bit 的方法和之前的预处理脚本完全一样(第一个 WindowCenter / WindowWidth);血管 mask 用 5-fold nnU-Net(logits 平均);`label.npy` 和 `geometry.json` 由之前 `partition.py` / `metrics.py` 的 JavaScript 移植生成,segment、编号、长度都和原来一样,只有到两条分支距离完全相等的像素可能归到另一条。
+- 中途停止或中断的任务,用 **Continue an existing dataset** 接着做:已完成的 case 跳过,新的 DICOM 接着编号,已经有标注的 unit 绝不会被改写。
+
+---
+
 ## 数据文件夹结构
 
 把工具指向这样一个**数据根目录**:

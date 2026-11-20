@@ -10,6 +10,32 @@ A browser tool for labeling collateral vessel segments on DSA (digital subtracti
 
 ---
 
+## Prepare a data folder from DICOM
+
+**https://jctaylor666.github.io/collateral-annotator/prepare.html** — also linked in the app as **Prepare data from DICOM ↗**, under *Open data folder*.
+
+Turns a folder of DSA DICOM files into a data folder this annotator opens directly. Everything runs in the browser (Chrome / Edge); no file is uploaded.
+
+1. **Open folder…** — every DICOM in the folder and its subfolders is listed with its patient, view, acquisition time and run.
+2. Choose the settings: remove the black border (one crop box per DICOM, so its frames keep one size), add a `minip` unit, the vessel-model folds and mirroring.
+3. **Prepare dataset.** The first run downloads the vessel model (5 folds, about 185 MB each); it is cached afterwards.
+
+The result is a new folder `annotator_dataset_<date>-<time>/` (inside the DICOM folder, or wherever you choose):
+
+```
+classes.json        index 1 = "Collateral"
+case_mapping.csv    s_<N>  <->  source DICOM, patient, view, acquisition time, run x/N, size, crop box
+manifest.csv        one row per unit
+build_params.json   the settings that were used
+s_<N>/f_<k>/  s_<N>/minip/      frames.png · mask.npy · label.npy · geometry.json · note.json
+```
+
+- Cases are renamed `s_0, s_1, …` because the annotator only finds folders whose name carries a number (see below); `case_mapping.csv` keeps the link to the original files. They are ordered by patient, then acquisition time, AP before LAT, so one patient's runs are consecutive.
+- Frames are converted to 8 bit exactly like the earlier preprocessing scripts (first WindowCenter / WindowWidth); the vessel mask is a 5-fold nnU-Net (logits averaged); `label.npy` and `geometry.json` come from a JavaScript port of the earlier `partition.py` / `metrics.py`, which gives the same segments, ids and lengths — only a pixel exactly as far from two branches may land in the other one.
+- A run that was stopped or interrupted is finished with **Continue an existing dataset**: completed cases are skipped, new DICOMs get the next numbers, and units that already hold annotations are never rewritten.
+
+---
+
 ## Data folder layout
 
 Point the tool at a **data root** that looks like this:

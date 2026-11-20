@@ -53,7 +53,9 @@ body.rpanel-collapsed .rpanel{display:none}
 
 /* left rail */
 .rail{grid-column:1;border-right:1px solid var(--border);background:var(--panel);padding:10px;overflow-y:auto;display:flex;flex-direction:column;gap:12px;min-height:0}
-.rail-files{display:flex;gap:6px}
+.rail-files{display:flex;flex-wrap:wrap;gap:6px}
+.rail-files .prepare-link{flex-basis:100%;text-align:center;text-decoration:none;color:var(--muted)}
+.rail-files .prepare-link:hover{color:var(--accent);border-color:var(--accent)}
 .seclbl{font-size:11px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
 .sel-full{width:100%}
 .stepper{display:flex;gap:5px;margin:7px 0}

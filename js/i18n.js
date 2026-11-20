@@ -16,6 +16,8 @@
       rpanelToggleTitle: 'Collapse/expand annotation panel',
 
       btnOpen: 'Open data folder',
+      btnPrepare: 'Prepare data from DICOM ↗',
+      btnPrepareTitle: 'Build a dataset for this annotator from a folder of DICOM files (opens in a new tab)',
       btnSave: 'Save to folder',
       btnSaveCaseLabel: 'Save case',
       saveCaseFmt: 'Save {id}',
@@ -274,6 +276,8 @@
       rpanelToggleTitle: '折叠/展开右侧标注面板',
 
       btnOpen: '打开数据文件夹',
+      btnPrepare: '从 DICOM 准备数据 ↗',
+      btnPrepareTitle: '把一个 DICOM 文件夹做成本标注工具能打开的数据集(在新标签页打开)',
       btnSave: '保存到文件夹',
       btnSaveCaseLabel: '保存本病例',
       saveCaseFmt: '保存 {id}',

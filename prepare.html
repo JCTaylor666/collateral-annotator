@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Prepare Annotator Data</title>
+  <meta name="description" content="Turn a folder of DSA DICOM files into a dataset the Collateral Annotator can open: frames, vessel masks, segment partitions and metrics, computed in the browser.">
+  <!-- Bump ?v= on both assets with every release: GitHub Pages lets browsers cache files for 10 minutes, and a
+       new page with old scripts breaks it. app.js passes the same tag on to the worker and every module. -->
+  <link rel="stylesheet" href="./prepare/style.css?v=1">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Prepare annotator data from DICOM</h1>
+      <p class="sub">Builds a dataset for the <a href="./index.html">Collateral Annotator</a> in this browser. No file is uploaded.</p>
+    </div>
+    <div class="model" id="modelInfo">Loading model info…</div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel">
+      <p class="meta err" id="unsupported" hidden>This page needs folder access, which only Chrome and Edge (desktop) provide. Please open it there.</p>
+
+      <section>
+        <h2>1 · DICOM folder</h2>
+        <button id="openFolder">Open folder…</button>
+        <p class="meta" id="inputInfo">Pick the folder that holds the DICOM files; subfolders are included.</p>
+      </section>
+
+      <section>
+        <h2>2 · Preprocess</h2>
+        <label class="check"><input type="checkbox" id="crop" checked> Remove black border</label>
+        <p class="meta tight">One crop box per DICOM (the box of its MinIP), so all of its frames keep one size — the same sizes the earlier pipeline produced.</p>
+        <label class="check"><input type="checkbox" id="minip" checked> Add a <code>minip</code> unit per DICOM (min over frames)</label>
+      </section>
+
+      <section>
+        <h2>3 · Vessel model</h2>
+        <div class="row">
+          <label for="backend">Backend</label>
+          <select id="backend">
+            <option value="auto">Auto (WebGPU, else CPU)</option>
+            <option value="webgpu">WebGPU only</option>
+            <option value="wasm">CPU (WebAssembly)</option>
+          </select>
+        </div>
+        <div class="row folds-row">
+          <span>Folds</span>
+          <div class="folds" id="folds" role="group" aria-label="Folds to average"></div>
+        </div>
+        <p class="meta tight" id="foldInfo"></p>
+        <label class="check"><input type="checkbox" id="mirror" checked> Mirroring TTA <span class="muted">(as the earlier pipeline; about 4× the model runs)</span></label>
+      </section>
+
+      <section>
+        <h2>4 · Cases</h2>
+        <div class="row">
+          <label for="startNum">First case number</label>
+          <input type="number" id="startNum" min="0" step="1" value="0">
+        </div>
+        <div class="row">
+          <label for="patientFrom">Patient from</label>
+          <select id="patientFrom">
+            <option value="tag">DICOM PatientID</option>
+            <option value="file">File name (text before the first “_”)</option>
+          </select>
+        </div>
+        <label class="check"><input type="checkbox" id="seedNotes" checked> Write <code>note.json</code>: patient | view | time | run x/N</label>
+        <p class="meta tight">Cases are numbered <code>s_0, s_1, …</code> by patient, then acquisition time, AP before LAT, so one patient's runs are consecutive. <code>case_mapping.csv</code> records which DICOM each case came from.</p>
+      </section>
+
+      <section>
+        <h2>5 · Output</h2>
+        <label class="check"><input type="radio" name="outMode" value="new" checked> New dataset inside the DICOM folder</label>
+        <label class="check"><input type="radio" name="outMode" value="elsewhere"> New dataset in another folder <button id="chooseOut" class="inline">Choose…</button></label>
+        <label class="check"><input type="radio" name="outMode" value="continue"> Continue an existing dataset <button id="chooseCont" class="inline">Choose…</button></label>
+        <p class="meta tight" id="outInfo"></p>
+        <button class="primary" id="run" disabled>Prepare dataset</button>
+        <button id="cancel" hidden>Stop</button>
+        <div class="progress" id="progressWrap" hidden><div class="bar" id="bar"></div></div>
+        <p class="meta" id="status" role="status" aria-live="polite">Open a DICOM folder to start. The vessel model downloads on the first run and is cached afterwards.</p>
+      </section>
+
+      <section>
+        <h2>6 · Preview</h2>
+        <div class="seg" role="radiogroup" aria-label="Display">
+          <label><input type="radio" name="mode" value="segments" checked> Segments</label>
+          <label><input type="radio" name="mode" value="mask"> Mask</label>
+          <label><input type="radio" name="mode" value="image"> Image</label>
+        </div>
+        <div class="row">
+          <label for="opacity">Overlay opacity</label>
+          <input type="range" id="opacity" min="0" max="100" value="60">
+        </div>
+        <p class="meta" id="previewInfo"></p>
+      </section>
+
+      <section>
+        <h2>7 · Downloaded models</h2>
+        <p class="meta tight" id="cacheInfo">Checking this browser's storage…</p>
+        <button id="clearCache" class="danger" disabled>Delete downloaded models</button>
+      </section>
+
+      <footer class="foot">
+        <p>Each frame: 8-bit image as the earlier preprocessing makes it, nnU-Net vessel mask (mean of the selected folds' logits), branch partition and per-segment metrics as in the earlier <code>prepare_dataset</code>. Research use only — not a medical device.</p>
+        <p><a href="./index.html">Open the annotator</a> · <a href="https://github.com/JCTaylor666/collateral-annotator">Source</a> · <a id="weightsLink" href="https://huggingface.co/cjy666/dsa-vessel-seg">Weights</a></p>
+      </footer>
+    </aside>
+
+    <section class="main">
+      <div class="stage" id="stage">
+        <div class="empty" id="empty"><p>The frame being prepared is shown here.</p></div>
+        <canvas id="view" hidden></canvas>
+      </div>
+      <div class="plan">
+        <div class="plan-head"><span id="planTitle">Cases</span><span class="meta" id="planSummary"></span></div>
+        <div class="plan-scroll">
+          <table id="planTable">
+            <thead><tr><th>Case</th><th>DICOM</th><th>Patient</th><th>View</th><th>Acquired</th><th>Run</th><th>Frames</th><th>Size</th><th>Status</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./prepare/app.js?v=1"></script>
+</body>
+</html>
