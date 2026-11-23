@@ -5063,7 +5063,9 @@
     }
     view.layout(); view.render(); updateZoomReadout();
   }
-  window.addEventListener('DOMContentLoaded', init);
+  // One working page per browser (onetab.js): a later page shows a notice instead of starting, and is
+  // started when it is the only one. Without that file the page starts as before.
+  window.addEventListener('DOMContentLoaded', () => { if (window.OneTab) window.OneTab.run(init); else init(); });
   // read-only diagnostics (support/debug; never mutates anything)
   window.__annotDebug = () => ({ cacheCap, cacheSize: cache.size, maxSeqLen, maxPxSeen, prefetchCold: prefetchCold.size, inflight: inflightLoads.size, scan: scanDone + '/' + scanTotal, dirty: State.dirtyCount() });
 })();

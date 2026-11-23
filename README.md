@@ -115,7 +115,7 @@ With Brush or Paint, hold **Space** while dragging to pan.
   | `note.json` | note text and markers |
   | `classes.json` | class names (colours stay in your browser) |
 
-- If a frame's file was changed elsewhere (another computer, a colleague, another program) since this browser last read or saved it, it is not overwritten: you choose which version to keep, and the other one is kept as a backup file. Tabs of the same browser take turns when they save. What the app cannot see is a change that reaches the folder in the moment between its last look at a file and its own write — from another computer, another browser or program, or a sync that is still on its way; there the later save replaces the earlier one. So two people should not annotate the same frame at the same time.
+- If a frame's file was changed elsewhere (another computer, a colleague, another program) since this browser last read or saved it, it is not overwritten: you choose which version to keep, and the other one is kept as a backup file. Only one tab of a browser works at a time: a second tab shows a notice and starts by itself once the first is closed. What the app cannot see is a change that reaches the folder in the moment between its last look at a file and its own write — from another computer, another browser or program, or a sync that is still on its way; there the later save replaces the earlier one. So two people should not annotate the same frame at the same time.
 
 ## 6 · Other panels
 

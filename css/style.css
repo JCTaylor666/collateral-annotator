@@ -161,6 +161,7 @@ body.sel-brush-mode .single-opts{display:none}
 .modal-warn{color:#dc2626;font-size:17px;font-weight:700;margin:0 0 22px;line-height:1.7}
 .modal-actions{display:flex;align-items:center;justify-content:center;gap:20px}
 .modal-title{font-size:16px;font-weight:700;margin:0 0 16px}
+.onetab-text{margin:0;font-size:14px;line-height:1.7;text-align:left}
 .saveprog{height:10px;border-radius:5px;background:var(--bg);overflow:hidden;margin:0 0 10px;min-width:300px}
 #saveProgFill{height:100%;width:0%;background:var(--accent);border-radius:5px;transition:width .15s}
 .saveprog-text{font-size:12px;color:var(--muted);margin-bottom:18px;min-height:16px;font-variant-numeric:tabular-nums}
