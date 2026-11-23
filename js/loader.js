@@ -122,7 +122,7 @@
              // perfectly, the doctor was told "annotation.json exists but could NOT be read", loadCur bailed
              // without seeding, and EVERY write to that frame was refused for the rest of the session — while
              // Finder showed a perfectly healthy annotation.json. They are separate files with separate fates.
-             annDropped: a.dropped || 0, annUnreadable: !!a.unreadable, noteUnreadable: !!n.unreadable,
+             annDropped: a.dropped || 0, annUnreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, annRaw: a.raw, noteRaw: n.raw, annBytes: a.bytes, noteBytes: n.bytes,
              annMtime: a.mtime || 0, noteMtime: n.mtime || 0, note: n.note, geometry };
   }
 
@@ -141,6 +141,18 @@
   //   corrupt     -> { annotation:null, corrupt:true }                present, readable, but not usable JSON
   // `dropped` counts layer entries this build cannot represent (see State.annotationDropped): the file is
   // readable and mostly usable, but saving it back would SHRINK it, so callers back it up like a corrupt one.
+  // The bytes of a file this build can read but not use — where they say more than its text does. Text is not
+  // always the whole file: a byte-order mark is dropped, and every byte that is not valid UTF-8 reads as the
+  // same replacement character. Returns
+  //   null         the text IS the file (it encodes back to exactly the file's size and holds no replacement
+  //                character): nothing to add, and nothing depends on a second read of the file succeeding;
+  //   Uint8Array   the bytes, where the text is not the whole file;
+  //   false        the text is not the whole file and the bytes cannot be had just now.
+  const bytesOf = async (file, text) => {
+    if (typeof text === 'string' && typeof TextEncoder !== 'undefined' && typeof file.size === 'number' &&
+        text.indexOf('\uFFFD') < 0 && new TextEncoder().encode(text).length === file.size) return null;
+    try { const b = new Uint8Array(await file.arrayBuffer()); return b.length ? b : false; } catch (e) { return false; }
+  };
   async function readAnnotation(unit) {
     let fh;
     try { fh = await unit.handle.getFileHandle('annotation.json'); }
@@ -153,12 +165,20 @@
     catch (e) { return { annotation: null, corrupt: false, unreadable: true, dropped: 0, mtime: 0 }; }
     const mtime = file.lastModified || 0;   // when the file was last WRITTEN — lets open-time reconciliation spot a stale localStorage dirty flag
     let ann;
+    // `raw` (and the file's bytes) ride along for the two kinds of file this build can read but not USE: the
+    // app cannot compare their content, but it can still tell whether such a file is the one it saw before
+    // (see app.js sigOfRead). The bytes, because text is not enough: every byte that is not valid UTF-8 reads
+    // as the same replacement character.
     try { ann = JSON.parse(text); }
-    catch (e) { return { annotation: null, corrupt: true, dropped: 0, mtime }; }   // read fine, but it is not JSON — the real "corrupt"
+    catch (e) { return { annotation: null, corrupt: true, dropped: 0, mtime, raw: text, bytes: await bytesOf(file, text) }; }   // read fine, but it is not JSON — the real "corrupt"
+    // JSON, but not a document: null, false, 0, a string, a list. It was handed on as "annotation: <that>", and
+    // everything that asks "is there an annotation?" took a falsy one for NO FILE — the file was then written
+    // over as if nothing had been there. It is a file this build cannot use, like one that is not JSON at all.
+    if (!ann || typeof ann !== 'object' || Array.isArray(ann)) return { annotation: null, corrupt: true, dropped: 0, mtime, raw: text, bytes: await bytesOf(file, text) };
     // A1: a schema_version newer than this build is NOT "corrupt" — it is a healthy file from a newer
     // app. Classified separately so the app can make the frame read-only instead of letting the
     // corrupt path back it up and then OVERWRITE it with a downgraded rewrite.
-    if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, versionAhead: Number(ann.schema_version), corrupt: false, dropped: 0, mtime };
+    if (ann && typeof ann === 'object' && Number(ann.schema_version) > 6) return { annotation: null, versionAhead: Number(ann.schema_version), corrupt: false, dropped: 0, mtime, raw: text, bytes: await bytesOf(file, text) };
     const dropped = (root.State && root.State.annotationDropped) ? root.State.annotationDropped(ann) : 0;
     return { annotation: ann, corrupt: false, dropped, mtime };
   }
@@ -170,11 +190,15 @@
     let fh;
     try { fh = await unit.handle.getFileHandle('note.json'); }
     catch (e) { return (e && e.name === 'NotFoundError') ? { note: null, mtime: 0 } : { note: null, unreadable: true, mtime: 0 }; }   // absent vs. present-but-unreachable
-    let text, mtime = 0;
-    try { const f = await fh.getFile(); mtime = f.lastModified || 0; text = await f.text(); }
+    let text, mtime = 0, f;
+    try { f = await fh.getFile(); mtime = f.lastModified || 0; text = await f.text(); }
     catch (e) { return { note: null, unreadable: true, mtime: 0 }; }
-    try { return { note: JSON.parse(text), mtime }; }
-    catch (e) { return { note: null, corrupt: true, mtime }; }   // present but not JSON: flagged so the app backs the original up to note.json.corrupt before any write replaces it (A2)
+    // JSON, but not a note (null, false, 0, a list …), is a file that is THERE and cannot be used — not "no
+    // note": taken for no note, it was written over as if nothing had been there.
+    let note = null, usable = false;
+    try { note = JSON.parse(text); usable = !!note && typeof note === 'object' && !Array.isArray(note); } catch (e) { usable = false; }
+    if (usable) return { note, mtime };
+    return { note: null, corrupt: true, mtime, raw: text, bytes: await bytesOf(f, text) };   // present but not JSON: flagged so the app backs the original up to note.json.corrupt before any write replaces it (A2)
   }
   // Optional geometry.json: per-segment named metrics that drive the stats + filter UI.
   // { segments: { "<segId>": { "<metric>": <number>, ... } }, filter?: {metric,min,max} }.
@@ -217,7 +241,7 @@
   async function loadAnnotation(unit) {
     const a = await readAnnotation(unit), n = await readNote(unit);
     return { annotation: a.annotation, annCorrupt: a.corrupt, annDropped: a.dropped || 0, versionAhead: a.versionAhead || 0,
-             unreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, note: n.note, noteCorrupt: !!n.corrupt,
+             unreadable: !!a.unreadable, noteUnreadable: !!n.unreadable, note: n.note, noteCorrupt: !!n.corrupt, annRaw: a.raw, noteRaw: n.raw, annBytes: a.bytes, noteBytes: n.bytes,
              mtime: Math.max(a.mtime || 0, n.mtime || 0), annMtime: a.mtime || 0, noteMtime: n.mtime || 0 };   // `mtime` is now the UNIT's newest file — symmetric with unitDiskMtime()   // ANS-3: the note's fate is its own
   }
 
@@ -239,10 +263,15 @@
   //                unreadable file is NOT absent: only NotFoundError takes that path.
   async function loadClasses(rootHandle) {
     let fh;
+    // `unreadable`: the file is there and could not be READ at this moment — still ok:false (never regenerated),
+    // but not a verdict on what it holds: a caller that can wait reads it again.
     try { fh = await rootHandle.getFileHandle('classes.json'); }
-    catch (e) { return (e && e.name === 'NotFoundError') ? { list: [], ok: true } : { list: [], ok: false }; }
+    catch (e) { return (e && e.name === 'NotFoundError') ? { list: [], ok: true } : { list: [], ok: false, unreadable: true }; }
+    let text;
+    try { text = await (await fh.getFile()).text(); }
+    catch (e) { return { list: [], ok: false, unreadable: true }; }
     try {
-      const o = JSON.parse(await (await fh.getFile()).text());
+      const o = JSON.parse(text);
       if (!o || !Array.isArray(o.classes)) return { list: [], ok: false };
       let dropped = 0;
       const list = [];

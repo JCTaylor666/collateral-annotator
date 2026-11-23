@@ -29,6 +29,12 @@ SOFTWARE.```
 ## jpeg-lossless-decoder-js 2.1.2 (jpeg-lossless-decoder-2.1.2.js)
 release/lossless.js from https://www.npmjs.com/package/jpeg-lossless-decoder-js
 
+**Modified in this project.** Five corrections, each marked `PATCH` in the file and listed at its top: the
+start value of the prediction with a point transform, a sample that is directly followed by a marker, the
+first line of a restart interval, predictor 7, and a scan that is cut short (it no longer yields samples it has
+no bits for). Everything else is the published file. `prepare/dicom.js` decodes small test streams before the
+first frame and refuses to go on if this file is not the corrected one.
+
 ```
 Copyright (c) 2015 RII-UTHSCSA
 

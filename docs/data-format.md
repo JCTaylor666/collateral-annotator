@@ -2,12 +2,12 @@
 
 **English** · [中文](data-format.zh-CN.md) · [Back to the README](../README.md)
 
-Everything a person or an AI agent needs to build a data folder this annotator can open. The same text is in the app under **Help → Data format… → Copy for an AI agent** (that copy is kept in sync with the code). The easiest way to get such a folder from DICOM files is the [prepare page](https://jctaylor666.github.io/collateral-annotator/prepare.html).
+Everything a person or an AI agent needs to build a data folder this annotator can open. The app has its own wording of this specification under **Help → Data format… → Copy for an AI agent**; it belongs to the version of the app you are running. The two are written separately — the rules for recovery files, conflicts and newer formats are word for word the same in both. The easiest way to get such a folder from DICOM files is the [prepare page](https://jctaylor666.github.io/collateral-annotator/prepare.html).
 
 Everything an agent needs in order to build a dataset this tool can open, in one
 self-contained block. It assumes **no prior context** — copy the whole thing.
-The same text is in the app under **Data format… → Copy for an AI agent**, and
-that copy is the one kept in sync with the code.
+The app's own copy (**Data format… → Copy for an AI agent**) is worded differently
+and goes with the installed version; where the two differ, trust the app.
 
 <details>
 <summary><b>Click to expand the full specification</b></summary>
@@ -49,8 +49,12 @@ FOLDER STRUCTURE
       annotation.json                OUTPUT (you MAY pre-fill it; see below)
       note.json                      OUTPUT
       annotation.json.corrupt        OUTPUT, recovery only
+      note.json.corrupt              OUTPUT, recovery only
       annotation.unsaved-backup.json OUTPUT, recovery only
       note.unsaved-backup.json       OUTPUT, recovery only
+      annotation.external-backup.json OUTPUT, recovery only
+      note.external-backup.json      OUTPUT, recovery only
+      note.unread-backup.json        OUTPUT, recovery only
 
 Do NOT create a "perfusion" folder. The tool appends one computed, view-only
 "perfusion" unit to every case, after minip. It has no files on disk, no label,
@@ -97,11 +101,15 @@ label.npy   (required) -- the segmentation, split into segments
 mask.npy   (optional)
   2-D (H, W) uint8 of 0/1: the vessel foreground. Drawn as the blue overlay and
   used to constrain the brush when "Foreground only" is on. If absent there is
-  simply no overlay. If PRESENT it must match W x H exactly -- a wrong-shaped or
-  truncated mask triggers the grey placeholder rather than being ignored.
+  simply no overlay and nothing constrains the brush (paint lands wherever you
+  drag). If PRESENT and readable it must match W x H exactly -- a
+  wrong-shaped mask triggers the grey placeholder rather than being ignored. A
+  mask that cannot be parsed at all (truncated, not 2-D) does NOT: the frame
+  stays annotatable and shows a warning, with the overlay and "Foreground only"
+  off for it.
   Normally mask == (label > 0).
 
-geometry.json   (optional; the tool writes back only "filter")
+geometry.json   (optional; the tool changes only "filter")
   { "segments": { "1":  { "radius_px": 2.0, "length_px": 40.0 },
                   "12": { "radius_px": 16.0, "length_px": 12.0 } },
     "filter":   { "metric": "radius_px", "min": 4.8, "max": 15.4 } }
@@ -111,7 +119,10 @@ geometry.json   (optional; the tool writes back only "filter")
     min / max / mean / median, and filter the display by a range.
   - "filter" is the reviewer's saved window; the tool rewrites it whenever the
     sliders move. Set it at generation time to the first metric's full range.
-  - Everything else in the file is preserved verbatim.
+  - Everything else in the file is kept: the tool reads the file again right
+    before it writes, sets "filter" and writes the rest back as it read it then
+    (as re-formatted JSON, not byte for byte). A file that cannot be read at that
+    moment, or is no longer a JSON object, is not written.
 
 classes.json   (at the root -- SHIP THIS)
   { "classes": [ { "index": 1, "name": "Collateral" } ] }
@@ -161,30 +172,69 @@ note.json
     "markers": [ { "id": 1, "click": [321, 187] } ] }
 
 .annotator_dataset.json  (root, hidden)
-  { "id": "d3f1a2..." } -- created on first open. In-browser progress is keyed to
-  this id so two datasets that both use case_1/frame_0 never bleed together. Safe
-  to delete (resets browser state only) and safe to omit from an archive.
+  { "id": "d3f1a2..." } -- created on first open. In-browser progress (unsaved
+  work included) is filed per FOLDER: under this id the first time a folder is
+  opened, and by the folder itself from then on -- the browser remembers which
+  folder it was. While the browser has that record, a copy of the folder, which
+  carries the same file, does not get the original's unsaved work; a folder
+  that was moved or renamed is a new folder to the browser. (A folder replaced,
+  at the same place and under the same name, by a copy of itself cannot be told
+  from the original; and a folder exchanged for ANOTHER dataset while it is
+  open is noticed when it is opened again -- open a folder again after
+  replacing it.) Unsaved work that comes back without that record -- left by an
+  older version of the app, or kept while the record could not be read or
+  written -- is compared with the folder as soon as its frame is read. Where it
+  says what the folder already holds, nothing is asked, and the next save
+  writes nothing: the frame then counts as saved. Where it differs, it is shown
+  and asked about at once, and nothing of it is written before the answer.
+  (Work done on such a frame before answering goes on top of it: the browser
+  then holds the result, not the work as it came back.) A file that is there
+  but cannot be read just now: a folder the browser has not seen is not opened
+  then (try again). A damaged file, or one that cannot be created: the folder's
+  name stands in for the id. Safe to delete (resets browser state only) and
+  safe to omit from an archive.
 
-RECOVERY FILES -- written only when something needs protecting; the app can
-show and RESTORE them from the UI (opening the frame offers a "View" banner;
-restoring is a swap, nothing is destroyed):
-  annotation.json.corrupt / note.json.corrupt / classes.json.corrupt -- an
-    unparseable file is copied here before anything overwrites it. A second,
-    DIFFERENT breakage of the same file goes to ...corrupt-2, and so on up to
-    -9: a rescue copy is never overwritten by a later one.
+RECOVERY FILES -- written by the tool only when something needs protecting.
+Never create them yourself; nothing reads them back automatically. The app can
+show and RESTORE them (opening the frame offers a "View" banner; restoring is a
+swap: the version it replaces is first written to a free backup name).
+  annotation.json.corrupt / note.json.corrupt / classes.json.corrupt (the last
+    one at the root) -- a file that cannot be parsed, or that this version can
+    take over only in part, is copied here, byte for byte, before a save
+    rewrites it.
   annotation.unsaved-backup.json / note.unsaved-backup.json -- the session's
-    side of a resolved conflict (you kept the folder's version).
+    side of a resolved conflict (the folder's version was kept).
   annotation.external-backup.json / note.external-backup.json -- the folder's
-    side of a resolved conflict (you kept the session's version).
+    side of a resolved conflict (the session's version was kept): the file as it
+    was, byte for byte.
   note.unread-backup.json -- the folder held a note.json this session never
-    managed to READ (a Drive or permission hiccup) and you then wrote a note of
-    your own; the unread original is preserved here first. It is not a damaged
-    file -- nothing is known to be wrong with it beyond one failed read.
-CONFLICTS: a file on disk NEWER than the session's copy and different in
-content is never auto-resolved -- the frame goes write-protected and opening
-it shows a two-thumbnail chooser. A file with a schema_version above the app's
-own, or an unknown paint.encoding, makes the frame READ-ONLY (never blindly
-rewritten by an older app).
+    managed to READ (a Drive or permission hiccup) and a note was then written;
+    the unread original is kept here first. It is not a damaged file.
+  A backup name that already holds DIFFERENT content is never written over: the
+  copy goes to ...-2, and so on up to -9; when all nine are taken, the operation
+  is refused instead.
+CONFLICTS -- decided by CONTENT, not by file time. When a frame's file no longer
+holds what the session last read or wrote, and the session has unsaved work on
+that frame, nothing is resolved automatically: the frame is write-protected and
+opening it shows a two-version chooser; the version that is not kept goes to one
+of the backup files above first, and if that copy cannot be made the choice is
+not carried out. (Unsaved work that came back from the browser without its
+record that it was made in THIS folder -- work left by an older version of the
+app, or kept while that record could not be read or written -- is asked about
+unless the folder already holds exactly that work, also where the folder has no
+such file yet.) What this cannot see: a write by another computer, another
+browser or another program that lands in the moment between the app's last look
+at a file and its own write -- the later write then replaces the earlier one,
+with no chooser and no backup.
+NEWER FORMATS -- an annotation.json with a schema_version above the app's own,
+or with an unknown paint.encoding, makes the frame READ-ONLY: saving does not
+rewrite it. The one way it is replaced: it appears while the frame is open with
+unsaved work -- a conflict like any other -- and the session's version is
+chosen; the file is then first copied, byte for byte, to
+annotation.external-backup.json. (While such a file cannot be read in full,
+nothing is written over it: the save waits.) A note.json from a newer version is
+treated differently: it can still be edited; the file as it was is first kept as
+note.unread-backup.json, and the note is then written in this version's format.
 
 ========================================
 HOW TO PREPARE A DATASET -- STEP BY STEP
@@ -328,7 +378,9 @@ not start anywhere in particular and need not be contiguous.
 - Merging is a plain copy; case folder names are unique so nothing collides. Take
   the UNION of the classes.json files if anyone added a class.
 - What comes back changed: annotation.json, note.json, the "filter" block of
-  geometry.json, classes.json, .annotator_dataset.json. Nothing else is written.
+  geometry.json, classes.json, .annotator_dataset.json. Apart from these the tool
+  writes only the recovery files (*.corrupt, *-backup.json), and only when
+  something had to be protected.
 
 ========================================
 CHECKLIST

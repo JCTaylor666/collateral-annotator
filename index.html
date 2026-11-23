@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vessel Annotator</title>
-<link rel="stylesheet" href="./css/style.css?v=104">
+<link rel="stylesheet" href="./css/style.css?v=105">
 <!-- GoatCounter privacy-friendly page-visit analytics (no cookies; counts page loads of this site only, never touches the user's local data files) -->
 <script data-goatcounter="https://jctaylor666.goatcounter.com/count"
         async src="//gc.zgo.at/count.js"></script>
@@ -60,16 +60,16 @@
 
     <div>
       <div class="seclbl" data-i18n="contrastLabel">Contrast</div>
-      <div class="ctl-row"><label data-i18n="winCenterLabel">Center</label><input id="winC" type="range" min="0" max="255" value="128"><span id="winCv" class="val">128</span></div>
-      <div class="ctl-row"><label data-i18n="winWidthLabel">Width</label><input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></div>
+      <div class="ctl-row"><label for="winC" data-i18n="winCenterLabel">Center</label><input id="winC" type="range" min="0" max="255" value="128"><span id="winCv" class="val">128</span></div>
+      <div class="ctl-row"><label for="winW" data-i18n="winWidthLabel">Width</label><input id="winW" type="range" min="1" max="255" value="255"><span id="winWv" class="val">255</span></div>
       <div class="btn-row"><button id="btnAuto" class="btn sm grow" data-i18n="btnAuto">Auto</button><button id="btnWinReset" class="btn sm grow" data-i18n="btnWinReset">Reset window</button></div>
     </div>
 
     <details class="grp" open data-sec="overlay">
       <summary><span class="chev">▶</span><span data-i18n="grpOverlay">Overlay</span><button type="button" class="grip" data-i18n-title="gripTitle" title="Drag to reorder this panel (Alt+↑/↓)"></button></summary>
       <div class="grp-body">
-        <div class="ctl-row"><label data-i18n="opacityLabel">Highlight opacity</label><input id="opacity" type="range" min="0" max="100" value="55"></div>
-        <div class="ctl-row"><label data-i18n="maskOpacityLabel">Vessel mask</label><input id="maskOpacity" type="range" min="0" max="100" value="45"></div>
+        <div class="ctl-row"><label for="opacity" data-i18n="opacityLabel">Highlight opacity</label><input id="opacity" type="range" min="0" max="100" value="55"></div>
+        <div class="ctl-row"><label for="maskOpacity" data-i18n="maskOpacityLabel">Vessel mask</label><input id="maskOpacity" type="range" min="0" max="100" value="45"></div>
       </div>
     </details>
 
@@ -80,8 +80,8 @@
         <div id="geomStats" class="ro muted geom-stats"></div>
         <div id="geomHist" class="geom-hist"></div>
         <label class="check-row"><input type="checkbox" id="geomEnable"> <span data-i18n="geomEnableLabel">Enable filter</span></label>
-        <div class="ctl-row"><label data-i18n="geomMinLabel">Min</label><input id="geomMin" type="range" min="0" max="1" value="0"><span id="geomMinV" class="val">0</span></div>
-        <div class="ctl-row"><label data-i18n="geomMaxLabel">Max</label><input id="geomMax" type="range" min="0" max="1" value="1"><span id="geomMaxV" class="val">0</span></div>
+        <div class="ctl-row"><label for="geomMin" data-i18n="geomMinLabel">Min</label><input id="geomMin" type="range" min="0" max="1" value="0"><span id="geomMinV" class="val">0</span></div>
+        <div class="ctl-row"><label for="geomMax" data-i18n="geomMaxLabel">Max</label><input id="geomMax" type="range" min="0" max="1" value="1"><span id="geomMaxV" class="val">0</span></div>
         <div id="geomCount" class="ro muted"></div>
       </div>
     </details>
@@ -89,13 +89,13 @@
     <details class="grp" data-sec="loupe">
       <summary><span class="chev">▶</span><span data-i18n="grpLoupe">Inspect loupe</span><button type="button" class="grip" data-i18n-title="gripTitle" title="Drag to reorder this panel (Alt+↑/↓)"></button></summary>
       <div class="grp-body">
-        <div class="ctl-row"><label data-i18n="loupeZoomLabel">Zoom</label><input id="loupeZoom" type="range" min="2" max="16" step="1" value="6"><span id="loupeZoomv" class="val">6</span></div>
-        <div class="ctl-row"><label data-i18n="loupeRLabel">Neighbor frames</label><input id="loupeR" type="range" min="1" max="6" step="1" value="3"><span id="loupeRv" class="val">3</span></div>
-        <div class="ctl-row"><label data-i18n="loupeSizeLabel">View size</label><input id="loupeSize" type="range" min="92" max="280" step="4" value="92"><span id="loupeSizev" class="val">92</span></div>
+        <div class="ctl-row"><label for="loupeZoom" data-i18n="loupeZoomLabel">Zoom</label><input id="loupeZoom" type="range" min="2" max="16" step="1" value="6"><span id="loupeZoomv" class="val">6</span></div>
+        <div class="ctl-row"><label for="loupeR" data-i18n="loupeRLabel">Neighbor frames</label><input id="loupeR" type="range" min="1" max="6" step="1" value="3"><span id="loupeRv" class="val">3</span></div>
+        <div class="ctl-row"><label for="loupeSize" data-i18n="loupeSizeLabel">View size</label><input id="loupeSize" type="range" min="92" max="280" step="4" value="92"><span id="loupeSizev" class="val">92</span></div>
         <label class="check-row"><input type="checkbox" id="loupeMean"> <span data-i18n="loupeMeanLabel">3×3 mean</span></label>
         <label class="check-row"><input type="checkbox" id="pinMinip" checked> <span data-i18n="pinMinipLabel">Pin minip in loupe</span></label>
         <label class="check-row"><input type="checkbox" id="pinPerfusion" checked> <span data-i18n="pinPerfusionLabel">Pin perfusion in loupe</span></label>
-        <div class="ctl-row"><label data-i18n="perfSmoothLabel">Perfusion smoothness</label><input id="perfSmooth" type="range" min="0" max="8" step="1" value="0"><span id="perfSmoothv" class="val">0</span></div>
+        <div class="ctl-row"><label for="perfSmooth" data-i18n="perfSmoothLabel">Perfusion smoothness</label><input id="perfSmooth" type="range" min="0" max="8" step="1" value="0"><span id="perfSmoothv" class="val">0</span></div>
         <label class="check-row"><input type="checkbox" id="perfMaskFilter"> <span data-i18n="perfMaskLabel">Filter by minip vessel mask</span></label>
         <div class="btn-row"><button id="btnExportPerf" class="btn sm grow" data-i18n="exportPerfusion">Export perfusion map</button></div>
         <div class="ro muted" data-i18n="loupeHoldHintShort">Hold Cmd/Ctrl to inspect (release to close; click-to-annotate still works while inspecting)</div>
@@ -172,7 +172,7 @@
             <button id="selAdd" class="btn sm grow active" data-i18n="selAdd">Select</button>
             <button id="selErase" class="btn sm grow" data-i18n="selErase">Deselect</button>
           </div>
-          <div class="ctl-row"><label data-i18n="selRadiusLabel">Radius</label><input id="selRadius" type="range" min="1" max="40" value="8"><span id="selRv" class="val">8</span></div>
+          <div class="ctl-row"><label for="selRadius" data-i18n="selRadiusLabel">Radius</label><input id="selRadius" type="range" min="1" max="40" value="8"><span id="selRv" class="val">8</span></div>
           <div class="hint muted" data-i18n="selBrushHint">Left-drag to select every segment the brush touches (uses the active class); pan with wheel/two-finger, or hold Space + left-drag.</div>
         </div>
       </div>
@@ -181,7 +181,7 @@
           <button id="brushAdd" class="btn sm grow active" data-i18n="brushAdd">Paint</button>
           <button id="brushErase" class="btn sm grow" data-i18n="brushErase">Erase</button>
         </div>
-        <div class="ctl-row"><label data-i18n="brushRadiusLabel">Radius</label><input id="brushRadius" type="range" min="1" max="40" value="6"><span id="brushRv" class="val">6</span></div>
+        <div class="ctl-row"><label for="brushRadius" data-i18n="brushRadiusLabel">Radius</label><input id="brushRadius" type="range" min="1" max="40" value="6"><span id="brushRv" class="val">6</span></div>
         <label class="check-row"><input type="checkbox" id="brushOnmask"> <span data-i18n="brushOnmaskLabel">Foreground only (within vessel mask)</span></label>
         <div class="hint muted" data-i18n="brushHint">Left-drag = paint (uses the active class’s color); pan with wheel/two-finger, or hold Space + left-drag.</div>
       </div>
@@ -275,16 +275,16 @@
   </div>
 </div>
 
-<script src="./js/i18n.js?v=104"></script>
-<script src="./js/npy.js?v=104"></script>
-<script src="./js/fs.js?v=104"></script>
-<script src="./js/loader.js?v=104"></script>
-<script src="./js/canvas.js?v=104"></script>
-<script src="./js/state.js?v=104"></script>
-<script src="./js/loupe.js?v=104"></script>
-<script src="./js/perfusion.js?v=104"></script>
-<script src="./js/dataformat.js?v=104"></script>
-<script src="./js/app.js?v=104"></script>
-<script src="./js/raillayout.js?v=104"></script>
+<script src="./js/i18n.js?v=105"></script>
+<script src="./js/npy.js?v=105"></script>
+<script src="./js/fs.js?v=105"></script>
+<script src="./js/loader.js?v=105"></script>
+<script src="./js/canvas.js?v=105"></script>
+<script src="./js/state.js?v=105"></script>
+<script src="./js/loupe.js?v=105"></script>
+<script src="./js/perfusion.js?v=105"></script>
+<script src="./js/dataformat.js?v=105"></script>
+<script src="./js/app.js?v=105"></script>
+<script src="./js/raillayout.js?v=105"></script>
 </body>
 </html>

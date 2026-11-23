@@ -21,6 +21,7 @@ Mark collateral vessel segments on DSA frames, right in the browser. Your files 
 3. Open the new `annotator_dataset_<date>-<time>` folder in the annotator.
 
 `case_mapping.csv` in that folder says which DICOM each case came from. The first run downloads the vessel model (about 0.9 GB); after that it is cached.
+Leave the new folder where it is until the run has finished: if it is moved, renamed or replaced while the run is working, the run stops and says so (what it had written stays in the folder the run started in; the unit being written at that moment may be incomplete there).
 
 ## 2 · Open a data folder
 
@@ -70,7 +71,7 @@ Choose a tool in the right panel. Every mark gets the active class.
 ![Paint](docs/media/paint.gif)
 
 - **Paint**: drag to colour pixels. **Erase** removes paint.
-- **Foreground only**: paint lands only on the vessel mask.
+- **Foreground only**: paint lands only on the vessel mask. A frame without a readable `mask.npy` has no mask to limit the brush: there paint lands wherever you drag.
 - **Radius** sets the brush size. Marking a segment clears any paint on it.
 
 With Brush or Paint, hold **Space** while dragging to pan.
@@ -91,7 +92,7 @@ With Brush or Paint, hold **Space** while dragging to pan.
 
 ![Inspect loupe](docs/media/loupe.gif)
 
-**Copy from another frame** — on a frame with no marks yet, click **Copy from another frame…**, then the source frame in the list (**Esc** cancels). Marks are matched to this frame's own segments; all layers are copied.
+**Copy from another frame** — on a frame with no marks and no numbered markers yet (a note or a star does not matter), click **Copy from another frame…**, then the source frame in the list (**Esc** cancels). Marks are matched to this frame's own segments; all layers are copied.
 
 ![Copy from another frame](docs/media/copy.gif)
 
@@ -114,7 +115,7 @@ With Brush or Paint, hold **Space** while dragging to pan.
   | `note.json` | note text and markers |
   | `classes.json` | class names (colours stay in your browser) |
 
-- If a file was changed elsewhere (another computer, a colleague), nothing is overwritten: you choose which version to keep, and the other one is kept as a backup.
+- If a frame's file was changed elsewhere (another computer, a colleague, another program) since this browser last read or saved it, it is not overwritten: you choose which version to keep, and the other one is kept as a backup file. Tabs of the same browser take turns when they save. What the app cannot see is a change that reaches the folder in the moment between its last look at a file and its own write — from another computer, another browser or program, or a sync that is still on its way; there the later save replaces the earlier one. So two people should not annotate the same frame at the same time.
 
 ## 6 · Other panels
 
@@ -127,7 +128,7 @@ With Brush or Paint, hold **Space** while dragging to pan.
 | **Settings** | **Coordinate order**: x,y or y,x in the saved files. **Auto-save** on or off. **Reset panel order**. |
 | **Help / Legend** | Colour legend and the full **Data format…** page. |
 
-Click a panel's title to fold it; drag its **≡** handle to reorder (remembered in this browser). **\\** hides the left sidebar; **⊟** in the top bar hides the right panel.
+A panel with **▶** before its title folds when you click the title, and its **≡** handle drags it to another place (remembered in this browser); Contrast is always open. **\\** hides the left sidebar; **⊟** in the top bar hides the right panel.
 
 ## Keyboard
 
@@ -159,7 +160,7 @@ Click a panel's title to fold it; drag its **≡** handle to reorder (remembered
 └─ s_1/ …
 ```
 
-- Folder names must contain a number (`s_0`, `case_12`, `7`); other folders are skipped.
+- A case or frame folder is recognised by the number in its name: all digits (`7`), ending in `_<number>` (`s_0`, `case_12`) or starting with `<number>_` (`12_patient`). Other names, such as `case3`, are skipped. The one exception is a frame folder named exactly `minip`, which is loaded too.
 - `frames.png`, `label.npy` and `mask.npy` of a frame must have the same size.
 
-Full specification (it also works as a prompt for an AI agent): **[docs/data-format.md](docs/data-format.md)**. The same text is in the app under **Help / Legend → Data format…**.
+Full specification (it also works as a prompt for an AI agent): **[docs/data-format.md](docs/data-format.md)**. The app has its own copy under **Help / Legend → Data format…**.

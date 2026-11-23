@@ -41,6 +41,7 @@
                      // test (annotation.json is newer than our last edit) otherwise mistakes OUR OWN write for
                      // someone else's and reverts the doctor's newest edits to a sidecar — or, when those edits
                      // left the frame empty (Clear / un-star), silently and with no sidecar at all.
+  let knownSig = {}; // caseUnit -> { a, n } : fingerprints of the frame's two files as app.js last knew them (see setKnownSig)
   let paintR = {};   // caseUnit -> RLE object (row-run-length paint mask, compact; dense never stored here)
   // ---- LAYERS (per-frame). The layered content (selections/points/paintR) is bucketed by lkey = caseUnit#layerId
   // (layer 0 has NO suffix, so single-layer data is byte-identical to the pre-layers format). note/markers/star/dirty
@@ -61,6 +62,17 @@
   let classColors = {};     // classIndex -> hex (UI only, not in annotation.json)
   let activeClass = null;   // active class index for new clicks (null = unclassified)
   let datasetId = null;     // id of the dataset the per-unit state above belongs to (guards cross-folder leakage)
+  // Who vouches for unsaved work. The key above is not proof that a record belongs to the folder that is open:
+  // a copy of a folder carries the same id file, and a key can pass from one folder to another (the id file was
+  // deleted, the browser's book of folders could not be read…). The book gives every folder it knows a token of
+  // its own; a frame's unsaved work is stored with the token of the session it was made in, and when it comes
+  // back from the store it is taken at its word only under that same token. Anything else that comes back —
+  // no token (an older version of the app, a session nothing vouched for) or another one — is FOREIGN: shown,
+  // kept, and asked about before it is written into the folder (app.js: FOREIGN).
+  let owner = null;         // the open folder's token (null: nothing vouches for this session)
+  let stampOf = {};         // caseUnit -> the token the frame's unsaved work was made under ('' : none)
+  let restored = {};        // caseUnit -> true: unsaved work read back from the store, not yet weighed
+  let foreign = {};         // caseUnit -> true: unsaved work that came back without this folder's token
   let onPersistFail = null, quotaWarned = false;   // localStorage-full handler + one-shot latch
 
   const key = (c, u) => c + '/' + u;
@@ -129,6 +141,11 @@
       if (k in notes) rec.n = notes[k];
       if (k in noteMarkers) rec.m = noteMarkers[k];
       if (unitLayers[k]) rec.ly = unitLayers[k];
+      if (knownSig[k]) rec.k = knownSig[k];
+      // The token goes with work made (or kept) under it. Work that came back under ANOTHER token keeps that
+      // one as long as this session has not touched it — it is still exactly what its own folder left behind —
+      // and loses it with the first change made here: from then on nobody vouches for it.
+      if (stampOf[k] && (stampOf[k] === owner || (foreign[k] && !dirtySeq[k]))) rec.o = stampOf[k];
     }
     if (visited[k]) rec.v = 1;
     if (editedAt[k]) rec.e = editedAt[k];
@@ -218,6 +235,8 @@
         if ('m' in rec && Array.isArray(rec.m)) noteMarkers[k] = rec.m;
         if (Array.isArray(rec.ly) && rec.ly.length) unitLayers[k] = rec.ly;
         if (Number.isFinite(rec.al)) activeLayerByUnit[k] = rec.al;
+        if (rec.d && rec.k && typeof rec.k === 'object') knownSig[k] = { a: typeof rec.k.a === 'string' ? rec.k.a : undefined, n: typeof rec.k.n === 'string' ? rec.k.n : undefined };
+        if (rec.d) { stampOf[k] = typeof rec.o === 'string' ? rec.o : ''; restored[k] = true; }
         n++;
       } catch (e) { }                        // one corrupt record must not abort recovery of the rest
     }
@@ -274,24 +293,62 @@
   // another tab writing a DIFFERENT dataset's records no longer clobbers this one's crash copy)
   const isMirrorKey = k => !!(datasetId && typeof k === 'string' && k.startsWith(dprefix(datasetId)));
   const getDatasetId = () => datasetId;
+  // Does the store still hold anything under this key? (A key that does is never given to another folder.)
+  function hasMirror(id) {
+    if (!id) return false;
+    const pfx = dprefix(id);
+    try { for (let i = 0; i < localStorage.length; i++) { const kk = localStorage.key(i); if (kk && kk.startsWith(pfx)) return true; } }
+    catch (e) { return true; }               // it cannot be looked at: not known to be empty
+    return false;
+  }
+  // The session's token is known (or known to be missing): weigh what came back from the store.
+  function setOwner(tok) {
+    owner = (typeof tok === 'string' && tok) ? tok : null;
+    for (const k of Object.keys(restored)) { if (dirty[k] && (!owner || stampOf[k] !== owner)) foreign[k] = true; }
+    restored = {};
+    // …and what was weighed while nothing could vouch for the session — the book of folders could not be read
+    // when the folder was opened — is weighed again once something can: work that carries this very folder's
+    // token is the folder's own after all. (It stayed "not vouched for" until the page was loaded again, and was
+    // asked about although nobody else had ever had it.)
+    if (owner) for (const k of Object.keys(foreign)) { if (stampOf[k] === owner) { delete foreign[k]; if (dirty[k]) { staleUnits.add(k); schedulePersist(); } } }
+  }
+  const isForeign = k => !!(dirty[k] && foreign[k]);
+  // The doctor chose to keep this unsaved work for the folder that is open: it is this session's from here on.
+  // (Returns what has to be handed to disownUnit to take the step back, or undefined when there was nothing to
+  // claim.)
+  function claimUnit(k) {
+    if (!foreign[k]) return undefined;
+    const was = stampOf[k] || '';
+    delete foreign[k];
+    if (dirty[k]) { stampOf[k] = owner || ''; staleUnits.add(k); schedulePersist(); }
+    return was;
+  }
+  // …and the way back, for a choice that was given up before anything was written (app.js: resolveConflictInner).
+  function disownUnit(k, was) {
+    if (was === undefined || !dirty[k]) return;
+    foreign[k] = true; stampOf[k] = was; staleUnits.add(k); schedulePersist();
+  }
   // Point per-unit state at a dataset. In-memory state is wiped so one folder's unsaved (dirty)
   // annotations can never render on / be written into another folder that reuses the same
   // case_N/frame_M names — but the outgoing dataset's mirror RECORDS survive (parked under its own
   // key prefix, pruned to the 2 newest datasets), and the incoming dataset's surviving records are
   // loaded back in: switching back to a folder now recovers its unsaved edits exactly like a reload.
   // Global prefs (window, loupe, colors…) are kept.
-  function switchDataset(newId) {
-    if (datasetId === newId) return { switched: false, hadDirty: false };
+  function switchDataset(newId, tok) {
+    if (datasetId === newId) { setOwner(tok); return { switched: false, hadDirty: false }; }
     flushPersist();                    // pending records belong to the OUTGOING dataset — land them under its prefix first
     const hadDirty = Object.keys(dirty).length > 0;
     const prev = datasetId;
     selections = {}; visited = {}; points = {}; notes = {}; noteMarkers = {};
     dirty = {}; editedAt = {}; starred = {}; writtenAt = {}; paintR = {}; unitLayers = {}; activeLayerByUnit = {}; undoStack.length = 0; undoBytes = 0;
+    knownSig = {};   // describes the OTHER dataset's files; the incoming dataset's own come back with its records below
+    stampOf = {}; restored = {}; foreign = {}; owner = null;
     dirtySeq = {};   // REVIEW FIX MEM-7: the ONE per-unit map this wipe used to miss — which is exactly why a cross-dataset markClean could pass its seq guard (see R2)   // writtenAt describes the OTHER dataset's files — a frame of the same name here must never inherit it
     staleUnits.clear();                // anything still marked stale is foreign now
     quotaBlocked.clear();              // ROUND-4/NSL-5: keyed by bare case/frame names, which the next dataset reuses — a blocked key carried over would silently skip a DIFFERENT study's frame
     datasetId = newId;
     if (newId) loadUnits(newId);       // switch-back / second-tab recovery: adopt this dataset's surviving mirror
+    setOwner(tok);
     if (newId) datasets[newId] = Date.now();
     const keep = new Set([newId, prev].filter(Boolean).map(id => dprefix(id)));
     try {
@@ -568,11 +625,22 @@
 
   const isDirty = (c, u) => !!dirty[key(c, u)];
   let dirtySeq = {};   // per-unit edit counter (session-only): lets an async writer detect edits made while it was writing
-  function markDirty(c, u) { const k = key(c, u); dirty[k] = true; dirtySeq[k] = (dirtySeq[k] || 0) + 1; editedAt[k] = Date.now(); persistUnit(c, u); }
+  function markDirty(c, u) { const k = key(c, u); if (!dirty[k]) stampOf[k] = owner || ''; dirty[k] = true; dirtySeq[k] = (dirtySeq[k] || 0) + 1; editedAt[k] = Date.now(); persistUnit(c, u); }
   const getDirtySeq = (c, u) => dirtySeq[key(c, u)] || 0;
   const getEditedAt = (c, u) => editedAt[key(c, u)] || 0;          // 0 = unknown (pre-feature data): callers must stay conservative
   const dirtyCount = () => Object.keys(dirty).length;              // frames with edits not yet on disk
   const getWrittenAt = (c, u) => writtenAt[key(c, u)] || 0;
+  // What app.js last knew a frame's two FILES to contain — a fingerprint each (a: annotation.json, n: note.json),
+  // by "case/unit" key. It is stored with a frame's UNSAVED work and only with that: after a reload it is what
+  // tells a file somebody else changed from the file this session last saw. A saved frame needs none, its file
+  // is simply read again.
+  function setKnownSig(k, a, n) {
+    const was = knownSig[k];
+    if (was && was.a === a && was.n === n) return;
+    knownSig[k] = { a, n };
+    if (dirty[k]) { staleUnits.add(k); schedulePersist(); }
+  }
+  const getKnownSig = k => knownSig[k] || null;
   // Record that the file on disk carries OUR content as of `ms` — ideally the FILE's own lastModified read
   // back after the write, because on Google Drive the file's timestamp and this machine's clock can differ by
   // more than the ±2 s margin the reconcile allows. Called on every successful write, NOT only when the unit
@@ -589,6 +657,7 @@
   function markClean(c, u, seq, ms) {
     if (seq !== undefined && (dirtySeq[key(c, u)] || 0) !== seq) return false;
     delete dirty[key(c, u)];
+    delete stampOf[key(c, u)]; delete foreign[key(c, u)]; delete restored[key(c, u)];
     writtenAt[key(c, u)] = (Number.isFinite(ms) && ms > 0) ? ms : Date.now();   // State and the file agree as of ms
     persistUnit(c, u); persistNow();                                // see noteWritten: the write stamp must never sit in a pending timer
     return true;
@@ -881,7 +950,8 @@
     selectedClicks, selectedSegs, usedClasses, pointList, pointItems, pointCount, markCount, applyClass, addPoint, removePoint, undo, peekUndo,
     getActiveClass, setActiveClass, getClassColor, setClassColor, hasNote, getNote, setNote, importNote,
     markerList, nextMarkerId, addMarker, removeMarker, hasNoteData, buildNote, importNoteJson,
-    isDirty, markDirty, markClean, getDirtySeq, getEditedAt, getWrittenAt, noteWritten, dirtyCount, isMirrorKey, resetUnit, isStarred, setStarred, caseStarred,
+    isDirty, markDirty, markClean, getDirtySeq, getEditedAt, getWrittenAt, noteWritten, setKnownSig, getKnownSig, dirtyCount, isMirrorKey, resetUnit, isStarred, setStarred, caseStarred,
+    isForeign, claimUnit, disownUnit, hasMirror,
     getTool, setTool, getBrush, setBrush, getClickMode, setClickMode, getMagSnap, setMagSnap, getGeomFilter, setGeomFilter, getPerfSmooth, setPerfSmooth, getPerfMask, setPerfMask, getSelBrush, setSelBrush, brushSeg, pushSegBatchUndo, removePointsInCircle, pushPointBatchUndo,
     hasPaint, paintDims, paintDense, setPaintDense, pushPaintUndo, applyPaintUndoOffscreen, usedClassesInPaint, unknownPaintEncodings, decodeRLE: rleDecode,
     clearUnit, markVisited, isVisited, importAnnotation, annotationDropped, buildAnnotation, annotationEmpty, unitsWithData, unitHasContent, unitHasLayerContent, unitAnnotated, key,

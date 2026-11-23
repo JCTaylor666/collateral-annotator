@@ -23,6 +23,7 @@ ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardw
 const CACHE = 'dsa-vessel-seg-models-v1';      // shared with the vessel-segmentation page on the same site
 const sessions = new Map();
 let ep = null, PH = 896, PW = 768, cancelled = false;
+let download = null;      // while models are being fetched: the AbortController of that download, so Stop can end it
 const post = (msg, transfer) => self.postMessage(msg, transfer || []);
 
 // ---------------------------------------------------------------- models
@@ -32,7 +33,7 @@ async function sha256Hex(bytes) {
   return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function fetchModel(m, report) {
+async function fetchModel(m, report, signal) {
   let cache = null;
   try { cache = await caches.open(CACHE); } catch (e) { cache = null; }
   if (cache) {
@@ -46,7 +47,7 @@ async function fetchModel(m, report) {
       }
     } catch (e) { /* fall through to the network */ }
   }
-  const res = await fetch(m.url, { mode: 'cors' });
+  const res = await fetch(m.url, signal ? { mode: 'cors', signal } : { mode: 'cors' });
   if (!res.ok) throw new Error(`Model download failed: HTTP ${res.status} from ${m.url}`);
   const reader = res.body.getReader();
   const chunks = []; let loaded = 0;
@@ -93,21 +94,31 @@ async function load({ id, models, patch, prefer }) {
   const todo = models.filter((m) => !sessions.has(m.key));
   const total = todo.reduce((s, m) => s + (m.size || 0), 0);
   let before = 0;
-  for (let i = 0; i < todo.length; i++) {
-    const m = todo[i];
-    let lastPost = 0;
-    const bytes = await fetchModel(m, (loaded, phase) => {
-      const now = performance.now();
-      if (phase === 'cache' || now - lastPost > 100) {
-        post({ type: 'progress', id, phase, key: m.key, index: i + 1, count: todo.length, loaded: before + loaded, total });
-        lastPost = now;
-      }
-    });
-    post({ type: 'progress', id, phase: 'compile', key: m.key, index: i + 1, count: todo.length, loaded: before + bytes.byteLength, total });
-    const session = await createSession(bytes, prefer);
-    sessions.set(m.key, { session, input: session.inputNames[0], output: session.outputNames[0] });
-    before += m.size || bytes.byteLength;
-  }
+  // Stop during the download ends it at once (it used to run to its end first: minutes on a slow line). A model
+  // that was cut off is not kept; the ones that were complete stay loaded for the next run.
+  download = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  try {
+    for (let i = 0; i < todo.length; i++) {
+      if (cancelled) throw new Error('cancelled');
+      const m = todo[i];
+      let lastPost = 0;
+      const bytes = await fetchModel(m, (loaded, phase) => {
+        const now = performance.now();
+        if (phase === 'cache' || now - lastPost > 100) {
+          post({ type: 'progress', id, phase, key: m.key, index: i + 1, count: todo.length, loaded: before + loaded, total });
+          lastPost = now;
+        }
+      }, download && download.signal);
+      if (cancelled) throw new Error('cancelled');
+      post({ type: 'progress', id, phase: 'compile', key: m.key, index: i + 1, count: todo.length, loaded: before + bytes.byteLength, total });
+      const session = await createSession(bytes, prefer);
+      sessions.set(m.key, { session, input: session.inputNames[0], output: session.outputNames[0] });
+      before += m.size || bytes.byteLength;
+    }
+  } catch (e) {
+    if (cancelled) throw new Error('cancelled');      // the download was cut off by Stop (it ends with an AbortError)
+    throw e;
+  } finally { download = null; }
   post({ type: 'ready', id, ep, threads: ort.env.wasm.numThreads, loaded: [...sessions.keys()] });
 }
 
@@ -258,7 +269,8 @@ async function processDicom({ id, file, crop, minip, mirror, keys, skipUnits }) 
 
 self.onmessage = async (e) => {
   const m = e.data;
-  if (m.type === 'cancel') { cancelled = true; return; }
+  if (m.type === 'cancel') { cancelled = true; if (download) download.abort(); return; }
+  if (m.type === 'load') cancelled = false;          // a Stop from before this request belonged to an earlier one
   try {
     await libsReady;
     if (m.type === 'load') await load(m);

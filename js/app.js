@@ -104,6 +104,7 @@
   let retryTimer = null;                      // the single timer that drives retryQ
   const ownWriteAt = new Map();               // State.key() -> ms of OUR last successful annotation write: a file mtime ≤ this+margin is our own write, never "externally newer"
   const lastSeenMtime = new Map();            // State.key() -> annotation.json mtime at our last reconcile: unchanged mtime on a clean revisit ⇒ skip the reset (preserves undo history)
+  const lastSeenSig = new Map();              // State.key() -> { ann, note }: what each file CONTAINED when this session last read or wrote it (see diskMovedOn)
   const prefetchCold = new Set();             // cache keys inserted by PREFETCH and never yet viewed — evicted before anything the user actually looked at
   let cacheCap = 64;                          // LRU capacity — BYTE-aware: min(count formula, ~900MB ÷ real per-frame bytes), refined as frames load
   let maxSeqLen = 0;                          // largest sequence (frame count) in the open dataset
@@ -385,32 +386,201 @@
 
   // A stable per-dataset id lives in a hidden .annotator_dataset.json at the folder root, so
   // localStorage state can be tied to the dataset it came from (never bleed across folders that
-  // reuse case_N/frame_M names). Read it; create it on first open. Best-effort: if it can't be
-  // written (no permission yet), fall back to a folder-name id for this session.
-  async function ensureDatasetId(root) {
-    const FNAME = '.annotator_dataset.json';
-    let fh = null;
-    // REVIEW FIX F3'/SWG-4: this catch used to swallow EVERY error as "truly absent", so one transient
-    // Drive/permission failure minted a fresh uuid and OVERWROTE the folder's real identity — orphaning
-    // its whole localStorage mirror. Only NotFoundError means absent; anything else means "it is there,
-    // we just could not look at it", and we must not create or overwrite.
-    try { fh = await root.getFileHandle(FNAME); }
+  // reuse case_N/frame_M names). Read it; create it on first open.
+  // One look at the id file:
+  //   { id }           the folder's id
+  //   { absent }       there is no id file
+  //   { unreadable }   it is there and cannot be READ at this moment (a Drive or permission hiccup): no verdict
+  //   { damaged }      it is there, it can be read, and it gives no id — damaged; or still being written: a file
+  //                    exists, EMPTY, from the moment another writer creates it until that write is closed
+  async function lookDatasetId(root) {
+    let fh;
+    try { fh = await root.getFileHandle('.annotator_dataset.json'); }
+    catch (e) { return (e && e.name === 'NotFoundError') ? { absent: true } : { unreadable: true }; }
+    let text;
+    try { text = await (await fh.getFile()).text(); }
+    catch (e) { return { unreadable: true }; }
+    try {
+      const o = JSON.parse(text);
+      if (o && typeof o.id === 'string' && o.id) return { id: o.id };
+    } catch (e) { /* readable, no id to be had from it */ }
+    return { damaged: true };
+  }
+  // What the folder's id file says, settled among the tabs of this browser. Never throws. Returns
+  //   { id }                  the id in the file (made here when there was none)
+  //   { named: 'name:…' }     no id can be had from the file for good (damaged), or none could be written (no
+  //                           permission yet): the folder's NAME stands in, as it always has — never written over
+  //                           (REVIEW FIX F3'/SWG-4: a failure must not mint over the folder's real identity)
+  //   { unreadable, error }   nothing can be said just now: the file cannot be read at this moment, or another
+  //                           tab has been at it for longer than the wait
+  // No id at first sight is settled inside the lock, where no other tab is in the middle of making one: a tab
+  // that met the file while another tab was still writing it used to go on under the folder's name, the other
+  // tab under the id it wrote — and unsaved work filed under the name was not found again.
+  // A file that cannot be READ is not taken for a damaged one any more: under the folder's name its unsaved work
+  // was filed where the next, successful reading did not look for it — and two folders of one name, both
+  // unreadable for a moment, were given each other's.
+  async function datasetIdOf(root) {
+    const FNAME = '.annotator_dataset.json', named = { named: 'name:' + (root.name || 'unknown') };
+    const first = await lookDatasetId(root);
+    if (first.id) return first;
+    const settle = async () => {
+      const now = await lookDatasetId(root);
+      if (now.id || now.unreadable) return now;
+      if (now.damaged) return named;
+      const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
+      try { await FS.writeText(root, FNAME, JSON.stringify({ id, created: new Date().toISOString() }, null, 2)); }
+      catch (e) { return named; }                  // cannot be written (no permission yet): the name stands in
+      // a writer this lock does not reach (another browser) may have written in the same instant: the id that
+      // is IN the file is the folder's id
+      const back = await lookDatasetId(root);
+      return { id: back.id || id };
+    };
+    try { return await siteLock('identity', settle, root.name || ''); }
     catch (e) {
-      if (!(e && e.name === 'NotFoundError')) return 'name:' + (root.name || 'unknown');
+      // Our turn did not come: another tab has been at this folder's id for longer than the wait. Making one
+      // here all the same, outside the lock, is how one folder got two ids. Look once more — the other tab may
+      // be done.
+      const again = await lookDatasetId(root);
+      return again.id ? again : { unreadable: true, error: e };
     }
-    if (fh) {
-      // File EXISTS. If it parses, use its id. If it's present-but-unreadable (corrupt, or a transient
-      // Google-Drive sync glitch), return a STABLE name-based id and DON'T overwrite it with a fresh
-      // random id — minting a new id here would make switchDataset wipe all unsaved state.
+  }
+
+  // ---- which key the folder's unsaved work is filed under ------------------------------------------------
+  // The id in the folder's file is not enough to say WHICH folder this is: a copy carries the same file. Opened
+  // first after a reload (or in a new tab), the copy was shown the original's unsaved work, and a save — or the
+  // automatic one, with no click at all — wrote it into the copy's files. The browser keeps a book of the
+  // folders it has had open (FS.folderBook: directory handles, compared with isSameEntry), and the key is
+  // decided by the folder itself:
+  //   * this very folder was open here before  -> the key it had then — also when its id file cannot be read
+  //     or is damaged today (so trouble with that file neither blocks the folder nor hides its unsaved work).
+  //     Only a NEW id in the file moves it to a new key: the file was deleted (the documented way to start the
+  //     browser's side afresh) or replaced. The key it leaves stays taken (a row marked `gone`): what is still
+  //     filed under it is not handed to the next folder that comes with the old id — a copy made before.
+  //   * a folder this browser has not seen     -> the key its id gives, unless that key is taken here: then it
+  //     is a copy (or cannot be told from one) and gets a key of its own.
+  //   * no id to be had and not known here     -> the open fails with its message, and can be tried again.
+  // The key is WRITTEN DOWN only when the folder is really opened ({ claim }): the look that comes first — it
+  // decides whether unsaved work has to be asked about — writes nothing. (It used to: a pick that was then
+  // cancelled left a row behind, and enough of those pushed the folder that was open out of the book.) Rows are
+  // dropped oldest first, and never one whose key still holds something in this browser.
+  // A row carries a token of its own (tok). Unsaved work is stored with the token of the session it was made
+  // in, and what comes back from the store is this folder's WITHOUT ASKING only under that token (State.
+  // isForeign; FOREIGN, further down). So the cases where the book cannot say whose a key is do no harm:
+  //   * no book (no IndexedDB), a book that cannot be read or written just now, or a row that cannot be compared
+  //     with the folder: the key is what the id file says, as it was before there was a book, nothing is written
+  //     down, and nothing vouches for the session (tok: null) — unsaved work that comes back is asked about, and
+  //     what the session leaves behind is asked about the next time;
+  //   * work kept by a version of the app that had no book is filed under the id alone and carries no token:
+  //     the first folder that comes with that id finds it, and is asked before any of it is written.
+  const BOOK_MAX = 64, BOOK_STEP_MS = 4000;
+  const isNameKey = k => typeof k === 'string' && k.indexOf('name:') === 0;
+  const newToken = () => (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('t-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
+  // One step of the book, with an end: a database that does not answer must not hold the lock — and with it
+  // every other tab's Open — for good. (What answers after that is not waited for and not used.)
+  const bookStep = fn => new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(Object.assign(new Error('the book of folders does not answer'), { silent: true })), BOOK_STEP_MS);
+    Promise.resolve().then(fn).then(v => { clearTimeout(t); resolve(v); }, e => { clearTimeout(t); reject(e); });
+  });
+  // The rows of the book, or null: it cannot be read (one read that fails is no verdict — three tries).
+  async function readBook(book) {
+    for (let i = 0; i < 3; i++) {
+      try { return (await bookStep(() => book.all())) || []; }
+      catch (e) { if (i >= 2 || (e && e.silent)) return null; await new Promise(r => setTimeout(r, 120)); }
+    }
+    return null;
+  }
+  // Is the folder of this row the folder that was picked? true / false / null (it could not be asked: that is
+  // not "another folder")
+  async function sameFolderSure(a, b) {
+    if (!(a && b && typeof a.isSameEntry === 'function')) return false;
+    for (let i = 0; i < 2; i++) { try { return !!(await bookStep(() => a.isSameEntry(b))); } catch (e) { } }
+    return null;
+  }
+  // What the book says about this folder; nothing is written. null: it cannot be said (a row could not be
+  // compared with the folder). Otherwise { mine, moved, key, base, fileId } — key: null when the folder is not
+  // known here and its id file says nothing.
+  async function lookInBook(rows, root, info) {
+    let mine = null, unsure = false;
+    for (const r of rows) {
+      if (!r || r.gone || !r.handle) continue;
+      const same = await sameFolderSure(r.handle, root);
+      if (same === true) { mine = r; break; }
+      if (same === null) unsure = true;
+    }
+    if (!mine && unsure) return null;
+    const taken = k => rows.some(r => r && r !== mine && r.key === k);
+    const freeFrom = base => { if (!taken(base)) return base; for (let n = 2; ; n++) { if (!taken(base + '~' + n)) return base + '~' + n; } };
+    const fileId = info.id || info.named || null;
+    if (!mine) return { mine: null, moved: false, key: fileId ? freeFrom(fileId) : null, base: fileId, fileId };
+    if (isNameKey(mine.base)) return { mine, moved: false, key: mine.key, base: info.id || mine.base, fileId: fileId || mine.base };   // filed under its name, and it has an id now: the key stays
+    let idNow = info.id || null;
+    // The file says another id than the one written down. That is read once more HERE, where no other tab is in
+    // the middle of this folder: the id that was handed in may be older than a step another tab has just taken.
+    if (idNow && idNow !== mine.base) { const again = await lookDatasetId(root); idNow = again.id || null; }
+    const moved = !!(idNow && idNow !== mine.base);
+    return { mine, moved, key: moved ? freeFrom(idNow) : mine.key, base: moved ? idNow : mine.base, fileId: moved ? idNow : (fileId || mine.base) };
+  }
+  // opts.claim: the folder is being opened — write the key down. opts.remint: it is a copy of the folder that is
+  // open and not known here — it is given an id file of its own first (see remintDatasetId).
+  // Returns { key, fileId, known, tok, reminted, firm } — firm: the book was read and the folder looked up in it
+  // (false: the key is only what the id file says).
+  async function folderKeyFor(root, info, opts) {
+    const o = opts || {};
+    const unread = () => new Error(I18n.t('idUnreadable', { name: root.name || '?' }));
+    const book = FS.folderBook;
+    const plain = async () => {
+      let fileId = info.id || info.named || null, reminted = false;
+      // (without a book nothing but the id file tells two folders apart: a copy that cannot be given its own is
+      // not opened — the open fails with its message, as before)
+      if (o.claim && o.remint) { fileId = await remintDatasetId(root, fileId); reminted = true; }
+      if (!fileId) throw unread();
+      return { key: fileId, fileId, known: false, tok: null, reminted, firm: false };
+    };
+    if (!book) return plain();
+    return siteLock('folders', async () => {
+      const rows = await readBook(book);
+      if (!rows) return plain();
+      // The id that was handed in was read when the folder was picked; listing the folder's cases has taken its
+      // time since. What is written down is what the id file says NOW. (A file that was replaced meanwhile — it
+      // names another dataset by now — was written down, and the folder opened, under the id it no longer has:
+      // the unsaved work kept for that id came back and was saved into it.)
+      // (Only for the look into the book: a copy of the open folder is still given its own id "instead of the
+      // one it came with" — the id that was handed in — so that of two tabs opening it together the second takes
+      // the id the first one wrote.)
+      let seen = info;
+      if (o.claim && info.id) { const now = await lookDatasetId(root); if (now.id && now.id !== info.id) seen = { id: now.id }; }
+      let at = await lookInBook(rows, root, seen), reminted = false;
+      if (!at) return plain();
+      if (o.claim && o.remint && !at.mine) {
+        // (decided again in here: another tab may have opened this very folder since the first look — it is
+        // known then, has its key, and is left as it is. One step among the tabs, so two of them cannot give
+        // the same copy two ids, nor move its key from under each other.)
+        try {
+          const fresh = await remintDatasetId(root, info.id || info.named || null);
+          const again = await lookInBook(rows, root, { id: fresh });
+          if (again) { at = again; reminted = true; }
+        } catch (e) { /* the copy cannot be given an id file of its own (it cannot be written, or read just now): the book keeps the two apart all the same */ }
+      }
+      if (!at.key) throw unread();
+      if (!o.claim) return { key: at.key, fileId: at.fileId, known: !!at.mine, tok: null, reminted: false, firm: true };
+      const now = Date.now();
+      const kept = (at.mine && !at.moved && typeof at.mine.tok === 'string' && at.mine.tok) ? at.mine.tok : null;
+      const tok = kept || newToken();
+      let written = false;
       try {
-        const o = JSON.parse(await (await fh.getFile()).text());
-        if (o && typeof o.id === 'string' && o.id) return o.id;
-      } catch (e) { /* present but unparseable */ }
-      return 'name:' + (root.name || 'unknown');
-    }
-    const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
-    try { await FS.writeText(root, FNAME, JSON.stringify({ id, created: new Date().toISOString() }, null, 2)); return id; }
-    catch (e) { return 'name:' + (root.name || 'unknown'); }
+        if (at.moved) await bookStep(() => book.put({ key: at.mine.key, gone: true, name: at.mine.name || '', at: now }));
+        await bookStep(() => book.put({ key: at.key, base: at.base, handle: root, name: root.name || '', at: now, tok }));
+        written = true;
+        const others = rows.filter(r => r && r !== at.mine && r.key !== at.key).sort((x, y) => (y.at || 0) - (x.at || 0));
+        for (const r of others.slice(BOOK_MAX - 1)) {
+          if (r.key === State.getDatasetId() || State.hasMirror(r.key)) continue;      // something is still filed under it: it stays taken
+          await bookStep(() => book.del(r.key));
+        }
+      } catch (e) { /* not written down: the next open decides again, from the same facts */ }
+      // (a row that was already there vouches for the folder even when touching it failed just now; a NEW row —
+      // or a new token — that did not get into the book vouches for nothing)
+      return { key: at.key, fileId: at.fileId, known: !!at.mine, tok: (written || kept) ? tok : null, reminted, firm: true };
+    }, '');
   }
 
   // Are these two picks literally the same directory? The ONLY authority on folder identity that the
@@ -419,11 +589,25 @@
     try { return !!(a && b && a.isSameEntry && await a.isSameEntry(b)); } catch (e) { return false; }
   }
   // Give a folder its own identity when the one it carries is already in use by a DIFFERENT folder.
-  async function remintDatasetId(root) {
-    const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
-    try { await FS.writeText(root, '.annotator_dataset.json', JSON.stringify({ id, created: new Date().toISOString(), reminted: true }, null, 2)); }
-    catch (e) { /* could not persist it — the session-local id still keeps the two datasets apart */ }
-    return id;
+  // One step among the tabs of this browser, like making the first id: two tabs that opened the same copied
+  // folder at the same moment each gave it a new id — the folder kept one, the other tab's unsaved work went
+  // under an id nobody finds again. Whoever comes second takes the id the first one wrote. (oldId: the id the
+  // copy came with — the one that must go.)
+  // An id that is not IN the folder is no id: when the file cannot be read at this moment (it could, a moment
+  // ago) or the new id cannot be written, the folder is not opened now — the open fails with its message and
+  // can be tried again. (It used to be opened under an id only this session knew; unsaved work filed under it
+  // was not found on the next visit. And a read that failed was taken for "no file", and the id another tab
+  // had just written was written over.)
+  async function remintDatasetId(root, oldId) {
+    const make = async () => {
+      const now = await lookDatasetId(root);
+      if (now.id && now.id !== oldId) return now.id;
+      if (now.unreadable || now.damaged) throw new Error(I18n.t('idUnreadable', { name: root.name || '?' }));
+      const id = (self.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('ds-' + Date.now() + '-' + Math.floor(Math.random() * 1e9));
+      await FS.writeText(root, '.annotator_dataset.json', JSON.stringify({ id, created: new Date().toISOString(), reminted: true }, null, 2));
+      return id;
+    };
+    return siteLock('identity', make, root.name || '');
   }
 
   // Opening a folder is a TRANSACTION. Everything is read and validated into LOCALS first; the module
@@ -451,6 +635,28 @@
       // gate our caller set (synchronously, before any await) keeps NEW navigation from un-freezing it.
       cur = null; navGen++; exitCopyPick(); exitMarkerArm();
       $('note').disabled = true; updateCopyBtn();
+      // A change to the class list that has not reached the folder yet goes first. If another tab still holds
+      // the list (the status line says "Failed to save classes" and the app keeps trying), this folder stays
+      // open: leaving it dropped the change without a word — the retry belongs to this folder and stops with it.
+      // (A class write that HAS its turn and does not come back — a folder that hangs — is not waited for beyond
+      // a few seconds: the folder can still be left, as since the third round.)
+      const classWrite = await classesSettled();
+      if (classesWaiting) return { restore: prevView, banner: { key: 'errOpenFailed', vars: { msg: I18n.t('classesSaveFailed') } } };
+      // …and so does the one change that cannot be handed on to be finished behind the doctor's back: the folder's
+      // list was one this session could not use, replacing it was asked and CONFIRMED, and that write (the copy
+      // of the original first, then the list) has not come back. Nobody is left to ask once the folder is closed —
+      // leaving used to drop the confirmed list without a word, the unusable file staying as it was.
+      if (classWrite === 'pending' && classesFileCorrupt && classesOverwriteOK && classesEdits > classesWritten)
+        return { restore: prevView, banner: { key: 'errOpenFailed', vars: { msg: I18n.t('classesSaveFailed') } } };
+      // …nor is it dropped when that write did come back — with a failure (the copy of the original could not be
+      // made, or the list itself not written; the status line says so): the confirmed list is still only here,
+      // and what counts is that it has not reached the folder, not whether a write is under way. It is tried
+      // once more now. If it still does not get there, the folder stays open, as above.
+      if (classesFileCorrupt && classesOverwriteOK && classesEdits > classesWritten) {
+        try { await saveClasses(); } catch (e) { /* said on the status line */ }
+        if (classesFileCorrupt && classesOverwriteOK && classesEdits > classesWritten)
+          return { restore: prevView, banner: { key: 'errOpenFailed', vars: { msg: I18n.t('classesSaveFailed') } } };
+      }
       // Different dataset while frames are still UNSAVED? Ask BEFORE the wipe — the after-the-fact
       // "discarded" banner can't bring the work back. Cancel restores the frozen view untouched.
       // REVIEW FIX SC-1/HF-1 (the audit's only CRITICAL): .annotator_dataset.json is copied VERBATIM when
@@ -461,7 +667,8 @@
       // into ITS files — while the folder they belong to silently loses them on the next visit. Nothing
       // else could catch it: `grep isSameEntry` over js/ returned zero hits. Compare the handles now — a
       // DIFFERENT folder carrying an id we already hold is re-identified before anything else happens.
-      let newId = await ensureDatasetId(newRoot);
+      const idInfo = await datasetIdOf(newRoot);
+      const fileId0 = idInfo.id || idInfo.named || null;      // what the folder's id file says (null: nothing can be said just now)
       // `rootHandle &&` is essential: on the FIRST open of a session there is no other folder to collide
       // with, and State.getDatasetId() is simply the id restored from this dataset's own mirror — reminting
       // there would cut the folder off from its own crash-recovery records. Only an ALREADY-OPEN, DIFFERENT
@@ -470,8 +677,19 @@
       // BEFORE the unsaved-work confirm — so cancelling that dialog still left a brand-new id in a folder the
       // doctor chose not to open, orphaning the crash mirror keyed to its old id. Decide here, write after
       // the cancel point, and openFolderTxn's all-or-nothing promise holds again.
-      const willRemint = !!(rootHandle && newId && newId === State.getDatasetId() && !(await isSameFolder(rootHandle, newRoot)));
-      if ((willRemint || newId !== State.getDatasetId()) && State.dirtyCount() > 0 &&
+      const sameAgain = !!rootHandle && await isSameFolder(rootHandle, newRoot);   // the folder that is open, picked again
+      // The key this folder's unsaved work would be filed under (throws — the open fails and can be tried again —
+      // when nothing can be said about a folder this browser does not know). Only looked up here: it is written
+      // down when the folder is really opened, further down.
+      const peek = await folderKeyFor(newRoot, idInfo);
+      // (Compared by what the two id FILES say — rootFileId is the open folder's. A folder the book already
+      // knows has a key of its own, and unsaved work filed under it: it is left as it is. And where there is a
+      // book, a stand-in name shared by two folders needs no new id file — the newcomer gets a key of its own.)
+      const willRemint = !!(rootHandle && fileId0 && fileId0 === rootFileId && !sameAgain && !peek.known && (idInfo.id || !FS.folderBook));
+      // (The folder that is open, picked again, keeps its key where the book has nothing firm to say — see the
+      // claim below — so there is nothing to ask about then either.)
+      const keyThen = (sameAgain && !peek.firm) ? State.getDatasetId() : peek.key;
+      if ((willRemint || keyThen !== State.getDatasetId()) && State.dirtyCount() > 0 &&
           !confirm(I18n.t('confirmSwitchDirty', { n: State.dirtyCount() }))) return { restore: prevView };
       // …and the WRITE itself waits until nothing can still abort (see just above the commit).
       const found = await Loader.discover(newRoot);
@@ -498,10 +716,47 @@
       // with {restore} or throw. A Drive listing failure therefore left a folder the doctor never opened
       // carrying a brand-new id, orphaning the crash mirror keyed to its old one. This is the LAST point
       // that can abort, so the only write into the picked folder happens after it.
-      const cls = await Loader.loadClasses(newRoot);
-      if (willRemint) { newId = await remintDatasetId(newRoot); reminted = true; }
+      // (This folder may have been left a moment ago with a change to its class list still on its way to it —
+      // see finishClassesFor. The list read now would be the one from before that change: wait for it.)
+      for (const f of classFinishers.slice()) {
+        if (await isSameFolder(f.root, newRoot)) await Promise.race([f.done, new Promise(r => setTimeout(r, LOCK_WAIT_MS))]);
+      }
+      let cls = await Loader.loadClasses(newRoot);
+      // (a list that is there and could not be READ this once is read again — as when a class is added, see
+      // adoptFolderClasses: one failed reading used to pass for a damaged list, and the doctor was asked to
+      // replace a list that was in perfect order)
+      for (let i = 0; i < 2 && cls && cls.unreadable; i++) { await new Promise(r => setTimeout(r, 150)); cls = await Loader.loadClasses(newRoot); }
+      // The folder is opened: its key is written down now (and a copy of the open folder gets its own id file
+      // first). Where the browser keeps a book of folders, a copy that cannot be given one — it cannot be
+      // written, or its file cannot be read just now — is kept apart by the book all the same; without a book
+      // nothing else tells the two folders apart, and the open fails with its message, as before.
+      let where = await folderKeyFor(newRoot, idInfo, { claim: true, remint: willRemint });
+      reminted = !!where.reminted;
+      // The folder that is open, picked again, keeps the key it is open under when the book has nothing firm to
+      // say at this moment (it cannot be read, or the row did not get written).
+      if (sameAgain && !where.tok) where = { key: State.getDatasetId(), fileId: rootFileId, known: true, tok: rootTok };
+      // The key was going to stay — so nothing was asked about unsaved work above — and it does not stay after
+      // all (the id file was replaced during this very open). Going on would wipe that work unasked: the folder
+      // is not opened now. Tried again, the question comes first.
+      if (!willRemint && keyThen === State.getDatasetId() && where.key !== keyThen && State.dirtyCount() > 0) throw new Error(I18n.t('idUnreadable', { name: newRoot.name || '?' }));
+      // …and ANOTHER folder is never opened under the key of the one that is open: nothing would be wiped, the
+      // open folder's unsaved work would stay on screen and be written into the new one (SC-1, above). The book
+      // rules that out; where there is none to ask just now, the folder is not opened — it can be tried again.
+      if (rootHandle && !sameAgain && where.key === State.getDatasetId()) throw new Error(I18n.t('idUnreadable', { name: newRoot.name || '?' }));
       // ------------------ COMMIT (synchronous: no await until the end of this block) ------------------
       for (const c of found) c.units.push({ id: 'perfusion', kind: 'perfusion', virtual: true });   // computed view-only unit after minip
+      // The folder being left may still be owed a change to its class list: the write was reading, or waiting
+      // behind another one, or hung. The change goes on to THAT folder on its own (finishClassesFor) — it used
+      // to be dropped here without a word. (Not when the folder's list is one this session could not use: that
+      // one is only ever replaced after asking.)
+      // (When it is THIS folder that is being opened again, nothing is handed on: the list read a moment ago is
+      // the one from before the change, and the change is laid over it below — the screen used to go back to the
+      // old list while the file got the new one.)
+      const owes = (rootHandle && classesEdits > classesWritten && !classesFileCorrupt)
+        ? { root: rootHandle, mine: classes.map(c => ({ index: c.index, name: c.name })), base: classesRaw, used: State.usedClasses() } : null;
+      const owed = sameAgain ? null : owes, carried = sameAgain ? owes : null;
+      classesEdits = 0; classesWritten = 0;
+      if (owed) finishClassesFor(owed);
       rootHandle = newRoot; cases = found;
       // Decision 4.7-B: class indices must be >= 1. Index 0 is the paint layer's "unpainted" value, so a
       // class 0 brush is a silent no-op on empty pixels and a silent ERASER over existing paint. Offending
@@ -520,14 +775,37 @@
       classesFileCorrupt = !cls.ok || badCount > 0; classesBackedUp = false; classesOverwriteOK = false; classesWasReplaced = false;   // R12-5: a fresh folder, a fresh latch
       classesIndexBad = cls.ok && badCount > 0; classesBadCount = badCount;   // parseable but with unusable entries: same protection, its own (accurate) banner
       classesRaw = (cls.ok && cls.raw && typeof cls.raw === 'object') ? cls.raw : null;   // UI-2: preserve unknown fields on write (assigned inside the synchronous COMMIT block, so it always belongs to the folder being committed)
+      if (carried) {
+        if (!classesFileCorrupt) {
+          const moved = new Map();
+          classes = mergeClassLists(carried.base, carried.mine, classesRaw, classes, carried.used, moved).classes.map(c => ({ index: c.index, name: c.name })).filter(okIdx);
+          // A class made here had to take another number (somebody made one under the same number meanwhile).
+          // The class that is selected goes with it: it used to stay on the number — which is the other class
+          // now, so the next marks were given a class the doctor had not picked.
+          const act = State.getActiveClass();
+          if (moved.has(act)) State.setActiveClass(moved.get(act));
+        } else {
+          // The folder's list has turned into one that cannot be used while the change was on its way. The list
+          // as this session has it stays (it used to be replaced by the empty one read from the unusable file,
+          // and the class made here was gone from the screen and never written). The file is not written over
+          // unasked: the usual question comes first, and a copy of the file is kept.
+          classes = carried.mine.filter(okIdx);
+        }
+        classesCarried = true;
+      }
       dsToken = {};                             // new dataset identity: work still running against the previous one aborts from here
       openGen++;                                // bumped WITH rootHandle, never before it: the old dataset's scan/prefetch/late reconciles go inert, and a cancelled Open now aborts nothing
       committed = true;
+      // The two choosers belong to a frame of the folder that has just been left, and frames carry the same
+      // names in every folder: a chooser left open (the Open button can be reached from the keyboard behind it),
+      // or a choice still waiting for its turn, acted on the new folder's frame of that name.
+      conflictOp++; hideConflictDialog(); rescueAsk++; hideRescueDialog(); classesWaiting = false;
       scanTotal = 0; scanDone = 0; updateScanProg();   // the old scan is dead — its progress text must not linger
       perfCache.clear(); perfInflight.clear();
       corruptUnits.clear(); corruptBackedUp.clear();
-      sw = State.switchDataset(newId);          // wipe any carryover from a different dataset
-      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); conflictedUnits.clear(); rescueFound.clear(); protectedUnits.clear(); noteCorruptUnits.clear(); noteCorruptBackedUp.clear();
+      sw = State.switchDataset(where.key, where.tok);   // wipe any carryover from a different dataset; unsaved work that comes back is weighed by the folder's token
+      rootFileId = where.fileId; rootTok = where.tok || null;
+      cache.clear(); prefetchCold.clear(); inflightLoads.clear(); sessionLoaded.clear(); ownWriteAt.clear(); lastSeenMtime.clear(); lastSeenSig.clear(); writeChain.clear(); writingUnits.clear(); conflictedUnits.clear(); rescueFound.clear(); protectedUnits.clear(); noteCorruptUnits.clear(); noteCorruptBackedUp.clear();
       // ROUND-3 FIX: these two were the ONLY per-unit sets the wave added and forgot here, so one folder's
       // corrupt/unreadable frames silently disabled class deletion and note writing for the SAME-NAMED
       // frames of every folder opened afterwards — datasets reuse case_N/frame_M names by design.
@@ -553,13 +831,18 @@
       return null;
     }
   }
+  let classesCarried = false;   // the folder was opened again with a change to its class list still unwritten: this session writes it
+  let rootFileId = null;        // what the open folder's id file said when it was opened (its id, or the name that stands in)
+  let rootTok = null;           // the token of the open folder's row in the book of folders (null: nothing vouches for this session)
   async function openFolder() {
     if (openBusy) return;                       // re-entrancy: set synchronously below, BEFORE the first await, so a second click (or a second Open from anywhere) cannot start a competing transaction whose late completion would decide which dataset is open
+    if (classesWaiting) { setBanner('errOpenFailed', { msg: I18n.t('classesSaveFailed') }, 'warn'); return; }   // (see openFolderTxn: the class list of this folder is still waiting for its turn)
     openBusy = true; $('btnOpen').disabled = true;
     flushAutoSave(); flushGeomWrite(true);      // persist any pending edits to the CURRENT dataset before we switch away
     let act;
     try { act = await openFolderTxn(); }
     finally { openBusy = false; $('btnOpen').disabled = !FS.supported; }   // release the gate BEFORE the showUnit calls below — they must not be blocked by it
+    if (classesCarried) { classesCarried = false; if (act && act.show) saveClasses(); }   // (see the commit block of openFolderTxn)
     if (!act) return;                           // picker cancelled and nothing was open — nothing to restore
     if (act.restore) {
       if (act.restore.had) await showUnit(act.restore.ci, act.restore.ui);   // un-freeze: back to the dataset that is still open
@@ -652,11 +935,14 @@
     let p = inflightLoads.get(k);
     if (!p) {
       const gen = openGen;
+      // (The entry is taken out only by the read that put it there. Frames carry the same names in every folder:
+      // a read of the folder that was left, coming back late, took out the entry of the new folder's frame of
+      // that name — which was then read a second time.)
       p = Loader.loadUnit(u).then(data => {
-        inflightLoads.delete(k);
+        if (inflightLoads.get(k) === p) inflightLoads.delete(k);
         if (gen === openGen) cacheInsert(k, data, cold);
         return data;
-      }, err => { inflightLoads.delete(k); throw err; });
+      }, err => { if (inflightLoads.get(k) === p) inflightLoads.delete(k); throw err; });
       inflightLoads.set(k, p);
     } else if (!cold) p.then(() => { if (cache.has(k)) cacheTouch(k); }, () => { });   // a real view promotes a pending prefetch (rejection handled by the primary caller)
     return p;
@@ -686,9 +972,42 @@
     let fh;
     try { fh = await unit.handle.getFileHandle(name); }
     catch (e) { return (e && e.name === 'NotFoundError') ? { absent: true } : { failed: true }; }
-    try { return { text: await (await fh.getFile()).text() }; }
+    try {
+      const file = await fh.getFile(), text = await file.text();
+      // The text is not always the file: bytes that are not valid UTF-8 all read as the same replacement
+      // character, and a byte-order mark is dropped. A "byte for byte" copy written from such text is a
+      // different file. Where that can be the case the bytes come along, and copies are made from them.
+      let bytes = null;
+      const enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+      if (text.indexOf('\uFFFD') >= 0 || (enc && typeof file.size === 'number' && enc.encode(text).length !== file.size)) {
+        // …and when the bytes cannot be had at this moment, there is nothing a true copy could be made from. The
+        // text was handed on then, and "7B FF 7D" was kept as "7B EF BF BD 7D" before the original was written
+        // over. Not readable now: the caller waits, as for any file it cannot read.
+        let b = null;
+        try { b = new Uint8Array(await file.arrayBuffer()); } catch (e2) { return { failed: true }; }
+        if (!b.length) return { failed: true };
+        bytes = b;
+      }
+      return bytes ? { text, bytes } : { text };
+    }
     catch (e) { return (e && e.name === 'NotFoundError') ? { absent: true } : { failed: true }; }   // ROUND-5/R5-9: a colleague deleted it between the handle and the read — there is nothing left to protect, so do not stall the doctor's note
   }
+  // what a copy of a probed file is written from / compared by: its bytes when the text is not the whole file
+  const rawOf = pr => pr.bytes ? pr : pr.text;
+  const rawBody = raw => (raw && typeof raw === 'object') ? raw.bytes : raw;
+  // (One side can come as bytes and the other as text: a note that really contains the character U+FFFD is read
+  // back with its bytes — the character is also what damaged bytes read as — while the copy about to be written
+  // is a string. Text is compared as the bytes it would be written as; it was "different" before, so a copy
+  // that was already there was written again under the next name, and refused when all nine were taken.)
+  const sameRaw = (probe, raw) => {
+    const enc = t => (typeof TextEncoder !== 'undefined' && typeof t === 'string') ? new TextEncoder().encode(t) : null;
+    const b = (raw && typeof raw === 'object') ? raw.bytes : null;
+    if (probe.bytes || b) {
+      const x = probe.bytes || enc(probe.text), y = b || enc(raw);
+      return !!x && !!y && x.length === y.length && x.every((v, i) => v === y[i]);
+    }
+    return probe.text === raw;
+  };
   async function rawFileText(unit, name) {
     try { return await (await (await unit.handle.getFileHandle(name)).getFile()).text(); }
     catch (e) { return null; }
@@ -704,6 +1023,134 @@
     const mks = Array.isArray(n.markers) ? n.markers.map(m => ({ id: m && m.id, p: conv(m && m.click) })) : [];
     return JSON.stringify({ t: typeof n.text === 'string' ? n.text : '', m: mks });
   }
+  // ---- what this session last KNEW each of a frame's two files to contain ------------------------------
+  // The guards built on file times allow a ±2 s margin and look at the NEWER of the frame's two files. Two
+  // things got through them: a colleague's save whose file time sits inside that margin of ours (two people
+  // saving one frame within a couple of seconds — the next save here wrote over theirs with no chooser and
+  // no backup), and a change to ONE file hidden behind a later time on the other (their annotation.json
+  // replaced by our note-only save). Content has neither blind spot. lastSeenSig remembers what each file
+  // held when this session last read or wrote it; before a file is written over, and before a clean frame
+  // is taken as unchanged, the file is asked whether it still holds that.
+  // A file we could not read or parse has no known content (undefined) and is never compared; a file that is
+  // not there counts as an empty one, exactly as reconcileUnitFromDisk treats it — so a file somebody DELETED
+  // is a change like any other.
+  // What is kept is a fingerprint, not the content: 64 bits of the canonical form tell "same" from "changed",
+  // cost a few bytes per frame of a 6000-frame folder, and can be stored with a frame's unsaved work. The tag
+  // names the recipe: a fingerprint made by another recipe (an older or newer build) is "not known".
+  const FP = 'f1:';
+  // (The multiply is taken once: looked up through Math for every character, a megabyte of annotations took a
+  // hundred times longer wherever reading a global is slow — the test harness's sandbox is such a place.)
+  const imul = Math.imul;
+  function fp(s) {
+    let h1 = 0xdeadbeef ^ s.length, h2 = 0x41c6ce57 ^ s.length;
+    for (let i = 0; i < s.length; i++) { const ch = s.charCodeAt(i); h1 = imul(h1 ^ ch, 2654435761); h2 = imul(h2 ^ ch, 1597334677); }
+    h1 = imul(h1 ^ (h1 >>> 16), 2246822507) ^ imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = imul(h2 ^ (h2 >>> 16), 2246822507) ^ imul(h1 ^ (h1 >>> 13), 3266489909);
+    return FP + (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+  }
+  // Never throws. importAnnotation takes what it can from a file (a layer entry that is not an object is
+  // skipped, and the file is backed up before the first save); the canonical form cannot be built for such a
+  // file, and a fingerprint that threw there stopped the folder scan and kept the frame from opening. Its
+  // parsed text is fingerprinted as it stands instead: still enough to see whether the file changed.
+  const annSig = a => {
+    const o = a || {};
+    try { return fp(annContentSig(o)); }
+    catch (e) { try { return fp('raw:' + JSON.stringify(o)); } catch (e2) { return undefined; } }
+  };
+  const noteSig = n => { try { return fp(noteContentSig(n)); } catch (e) { return undefined; } };
+  // A file this build can read but not use — not JSON, or written by a newer app — has no canonical form; its
+  // text is fingerprinted as it stands. Its content cannot be compared with anything, but whether it is still
+  // the file this session saw can: such a file appearing where a readable one was is a change like any other,
+  // and one that was already there when the frame was read is not.
+  // (From its BYTES where the loader has them: as text, two files that are broken in different ways can look
+  // the same — every byte that is not valid UTF-8 reads as the same replacement character.)
+  const bytesKey = b => { let t = ''; for (let i = 0; i < b.length; i += 8192) t += String.fromCharCode.apply(null, b.subarray(i, i + 8192)); return t; };
+  // (The loader hands the bytes over only where the text is NOT the whole file — a byte-order mark, bytes that
+  // are not valid UTF-8 — and `false` where it would have to and cannot read them just now: what such a file
+  // holds is then not known. A file whose text is all of it is fingerprinted by that text every time. It used
+  // to be fingerprinted by its bytes when they could be read and by its text when they could not, so one
+  // reading that failed made an untouched file look like another one — a conflict nobody had caused.)
+  const opaqueSig = (raw, bytes) => (bytes && bytes.length) ? fp('opaque-bytes:' + bytesKey(bytes)) : (bytes === false) ? undefined : (typeof raw === 'string') ? fp('opaque:' + raw) : undefined;
+  function sigOfRead(r) {   // r: what Loader.loadAnnotation / loadUnit returned
+    return {
+      ann: (r.unreadable || r.annUnreadable) ? undefined : (r.annCorrupt || r.versionAhead) ? opaqueSig(r.annRaw, r.annBytes) : annSig(r.annotation),
+      note: r.noteUnreadable ? undefined : r.noteCorrupt ? opaqueSig(r.noteRaw, r.noteBytes) : noteSig(r.note),
+    };
+  }
+  // UNTRUSTED: "what this file held when the unsaved work was made is not known". It is the record a frame
+  // gets when its unsaved work comes back from the browser's copy WITHOUT fingerprints — work kept by an older
+  // version of the app. Such a file equals nothing: a save asks first (the chooser keeps both versions), unless
+  // there is no file to lose or the file already holds what the save would write.
+  // (The file's time proves nothing here. A frame's two files were vouched for by ONE time, the newer of the
+  // two: a colleague's annotation.json moved in with an older date hid behind our own note.json, and was written
+  // over. And a file that is there but empty may be somebody's decision to empty it.)
+  const UNTRUSTED = '?';
+  // FOREIGN: unsaved work that came back from the browser's copy and that nothing vouches for as THIS folder's
+  // (State.isForeign: it was not kept under this folder's entry in the browser's book of folders — work kept
+  // by a version that had no book, by a session the book could not vouch for, or under a key another folder
+  // held before). It may be another folder's: a copy carries the same id file. Such work equals nothing, not
+  // even "no file": it is written only where the folder already holds exactly what would be written; anything
+  // else is asked first, in the chooser, which keeps both versions.
+  const FOREIGN = '!';
+  const fileAbsent = (r, f) => f === 'ann' ? (!r.annotation && !(r.unreadable || r.annUnreadable || r.annCorrupt || r.versionAhead)) : (!r.note && !(r.noteUnreadable || r.noteCorrupt));
+  // the fingerprints stored with a frame's unsaved work, as far as this build can use them
+  function storedSig(k) {
+    if (State.isForeign(k)) return { ann: FOREIGN, note: FOREIGN };
+    const st = State.getKnownSig(k); if (!st) return {};
+    const ok = v => (typeof v === 'string' && v.indexOf(FP) === 0) ? v : undefined;
+    return { ann: ok(st.a), note: ok(st.n) };
+  }
+  // What the folder holds now, measured against what this session knew: 'same', 'changed', or 'unknown' when a
+  // file cannot be read or parsed right now (only its time can be asked then). `mine` — the fingerprints of what
+  // a save is about to write — is optional: a file that already holds exactly that has nothing to lose,
+  // whoever put it there (our own write whose confirmation was lost, or a colleague's identical edit).
+  function diskVerdict(k, r, mine) {
+    const seen = lastSeenSig.get(k); if (!seen) return 'unknown';
+    const now = sigOfRead(r);
+    let unknown = false;
+    for (const f of ['ann', 'note']) {
+      if (seen[f] === FOREIGN) {
+        if (f === 'note' && mine && mine.note === undefined) continue;        // the save does not write note.json at all
+        if (mine && mine[f] !== undefined && now[f] !== undefined && now[f] === mine[f]) continue;
+        return 'changed';
+      }
+      if (now[f] === undefined || seen[f] === undefined) { unknown = true; continue; }
+      if (now[f] === seen[f] || (mine && mine[f] !== undefined && now[f] === mine[f])) continue;
+      if (seen[f] === UNTRUSTED && fileAbsent(r, f)) continue;              // no file there: nothing to lose
+      return 'changed';
+    }
+    return unknown ? 'unknown' : 'same';
+  }
+  // lastSeenSig is this session's working copy; State keeps the same pair with the frame's unsaved work, so
+  // it survives a reload (and a switch to another folder and back).
+  // (FOREIGN is a word about this SESSION — nothing vouches for the work here — not about the files, so it is
+  // never stored with the work: what the work's own record says of its files stays as it came, for the folder
+  // the work does belong to. It used to be written over. Merely LOOKING at a copy replaced it, and the original
+  // folder was then asked about its own unsaved work.)
+  function setSeen(k, s) { lastSeenSig.set(k, s); if (s.ann !== FOREIGN && s.note !== FOREIGN) State.setKnownSig(k, s.ann, s.note); }
+  function sawOnDisk(k, which, sig) { const s = Object.assign({}, lastSeenSig.get(k)); s[which] = sig; setSeen(k, s); }   // one file, right after we wrote it
+  // A read. What it could not tell us (a file unreadable just now) does not erase what we knew before.
+  // keptLocal: on this FIRST sighting of the frame the session kept its own unsaved version over the file
+  // (reconcile answered 'kept-dirty' or 'conflict') — a reload, typically. What was known of the file BEFORE
+  // the reload came back with the unsaved work, and it stands: taking the file as it is now for "known" is
+  // what let a save after a reload write over a change made in the meantime.
+  // Unsaved work that came back WITHOUT a fingerprint for a file leaves that file UNTRUSTED (see above): the
+  // first reading of a file must never stand in for what the file held when the work was made.
+  function sawRead(k, r, keptLocal) {
+    const now = sigOfRead(r), had = lastSeenSig.get(k);
+    if (keptLocal) {
+      // (…and a later reading that keeps the local version AGAIN changes nothing either. Two first readings of
+      // one frame can run side by side — the folder scan and a Save reaching the frame together — and the one
+      // that came back second took the file as it is for "known": the save then went ahead without asking.)
+      if (had) return;
+      const st = storedSig(k);
+      const pick = f => st[f] !== undefined ? st[f] : UNTRUSTED;
+      setSeen(k, { ann: pick('ann'), note: pick('note') });
+      return;
+    }
+    const prev = had || {};
+    setSeen(k, { ann: now.ann !== undefined ? now.ann : prev.ann, note: now.note !== undefined ? now.note : prev.note });
+  }
   // Reconcile ONE unit's State from its on-disk annotation. Shared by loadCur (the frame being shown) and
   // the background scan (unvisited frames). NEVER discards silently: if a needed sidecar write fails, the
   // local (dirty) copy is kept. Returns exactly one of:
@@ -714,19 +1161,54 @@
   //                      writers refuse the unit and opening the frame shows the two-version chooser (4.2)
   //   'aborted'          a DIFFERENT dataset was opened meanwhile — State is foreign now, nothing was touched
   // Only 'clean' / 'stale-*' / 'kept-dirty' mean "State is authoritative for this unit"; 'aborted' does not.
-  async function reconcileUnitFromDisk(c, u, ann, note, annMtime) {
+  async function reconcileUnitFromDisk(c, u, ann, note, annMtime, diskSig) {
     const tok = dsToken, k = State.key(c.id, u.id);
     if (!State.isDirty(c.id, u.id)) {
       State.resetUnit(c.id, u.id);
       try { if (ann) State.importAnnotation(c.id, u.id, ann); if (note) State.importNoteJson(c.id, u.id, note); } catch (e) { }   // one malformed file must not abort the load
       return 'clean';
     }
+    // Unsaved work that nothing vouches for as THIS folder's (FOREIGN, above) is weighed against the folder's
+    // files by content the first time they are read. Where they differ, that is a conflict like any other: the
+    // frame is not written, and opening it asks which version to keep. (It used to be found only by the first
+    // save. With auto-save off nothing was asked before the doctor went on working on a copy that may be
+    // another folder's — and a second reading of the frame could let the save through unasked.) Where the
+    // folder already holds what the work would write there is nothing to ask: the save finds that too, and
+    // writes nothing.
+    if (State.isForeign(k)) {
+      if (!diskSig || diskSig.ann === undefined || diskSig.note === undefined || writingUnits.has(k)) return 'kept-dirty';   // cannot be compared now: the save asks
+      let same = true;
+      try {
+        const sz = (ann && Array.isArray(ann.image_size) && ann.image_size.length === 2) ? ann.image_size : [0, 0];
+        if (annSig(State.buildAnnotation(c.id, u.id, sz[0], sz[1])) !== diskSig.ann) same = false;
+        if (State.hasNoteData(c.id, u.id) && noteSig(State.buildNote(c.id, u.id)) !== diskSig.note) same = false;
+      } catch (e) { return 'kept-dirty'; }
+      if (same) return 'kept-dirty';
+      conflictedUnits.set(k, ann ? { ann, note, annMtime } : null);   // (null: read again when the chooser opens — a file this build cannot use says so there)
+      return 'conflict';
+    }
+    // Where it is KNOWN what both files held when this unsaved work was made (this session's own record, or the
+    // one that came back with the work after a reload), that decides, not the files' times:
+    //  * both still hold it: nobody touched them, the unsaved work stands — a sync client that only re-stamped
+    //    them is not a conflict;
+    //  * one of them holds something else: somebody changed it, however its time compares with our last edit
+    //    or our last write (two seconds either way used to count as "our own write"). The contents are then
+    //    compared below like for any newer file.
+    let byContent = false;
+    if (diskSig && diskSig.ann !== undefined && diskSig.note !== undefined) {
+      const base = lastSeenSig.get(k) || storedSig(k);
+      const firm = v => v !== undefined && v !== UNTRUSTED && v !== FOREIGN;
+      if (firm(base.ann) && firm(base.note)) {
+        if (diskSig.ann === base.ann && diskSig.note === base.note) return 'kept-dirty';
+        byContent = true;
+      }
+    }
     const ea = State.getEditedAt(c.id, u.id);
     // v102/R102-1: a note-only frame has no annotation.json (v102 no longer creates a bare one), so a note.json alone must be
     // enough to compare — otherwise a colleague's newer note was kept-dirty here, its mtime then recorded as seen, and our
     // stale note written over it with no chooser and no backup.
-    if (!((ann || note) && annMtime && ea && annMtime > ea)) return 'kept-dirty';
-    if (annMtime <= ownWriteMs(c.id, u.id, k) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale (persisted, so this still holds after a reload)
+    if (!byContent && !((ann || note) && annMtime && ea && annMtime > ea)) return 'kept-dirty';
+    if (!byContent && annMtime <= ownWriteMs(c.id, u.id, k) + 2000) return 'kept-dirty';   // the "newer" file is OUR OWN recent write — an edit that landed during it must not be reverted as stale (persisted, so this still holds after a reload)
     if (writingUnits.has(k)) return 'kept-dirty';             // a save of this unit is in flight — its write will settle disk vs local, don't race it
     // Dirty flag looks stale (disk written after our last recorded edit). mtime can lie (folder copy /
     // cloud re-sync), so compare CONTENT first: an identical file is adopted silently — no dialog noise
@@ -771,9 +1253,10 @@
     catch (e) { return 'unreadable'; }                                     // I/O failure: never let the caller build over a file we could not read
     if (r.unreadable) return 'unreadable';                                 // …and the same when the read "succeeded" but the file could not be opened: seeding EMPTY here is what later lets a star/Save overwrite the real annotations
     if (tok !== dsToken) return 'aborted';                                 // folder switched during the read — this unit belongs to the OLD dataset
+    if (sessionLoaded.has(k)) return 'already';                            // …or the folder scan (or the frame being opened) read it meanwhile: that reading stands, this one is not weighed a second time
     if (r.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);             // UI-1: nothing was imported from it
     if (r.annCorrupt || r.annDropped) corruptUnits.add(k); else { corruptUnits.delete(k); corruptBackedUp.delete(k); }   // ROUND-4/R4-GS-5: the "already backed up" flag was add-only, so a file that went corrupt, was fixed, then went corrupt AGAIN was overwritten with no backup   // keeps backupCorruptOnce's invariant — a later write must still .corrupt-backup the original (an unparseable one, or one whose layers this build cannot represent)
-    const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0);
+    const rec = await reconcileUnitFromDisk(c, u, r.annotation, r.note, r.mtime || 0, sigOfRead(r));
     if (rec === 'aborted') return 'aborted';
     evalImportProtection(c, u, r.annotation, r.versionAhead); // A1: unreadable-by-this-version content => the frame goes read-only
     if (r.noteCorrupt) noteCorruptUnits.add(k);               // A2: back the original up before any write replaces it
@@ -781,7 +1264,7 @@
     if (r.noteUnreadable) noteUnreadableUnits.add(k);
     else if (rec === 'clean' || rec === 'stale-clean') noteUnreadableUnits.delete(k);   // ROUND-5/R5-2: ONLY these two outcomes adopt the file into State; 'kept-dirty'/'conflict' keep the LOCAL version and import nothing
     if (r.annDropped) setBanner('annLayersDropped', { id: u.id, n: r.annDropped }, 'warn');   // saving this frame back would shrink the file — say so before it happens
-    lastSeenMtime.set(k, r.mtime || 0);
+    lastSeenMtime.set(k, r.mtime || 0); sawRead(k, r, rec === 'kept-dirty' || rec === 'conflict');
     sessionLoaded.add(k);
     return 'seeded';
   }
@@ -791,7 +1274,7 @@
     const c = curCase(), u = curUnit(), k = State.key(c.id, u.id);
     let data = cacheTouch(k);
     if (data === undefined) data = await loadUnitCached(u, k, false);
-    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.annDropped = fresh.annDropped || 0; data.versionAhead = fresh.versionAhead || 0; data.annUnreadable = !!fresh.unreadable; data.note = fresh.note; data.annMtime = fresh.mtime || 0; data.noteCorrupt = !!fresh.noteCorrupt; data.noteUnreadable = !!fresh.noteUnreadable; data.noteMtime = fresh.noteMtime || 0; }   // ROUND-3 FIX: noteUnreadable/noteMtime were the two fields this warm path forgot, so a note that became readable again stayed blocked
+    else if (!data.shapeMismatch) { const fresh = await Loader.loadAnnotation(u); data.annotation = fresh.annotation; data.annCorrupt = fresh.annCorrupt; data.annDropped = fresh.annDropped || 0; data.versionAhead = fresh.versionAhead || 0; data.annUnreadable = !!fresh.unreadable; data.note = fresh.note; data.annMtime = fresh.mtime || 0; data.noteCorrupt = !!fresh.noteCorrupt; data.noteUnreadable = !!fresh.noteUnreadable; data.noteMtime = fresh.noteMtime || 0; data.annRaw = fresh.annRaw; data.noteRaw = fresh.noteRaw; data.annBytes = fresh.annBytes; data.noteBytes = fresh.noteBytes; }   // ROUND-3 FIX: noteUnreadable/noteMtime were the two fields this warm path forgot, so a note that became readable again stayed blocked
     if (data.shapeMismatch) return data;   // broken frame: no annotation state; shown as a view-only placeholder
     if (gen !== openGen) return data;      // a folder switch happened during the read — this unit belongs to the OLD dataset: no reconcile, no sessionLoaded (would pollute the new one)
     if (data.annUnreadable) return data;   // this frame's annotation.json exists but could not be read: do NOT reset State from it and do NOT mark the unit seeded — every write path re-reads first (and refuses meanwhile)
@@ -803,13 +1286,15 @@
     const m = Math.max(data.annMtime || 0, data.noteMtime || 0);
     // clean revisit with the disk file unchanged since our last reconcile (or only changed by OUR OWN write):
     // State already equals disk — skip the reset so the frame's undo history survives navigation.
+    // …and the files still say what they said then: a colleague's save inside the ±2 s margin of our own
+    // write passed the time test, and this session went on showing (and later saving) its stale copy.
     const unchanged = sessionLoaded.has(k) && !State.isDirty(c.id, u.id) &&
-      (m === (lastSeenMtime.get(k) || 0) || m <= ownWriteMs(c.id, u.id, k) + 2000);
+      (m === (lastSeenMtime.get(k) || 0) || m <= ownWriteMs(c.id, u.id, k) + 2000) && diskVerdict(k, data) !== 'changed';
     const seenBefore = lastSeenMtime.has(k);   // R7: telling a FIRST sighting apart from a later replacement
     let rec = null;
     if (!unchanged) {
       // disk is the source of truth for CLEAN units; a provably-stale dirty flag reconciles WITH sidecar backups
-      rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m);
+      rec = await reconcileUnitFromDisk(c, u, data.annotation, data.note, m, sigOfRead(data));
       if (rec === 'aborted') return data;   // the dataset switched during the reconcile: never record a foreign unit in the NEW dataset's sessionLoaded/lastSeenMtime maps
       evalImportProtection(c, u, data.annotation, data.versionAhead);
       if (data.noteCorrupt) noteCorruptUnits.add(k);
@@ -835,8 +1320,7 @@
     // dirty local copy over a file whose CONTENT we never compared: that is the R7 hole — reconcile's first
     // guard returns 'kept-dirty' before any comparison, so recording the replacement's mtime as "seen" told
     // writeUnitInner the file was known and the next save overwrote a colleague's work with no chooser.
-    if (rec !== 'kept-dirty' && rec !== 'conflict') lastSeenMtime.set(k, m);
-    else if (!seenBefore) lastSeenMtime.set(k, m);
+    if ((rec !== 'kept-dirty' && rec !== 'conflict') || !seenBefore) { lastSeenMtime.set(k, m); sawRead(k, data, rec === 'kept-dirty' || rec === 'conflict'); }
     sessionLoaded.add(k);                  // background scan must skip this unit now (a re-reset would wipe undo history)
     return data;
   }
@@ -899,6 +1383,7 @@
         const grays = []; let W = 0, H = 0;
         for (const u of frames) {
           const g = await Loader.loadGray(u);
+          if (pGen !== openGen) return null;                  // (before anything is noted for this case: the cache is the new folder's by now)
           if (!W) { W = g.W; H = g.H; }
           if (g.W !== W || g.H !== H) { perfPut(c.id, 'failed'); return null; }   // frames must share dimensions
           grays.push(g.gray);
@@ -1369,6 +1854,7 @@
       geomSaveTimer = setTimeout(() => flushGeomWrite(false), 600);
     }
   }
+  const geomWriting = new Map();       // dataset key + frame -> the write of that frame's geometry.json that is on its way
   function flushGeomWrite(force) {
     if (geomSaveTimer) { clearTimeout(geomSaveTimer); geomSaveTimer = null; }
     if (!rootHandle || !pendingGeom.size) return;
@@ -1380,13 +1866,40 @@
       while (pendingGeom.size > CAP) pendingGeom.delete(pendingGeom.keys().next().value);
       return;
     }
-    const pend = [...pendingGeom.values()];
+    const pend = [...pendingGeom.entries()].map(([fk, p]) => Object.assign({ fk }, p)), tok = dsToken;
     pendingGeom.clear();
+    // The window is the only thing in that file that is this session's. Everything else is written as the folder
+    // holds it NOW: the object read when the frame was opened used to be written back whole, and a segment or
+    // a field somebody had added to the file since then was gone. A file that cannot be read at this moment (or
+    // is no longer an object) is not written over: the write is reported as failed, the file stays.
+    // One write of a frame's file at a time, in the order they were asked for, each taking the window as it
+    // stands when its turn comes. (Two releases of the slider started two writes; the first, slower one landed
+    // last — the file kept the older window while the screen showed the newer.)
+    // (The queue is kept by the folder's key and the frame, not by the frame's handle: picking the open folder
+    // again hands out new handle objects for the same frames, and a write that was still on its way through an
+    // old one was not waited for — it landed after the newer write and put the older window back.)
+    const qk0 = String(State.getDatasetId()) + '\n';
+    const writeOne = p => {
+      if (!(p.unit && p.unit.handle)) return Promise.resolve(true);
+      const h = p.unit.handle, qk = qk0 + p.fk;
+      const job = async () => {
+        let latest;
+        try { latest = JSON.parse(await (await (await h.getFileHandle('geometry.json')).getFile()).text()); }
+        catch (e) { return false; }
+        if (!latest || typeof latest !== 'object' || Array.isArray(latest)) return false;
+        latest.filter = p.raw.filter;
+        await FS.writeText(h, 'geometry.json', JSON.stringify(latest, null, 2));
+        return true;
+      };
+      const run = (geomWriting.get(qk) || Promise.resolve()).then(job, job);
+      const tail = run.then(() => { }, () => { });
+      geomWriting.set(qk, tail);
+      tail.then(() => { if (geomWriting.get(qk) === tail) geomWriting.delete(qk); });
+      return run;
+    };
     // UI-6: every error used to be swallowed while the save modal reported an unqualified success.
-    Promise.all(pend.map(p => (p.unit && p.unit.handle)
-      ? FS.writeText(p.unit.handle, 'geometry.json', JSON.stringify(p.raw, null, 2)).then(() => true, () => false)
-      : Promise.resolve(true)))
-      .then(rs => { const bad = rs.filter(x => !x).length; if (bad) setBanner('geomWriteFailedFmt', { n: bad }, 'warn'); });
+    Promise.all(pend.map(p => writeOne(p).then(v => v, () => false)))
+      .then(rs => { const bad = rs.filter(x => !x).length; if (bad && tok === dsToken) setBanner('geomWriteFailedFmt', { n: bad }, 'warn'); });
   }
   function ensureActiveClass() {
     if (!classes.length) { State.setActiveClass(null); return; }
@@ -1411,11 +1924,12 @@
       // classes.json parses again (and starts false after a reload), so a SECOND, different corruption
       // overwrote the first preserved original — which existed nowhere else. The Data format page says that
       // cannot happen; now it cannot.
-      const raw = await (await fh.getFile()).text();
-      if (root !== rootHandle) return false;
+      const pr = await rawFileProbe({ handle: root }, 'classes.json');
+      if (root !== rootHandle || pr.absent || pr.failed) return false;
+      const raw = rawOf(pr);
       const slot = await freeBackupName({ handle: root }, 'classes.json.corrupt', raw);
       if (slot === null) return 'slots';   // ROUND-9/R9-6: permanent — "check the folder permission and try again" would be a lie
-      if (slot.write) await FS.writeText(root, slot.name, raw);
+      if (slot.write) await FS.writeText(root, slot.name, rawBody(raw));
       if (root !== rootHandle) return false;
       classesBackupName = slot.name;   // ROUND-9/R9-10: R8-7 gave this file numbered slots; the banner still named slot 1, which holds an OLDER corruption — and the doctor would restore the wrong class vocabulary for every case in the folder
       classesBackedUp = true;
@@ -1431,10 +1945,222 @@
     classesOverwriteOK = true;
     return true;
   }
-  async function saveClasses() {
+  // classes.json has ONE writer at a time, and every write starts from what is in the folder at that moment.
+  //  * Two quick edits used to start two independent writes, and whichever FINISHED last won — an older list
+  //    could land on top of a newer one (screen: A and B; file: only A). They now queue, and each writes the
+  //    list as it stands when its turn comes.
+  //  * The file was rebuilt from this session's list alone, so a rename or a new class a colleague had saved
+  //    since we read it was written out of existence (and a new class of theirs with the number we had just
+  //    given ours silently changed meaning). See adoptFolderClasses.
+  //  * Two TABS with the folder open each read the file, and each wrote its own list over the other's. Reading,
+  //    merging and writing are one step among the tabs of this browser now (siteLock).
+  let classesChain = Promise.resolve(), classesChainTok = null;
+  let classesWaiting = false;   // an edit of the class list has not reached the folder: another tab holds the list, and the app is trying again
+  let classesTurn = { at: 0 };  // when the class write of this folder that is at work got its turn (0: none is at work)
+  let classesEdits = 0, classesWritten = 0;   // changes made to this folder's list here / how many of them are known to be in the folder
+  // The list of a folder that has been LEFT, written to that folder: what was changed here and had not reached it.
+  // Nothing of the folder that is open now is read, shown or touched. One step among the tabs, like every write
+  // of the list; the folder's file as it stands then is the starting point, and the changes made here are laid
+  // over it by the same rules as in adoptFolderClasses: ours where both changed a class; and a class made on
+  // both sides under one number — when ours is not used by any mark of this session it takes the next free
+  // number and both stay, when it is used it keeps its number (`used`: the class numbers this session's marks
+  // carried when the folder was left). A file that cannot be used as a class list is never written over from
+  // here: there is nobody left to ask.
+  const classFinishers = [];    // { root, done } — a folder that is opened again waits for its own
+  // (moved, optional: a Map that is filled with old number -> new number for the classes of ours that had to
+  // take another number.)
+  function mergeClassLists(baseRaw, mine, theirsRaw, theirs, used, moved) {
+    const nameOf = (c, i) => String((c && c.name) || I18n.t('classFallbackName', { idx: i }));
+    const base = new Map(), rawBy = new Map(), out = new Map();
+    if (baseRaw && Array.isArray(baseRaw.classes)) for (const c of baseRaw.classes) { const i = Number(c && c.index); if (Number.isFinite(i)) base.set(i, nameOf(c, i)); }
+    if (theirsRaw && Array.isArray(theirsRaw.classes)) for (const c of theirsRaw.classes) { const i = Number(c && c.index); if (Number.isFinite(i)) rawBy.set(i, c); }
+    for (const c of theirs) out.set(c.index, Object.assign({}, rawBy.get(c.index) || {}, { index: c.index, name: c.name }));
+    const mineIdx = new Set(mine.map(m => m.index)), usedHere = new Set(used || []), placeholder = I18n.t('unnamedPrefix');
+    for (const i of base.keys()) if (!mineIdx.has(i)) out.delete(i);                        // deleted here
+    const renumber = [];
+    for (const m of mine) {
+      const th = out.get(m.index), b = base.get(m.index);
+      if (!th) { out.set(m.index, { index: m.index, name: m.name }); continue; }             // ours alone
+      if (b !== undefined) { if (m.name !== b) th.name = m.name; continue; }                  // renamed here
+      // made on both sides since the list was last read, under one number
+      if (th.name === m.name || String(m.name).indexOf(placeholder) === 0) continue;          // one and the same, or ours is only the scan's placeholder: theirs stands
+      if (usedHere.has(m.index)) th.name = m.name;                                            // marks of this session carry the number: ours keeps it
+      else renumber.push(m);                                                                  // not used by any mark: ours takes the next free number, both stay
+    }
+    // (The numbers in use are kept in one set as the loop goes — it was built anew for every class, which made
+    // many classes with clashing numbers take time by the square of their count. Same rule as freeClassIndex:
+    // one above the highest while that is a legal number, then the lowest gap, then none.)
+    if (renumber.length) {
+      const takenNow = new Set(out.keys());
+      let top = 0, gap = 1;
+      for (const i of takenNow) if (okClassIdx(i) && i > top) top = i;
+      const nextFree = () => {
+        if (top < 65535) { top++; return top; }
+        while (gap <= 65535 && takenNow.has(gap)) gap++;
+        return gap <= 65535 ? gap : 0;
+      };
+      for (const m of renumber) {
+        const free = nextFree();
+        if (free) { takenNow.add(free); out.set(free, { index: free, name: m.name }); if (moved) moved.set(m.index, free); }
+        else out.get(m.index).name = m.name;                                                      // (no number left: as when it is in use)
+      }
+    }
+    return Object.assign({}, theirsRaw || {}, { classes: [...out.values()].sort((x, y) => x.index - y.index) });
+  }
+  function finishClassesFor(left) {
+    const entry = { root: left.root, done: null };
+    entry.done = (async () => {
+      for (let tries = 0; tries < 30; tries++) {
+        try {
+          return await siteLock('classes', async () => {
+            const disk = await Loader.loadClasses(left.root);
+            if (disk && disk.unreadable) throw new Error('classes.json cannot be read just now');   // (one read that failed is no verdict on the file: the next try reads it again)
+            if (!disk || !disk.ok || disk.dropped || (disk.list || []).some(c => !okClassIdx(c.index))) return false;   // not a list this may be laid over
+            const merged = mergeClassLists(left.base, left.mine, disk.raw || null, disk.list || [], left.used);
+            if (disk.raw && JSON.stringify(merged.classes) === JSON.stringify(disk.raw.classes)) return true;   // all of it is there already
+            await FS.writeText(left.root, 'classes.json', JSON.stringify(merged, null, 2));
+            return true;
+          }, left.root.name || '');
+        } catch (e) { await new Promise(r => setTimeout(r, Math.min(1000, LOCK_WAIT_MS / 4))); }      // the list is still held elsewhere, or the write failed: once more
+      }
+      return false;
+    })().then(ok => {
+      const i = classFinishers.indexOf(entry); if (i >= 0) classFinishers.splice(i, 1);
+      // It did not get there (the folder would not take the write, try after try, or its list has turned into
+      // one that cannot be used): the change exists nowhere now, so it is said — over whatever folder is open.
+      if (!ok) setBanner('saveFailedMsg', { msg: I18n.t('classesSaveFailed') + ' — “' + (left.root.name || '?') + '”' }, 'warn');
+    });
+    classFinishers.push(entry);
+  }
+  // Resolves when no class write of this folder is on its way any more — or when one that has its turn has not
+  // come back for a while.
+  function classesSettled() {
+    const turn = classesTurn, chain = classesChain, limit = Math.min(5000, LOCK_WAIT_MS / 4);
+    return new Promise(resolve => {
+      let done = false;
+      const finish = v => { if (!done) { done = true; resolve(v); } };
+      const look = () => { if (done) return; if (turn.at && Date.now() - turn.at > limit) finish('pending'); else setTimeout(look, 50); };
+      chain.then(() => finish('settled'), () => finish('settled')); look();
+    });
+  }
+  function saveClasses() {
+    // the dataset is fixed HERE, when the edit is made: a turn that comes up after another folder was opened
+    // must not write that folder's list (and must not walk into its unreadable-file path unasked)
+    const tok = dsToken, root = rootHandle;
+    classesEdits++;
+    // …and the queue belongs to the dataset: a write to another folder that hangs is not ours to wait for
+    if (classesChainTok !== tok) { classesChain = Promise.resolve(); classesChainTok = tok; classesTurn = { at: 0 }; }
+    const turn = classesTurn;
+    const job = () => (tok === dsToken && root === rootHandle)
+      ? siteLock('classes', () => {
+          if (tok !== dsToken || root !== rootHandle) return undefined;
+          classesWaiting = false; turn.at = Date.now();
+          return saveClassesNow().then(v => { turn.at = 0; return v; }, e => { turn.at = 0; throw e; });
+        }, root ? root.name : '').catch(e => {
+          // Another tab kept the lock too long. The list is still here and still not in the folder: say so (it
+          // used to stay silent, and the new class was gone after a reload), and come back for it. The new
+          // attempt queues for the lock again almost at once, so the list is written as soon as the other tab
+          // lets go (the second is only there so that a lock that fails outright cannot spin).
+          if (!(e && e.lockTimeout)) throw e;
+          if (tok !== dsToken || root !== rootHandle) return;
+          classesWaiting = true;
+          setSaveStatus('classesSaveFailed', null, true);
+          setTimeout(() => { if (tok === dsToken && root === rootHandle) saveClasses(); }, 1000);
+        })
+      : undefined;
+    const run = classesChain.then(job, job);
+    classesChain = run.catch(() => { });
+    return run;
+  }
+  // A class number is an integer 1…65535 (see openFolder: 0 is the paint layer's "unpainted", and the paint
+  // layer stores 16 bits). The next unused one: one above the highest while that is still a legal number, else
+  // the lowest gap; 0 when every number is taken.
+  const okClassIdx = i => Number.isInteger(i) && i >= 1 && i <= 65535;
+  function freeClassIndex(taken) {
+    let top = 0;
+    for (const i of taken) if (okClassIdx(i) && i > top) top = i;
+    if (top < 65535) return top + 1;
+    for (let i = 1; i <= 65535; i++) if (!taken.has(i)) return i;
+    return 0;
+  }
+  // Take over what changed in the folder's classes.json since this session last read or wrote it (classesRaw):
+  // a rename of a class we left alone, and classes we do not have. Where both sides changed the same class,
+  // ours stands — it is the edit being saved. A class the file no longer lists is kept: dropping it on someone
+  // else's word could strand marks of this session, and keeping it loses nothing.
+  // Returns false when the write must not go ahead now: the folder's file is there and cannot be looked at.
+  async function adoptFolderClasses(root) {
+    if (classesFileCorrupt) return true;                       // the file was unreadable at open: nothing to compare with (its own backup path applies)
+    let disk;
+    try { disk = await Loader.loadClasses(root); } catch (e) { return true; }
+    // The file is there and could not be READ at this moment. That says nothing about what it holds: it is read
+    // again, and if it still cannot be, the write does not go ahead now. (It was taken for a list that had
+    // turned unusable: the doctor was asked to replace a "damaged" list that was in perfect order — and saying
+    // yes wrote this session's list over a colleague's renames and new classes, which were left only in the
+    // .corrupt copy.)
+    for (let i = 0; disk && disk.unreadable && i < 2 && root === rootHandle; i++) {
+      await new Promise(r => setTimeout(r, 150));
+      try { disk = await Loader.loadClasses(root); } catch (e) { return true; }
+    }
+    if (root !== rootHandle || !disk) return true;
+    if (disk.unreadable) return false;
+    const list = (disk.ok && Array.isArray(disk.list)) ? disk.list : [];
+    if (!disk.ok || disk.dropped || list.some(c => !okClassIdx(c.index))) {
+      // Since this session read it, the file has become one no class list can be taken from in full: not JSON,
+      // or entries with a number no class can have (0, 65536, 2.5, none at all). Found like that when the
+      // folder is opened, it is never rewritten unasked and is copied to classes.json.corrupt first; the same
+      // holds here. (Taking such entries over put class 0 — the eraser — and 65536 into the list and the file.)
+      const pr = await rawFileProbe({ handle: root }, 'classes.json');
+      if (root !== rootHandle || pr.absent) return true;       // gone meanwhile: nothing to keep, the list is written afresh
+      if (pr.failed) return false;                             // cannot be read at all right now: not written over unseen
+      classesFileCorrupt = true; classesBackedUp = false; classesOverwriteOK = false;
+    }
+    if (!disk.ok || !disk.raw) return true;                    // nothing parseable to take over
+    const base = new Map(), theirs = new Map();
+    // names are read the way Loader.loadClasses reads them, so "unchanged by us" compares like with like
+    if (classesRaw && Array.isArray(classesRaw.classes)) for (const c of classesRaw.classes) { const i = Number(c && c.index); if (Number.isFinite(i)) base.set(i, String((c && c.name) || I18n.t('classFallbackName', { idx: i }))); }
+    for (const c of list) if (okClassIdx(c.index)) theirs.set(c.index, c.name);
+    let changed = false;
+    for (const c of classes) {                                 // their rename of a class this session did not rename
+      const b = base.get(c.index), th = theirs.get(c.index);
+      if (b !== undefined && th !== undefined && th !== b && c.name === b) { c.name = th; changed = true; }
+    }
+    for (const [i, name] of theirs) {                          // a class they added
+      if (base.has(i)) continue;
+      const mine = classes.find(c => c.index === i);
+      if (!mine) { classes.push({ index: i, name }); changed = true; continue; }
+      if (mine.name === name) continue;
+      // ours is only the placeholder the scan gives a class it found in use without a name: the real name wins
+      if (mine.name.indexOf(I18n.t('unnamedPrefix')) === 0) { mine.name = name; changed = true; continue; }
+      // Both sides created class i since the last read. Theirs is in the folder already and may be in use
+      // there; ours is new. Give ours the next free number — unless this session has already marked with it.
+      if (State.usedClasses().indexOf(i) < 0) {
+        const free = freeClassIndex(new Set([...classes.map(c => c.index), ...theirs.keys()]));
+        if (free) {                                            // (no legal number left: ours keeps its number, as when it is already in use)
+          if (State.getActiveClass() === i) State.setActiveClass(free);
+          mine.index = free; classes.push({ index: i, name }); changed = true;
+        }
+      }
+    }
+    classesRaw = disk.raw;                                     // their other fields (colour, description…) ride along in our write
+    if (changed) {
+      classes.sort((a, b) => a.index - b.index);
+      ensureActiveClass();
+      const ae = typeof document !== 'undefined' && document.activeElement;   // UI-5: never rebuild the manager under a name being typed
+      if (!(ae && ae.classList && ae.classList.contains('cls-name-inp'))) buildClassMgr();
+      buildClassPicker();
+      if (cur) refreshCanvasSelection();
+    }
+    return true;
+  }
+  async function saveClassesNow() {
     if (!rootHandle) return;
+    const root0 = rootHandle;
+    const goAhead = await adoptFolderClasses(root0);
+    if (root0 !== rootHandle) return;          // another folder was opened while we looked: its classes are not ours to write
+    if (goAhead === false || !confirmClassOverwrite()) { setSaveStatus('classesSaveFailed', null, true); return; }   // unreadable just now, or it turned unusable and replacing it was declined
     const wasCorrupt = classesFileCorrupt;
     const cbk = wasCorrupt ? await backupClassesOnce() : true;
+    if (root0 !== rootHandle) return;          // (as above: what follows is said and done for the folder that was open when this began)
     if (cbk !== true) {   // ROUND-9/R9-6: a full backup family never clears by retrying; say which files to move
       setBanner(cbk === 'slots' ? 'classesNoSlotFmt' : 'classesBackupFailed', cbk === 'slots' ? { file: 'classes.json.corrupt' } : null, 'warn');
       setSaveStatus('classesSaveFailed', null, true); return;
@@ -1453,6 +2179,7 @@
       const merged = Object.assign({}, classesRaw || {}, {
         classes: classes.map(c => Object.assign({}, prevByIdx.get(c.index) || {}, { index: c.index, name: c.name })),
       });
+      const holds = classesEdits;              // every change up to here is in `merged`
       // ROUND-3 FIX (GS-6/NL-4): UI-3 bound the handle once inside backupClassesOnce but its CALLER still
       // re-read the live rootHandle on both sides of this await — so a folder switch landing in between
       // wrote folder A's classes into folder B, and then cached A's raw object as "what is on disk" for B.
@@ -1460,13 +2187,14 @@
       await FS.writeText(root, 'classes.json', JSON.stringify(merged, null, 2));
       if (root !== rootHandle) return;         // the folder changed under us: do not adopt this as the new truth
       classesRaw = merged;                     // what is on disk now
+      if (holds > classesWritten) classesWritten = holds;
       if (wasCorrupt) {   // the file parses again — and the "left untouched" banner has just become FALSE
         classesFileCorrupt = false; classesBackedUp = false; classesWasReplaced = true;   // R12-5
         setBanner('classesReplaced', { file: classesBackupName }, 'warn');
       }
       setSaveStatus('classesSaved', { time: hhmm() });
     }
-    catch (e) { setSaveStatus('classesSaveFailed', null, true); }
+    catch (e) { if (root0 === rootHandle) setSaveStatus('classesSaveFailed', null, true); }   // (a write of the folder that was left, failing late, is not the open folder's failure: finishClassesFor comes back for it)
   }
   function randomName() { return I18n.t('unnamedPrefix') + Math.random().toString(36).slice(2, 6); }
   // collect every class index used anywhere inside one annotation.json object — flat v5 AND layered v6
@@ -1492,12 +2220,23 @@
     // rename compared EQUAL to the disk copy. reconcile then took its 'stale-clean' path — adopt the file,
     // markClean — and the rename was gone with no banner, no sidecar, and the mirror record erased. A name
     // the doctor typed is content.
-    const layer = o => ({ name: o.name == null ? null : String(o.name), collaterals: norm(o.collaterals), points: norm(o.points), paint: (o.paint && o.paint.classes) || null });
+    // Marked segments are a set keyed by segment id — this app reads them into a map and writes them sorted —
+    // so the order a file lists them in says nothing: the same marks listed [3,2,1] by another tool are the
+    // same marks. (Entries sharing an id keep their relative order: which one wins on import depends on it.)
+    // Points, layers and markers are shown in file order and stay in it.
+    const byId = arr => arr.sort((x, y) => (Number(x && x.id) || 0) - (Number(y && y.id) || 0));   // sort() is stable, and `arr` is norm()'s own fresh array
+    // Paint: the runs, and how they are to be read. A file whose runs are the same but whose encoding or size
+    // was changed (by a newer app, a re-export) is NOT the same paint — written back from this session it
+    // would get the old encoding and size again.
+    const paintSig = p => (p && typeof p === 'object' && p.classes) ? { e: p.encoding == null ? null : p.encoding, w: p.width == null ? null : p.width, h: p.height == null ? null : p.height, c: p.classes } : null;
+    const layer = o => ({ name: o.name == null ? null : String(o.name), collaterals: byId(norm(o.collaterals)), points: norm(o.points), paint: paintSig(o.paint) });
     // ROUND-3 FIX (SM-5): SP-2's two branches were not symmetric — the flat form carried the layer's name
     // in a top-level `layer_name` field while the layered form carried it inside the layer. The SAME
     // annotations written flat (v5, one layer) and layered (v6) therefore compared UNEQUAL, so the quiet
     // "identical content, only the timestamp moved" adoption never fired across that boundary. One shape.
-    if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => ({ id: Number(l.id), ...layer(l) })) });
+    // A layer entry that is not an object (importAnnotation skips those) is still part of what the file holds:
+    // it is kept in the comparison as what it is, instead of stopping the comparison with an exception.
+    if (Array.isArray(a.layers)) return JSON.stringify({ starred: !!a.starred, layers: a.layers.map(l => (l && typeof l === 'object') ? ({ id: Number(l.id), ...layer(l) }) : { unusable: l === undefined ? null : l }) });
     const flatName = (a.layer_name == null || a.layer_name === 'Layer 1') ? null : String(a.layer_name);
     return JSON.stringify({ starred: !!a.starred, layers: [{ id: 0, ...layer(a), name: flatName }] });
   }
@@ -1533,7 +2272,10 @@
       // vocabulary, and since that frame is never rewritten its name was gone for good. Count them as
       // un-checked so the "never delete on partial evidence" guard fires.
       if (protectedUnits.has(uk) || unimportedUnits.has(uk)) { unimported++; continue; }
-      if (sessionLoaded.has(uk)) continue;                           // reconciled AND imported into State
+      // …unless it has UNSAVED changes: State then says what the frame WILL contain, not what its file in the
+      // folder contains. Clear a frame with auto-save off, delete its class, and classes.json lost a name that
+      // annotation.json still pointed at. Unsaved frames are few; they are read like the unscanned ones.
+      if (sessionLoaded.has(uk) && !State.isDirty(c.id, u.id)) continue;   // reconciled AND imported into State AND identical to its file
       units.push(u);
     }
     const total = units.length;
@@ -1578,8 +2320,8 @@
       while (next < units.length) {
         if (gen !== openGen) return;
         const { c, u } = units[next++];
-        let ann = null, note = null, annCorrupt = false, noteCorrupt = false, versionAhead = 0, annMtime = 0, annDropped = 0, unreadable = false, noteUnreadable = false;
-        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annCorrupt = r.annCorrupt; noteCorrupt = !!r.noteCorrupt; versionAhead = r.versionAhead || 0; annMtime = r.mtime || 0; annDropped = r.annDropped || 0; unreadable = !!r.unreadable; noteUnreadable = !!r.noteUnreadable; }
+        let ann = null, note = null, annCorrupt = false, noteCorrupt = false, versionAhead = 0, annMtime = 0, annDropped = 0, unreadable = false, noteUnreadable = false, annRaw, noteRaw, annBytes, noteBytes;
+        try { const r = await Loader.loadAnnotation(u); ann = r.annotation; note = r.note; annRaw = r.annRaw; noteRaw = r.noteRaw; annBytes = r.annBytes; noteBytes = r.noteBytes; annCorrupt = r.annCorrupt; noteCorrupt = !!r.noteCorrupt; versionAhead = r.versionAhead || 0; annMtime = r.mtime || 0; annDropped = r.annDropped || 0; unreadable = !!r.unreadable; noteUnreadable = !!r.noteUnreadable; }
         catch (e) { unreadable = true; }
         if (gen !== openGen) return;
         const uk = State.key(c.id, u.id);
@@ -1592,14 +2334,15 @@
         if (noteUnreadable) noteUnreadableUnits.add(uk);   // ROUND-4/E2E-1: the clear lives in the reconcile block below — this loop SKIPS the import for units loadCur already seeded, and clearing there armed the next write to wipe the file it never read
         if (annCorrupt || annDropped) corruptUnits.add(uk); else { corruptUnits.delete(uk); corruptBackedUp.delete(uk); }   // ROUND-4/R4-GS-5 (the scan only ever ADDED)
         if (!sessionLoaded.has(uk) && !writingUnits.has(uk)) { // skip units loadCur already reconciled (keeps undo history) and units a save is writing RIGHT NOW (our snapshot of their file is already stale)
-          const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime);
+          const scanRead = { annotation: ann, annCorrupt, versionAhead, note, noteCorrupt, noteUnreadable, annRaw, noteRaw, annBytes, noteBytes };
+          const rec = await reconcileUnitFromDisk(c, u, ann, note, annMtime, sigOfRead(scanRead));
           if (gen !== openGen) return;
           evalImportProtection(c, u, ann, versionAhead);    // A1: the SCAN seeds most frames first — without this the loadCur fast path never re-evaluates
           if (noteCorrupt) noteCorruptUnits.add(uk);        // A2
           else if (!noteUnreadable) { noteCorruptUnits.delete(uk); noteCorruptBackedUp.delete(uk); }   // ROUND-4/R4-GS-5
           if (!noteUnreadable && (rec === 'clean' || rec === 'stale-clean')) noteUnreadableUnits.delete(uk);   // ROUND-5/R5-2: a reconcile that KEPT the local version imported nothing
           if (rec === 'conflict') conflicts++;
-          if (rec !== 'kept-dirty' && rec !== 'conflict' || !lastSeenMtime.has(uk)) lastSeenMtime.set(uk, annMtime);   // R7: same rule as loadCur (advance when State mirrors the file, or on a first sighting)
+          if (rec !== 'kept-dirty' && rec !== 'conflict' || !lastSeenMtime.has(uk)) { lastSeenMtime.set(uk, annMtime); sawRead(uk, scanRead, rec === 'kept-dirty' || rec === 'conflict'); }   // R7: same rule as loadCur (advance when State mirrors the file, or on a first sighting)
           if (rec !== 'raced') sessionLoaded.add(uk);          // seeded now — later Save/star/copy must not re-read + re-reconcile all of them (O(N) sweep)
         }
         if (cur && c.id === cur.caseId) updateFrameStar(c.id, u.id);   // SW-5: the rail shows the DISPLAYED case's rows   // the row was built before this unit was read: a stale hollow ☆ that the doctor clicks DELETES the star on disk
@@ -1627,6 +2370,11 @@
       buildClassPicker();
       // never auto-overwrite a classes.json that failed to parse — that would replace the user's names with placeholders
       if (!classesFileCorrupt) await saveClasses();
+      // (That write can take a while, and another folder can be opened meanwhile. What follows — the rows, the
+      // count of conflicts, the catch-up save of unsaved frames — is about the folder this scan read: over the
+      // new one it replaced that folder's own warning with a count of conflicts it does not have, and wrote its
+      // unsaved frames at once.)
+      if (gen !== openGen) return;
     }
     // Star glyphs and the case dropdown's ★ suffix are produced ONLY by these two builders — the old tail
     // called highlightNav(), which updates .active/.done/the annotated dot but never a star.
@@ -1676,8 +2424,10 @@
   function addClass() {
     const inp = $('className'), name = inp.value.trim(); if (!name) return;
     if (!confirmClassOverwrite()) return;   // an unreadable classes.json would be REPLACED by this edit
-    const idx = classes.reduce((m, c) => Math.max(m, c.index), 0) + 1;
+    const idx = freeClassIndex(new Set(classes.map(c => c.index)));   // "highest + 1" walked out of the legal range once a class 65535 existed
+    if (!idx) return;                                                 // all 65535 numbers are taken
     classes.push({ index: idx, name }); inp.value = '';
+    classes.sort((a, b) => a.index - b.index);
     ensureActiveClass(); buildClassMgr(); buildClassPicker(); saveClasses();
   }
   function renameClass(idx, name) {
@@ -1791,8 +2541,10 @@
     const tgtCase = cur && cur.caseId, tgtUnit = cur && cur.unitId;   // AEP-2: the frame the copy is FOR, captured before any await
     exitCopyPick();   // exit FIRST so its setBanner(null) can't wipe doCopyFrom's result banner
     if (!c || !src || !cur || cur.caseId !== caseId || cur.unitId === unitId) return;   // the source must be another frame of the case that is actually displayed
+    const tok = dsToken;
     if (!src.virtual && !src.mismatch) {                             // the background scan may not have reached the SOURCE yet — an unseeded source would falsely read as "no annotations"
       const st = await ensureSeeded(c, src);
+      if (tok !== dsToken) return;                                    // another folder was opened meanwhile: nothing is copied into it, and nothing is said there about a frame it does not have
       if (st !== 'seeded' && st !== 'already') { setBanner('frameNotSeeded', { id: src.id }, 'warn'); return; }   // we could not read the source: say so instead of copying "nothing"
       // REVIEW FIX F5: copying FROM a read-only frame was never refused. Its State is empty (or half
       // imported), so the doctor got "has no annotations to copy" — a lie about a fully annotated file —
@@ -1881,6 +2633,7 @@
     view.setMarkerHighlight(0);                             // never carry a chip-hover highlight across rebuilds/frames
     view.setMarkers(State.markerList(cur.caseId, cur.unitId));
     buildMarkerChips();
+    updateCopyBtn();                                        // a numbered marker decides whether "Copy from another frame" is offered: placing or removing one changes that at once, not at the next frame change
     if (markerArm) setBanner('markerPlaceHint', { n: State.nextMarkerId(cur.caseId, cur.unitId) });   // keep the promised number fresh
   }
   function buildMarkerChips() {
@@ -1936,7 +2689,13 @@
   // download the current case's perfusion map as a PNG
   async function exportPerfusion() {
     const c = curCase(); if (!c) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
+    // The export belongs to the folder it was asked for in. Everything below is looked up by the case's NAME,
+    // and cases carry the same names in every folder: with another folder opened while this waited (for the
+    // map, for the minip mask), the file that came out under this case's name was the OTHER folder's map.
+    // After a switch nothing is exported.
+    const gen = openGen;
     let perf = await ensureCasePerfusion(c);
+    if (gen !== openGen) return;
     if (State.getPerfMask() && perf) {                       // wait for the minip mask (bounded) so the export matches the on-screen filter
       ensureMinipMask(c);
       const t0 = Date.now();
@@ -1944,12 +2703,13 @@
         const e = perfTouch(c.id);
         if (!e || e === 'failed' || (e.minipMask !== undefined && e.minipMask !== 'pending')) break;
         await new Promise(r => setTimeout(r, 60));
+        if (gen !== openGen) return;
       }
       perf = perfView(c) || perf;
     }
     if (!perf || !perf.canvas) { setBanner('perfFailed', null, 'warn'); return; }
     perf.canvas.toBlob(blob => {
-      if (!blob) return;
+      if (!blob || gen !== openGen) return;
       const url = URL.createObjectURL(blob), a = document.createElement('a');
       a.href = url; a.download = c.id + '_perfusion.png';
       document.body.appendChild(a); a.click(); a.remove();
@@ -2004,9 +2764,11 @@
     if (!sessionLoaded.has(k)) { setBanner('frameNotSeeded', { id: u }, 'warn'); return; }   // same rule as writeUnit: never overwrite an annotation.json this session could not read
     if (conflictedUnits.has(k)) { setBanner('conflictFoundFmt', { id: u, k }, 'warn'); showConflictDialog(k); return; }   // unresolved conflict: choosing comes first, no write may touch the file
     State.setNote(c, u, $('note').value);
+    const tok = dsToken;                                      // (what follows the write speaks about THIS folder's frame: not after another folder was opened)
     try {
       setSaveStatus('saving');
       await writeUnit(c, unit);
+      if (tok !== dsToken) return;
       if (conflictedUnits.has(k)) {                           // the write itself found a NEWER file on disk and refused
         setSaveStatus(null);                                  // the frame is NOT saved — never claim it is
         setBanner('conflictFoundFmt', { id: u, k }, 'warn');
@@ -2014,8 +2776,10 @@
         return;
       }
       updateDirtyUI();
-      setSaveStatus('noteSaved', { time: hhmm() });
-    } catch (e) { setSaveStatus('noteSaveFailed', null, true); }
+      // The write took the note as it was when it began. Text typed while it was on its way is not in the folder:
+      // the frame is still unsaved (its mark says so), and "Note saved" next to it said the opposite.
+      if (State.isDirty(c, u)) setSaveStatus(null); else setSaveStatus('noteSaved', { time: hhmm() });
+    } catch (e) { if (tok === dsToken) setSaveStatus('noteSaveFailed', null, true); }
   }
   function toggleRPanel() { document.body.classList.toggle('rpanel-collapsed'); onResize(); }
 
@@ -2071,13 +2835,17 @@
     State.markDirty(c.id, u.id);
     buildCaseOptions(); buildFrameList(); updateDirtyUI();
     if (State.getAutoSave() && rootHandle) {   // write THIS frame (not necessarily the current one)
+      const tok = dsToken;
       try {
-        setSaveStatus('saving'); await writeUnit(c.id, u); updateDirtyUI();
+        setSaveStatus('saving'); await writeUnit(c.id, u);
+        if (tok !== dsToken) return;             // another folder was opened meanwhile: nothing here is said about ITS frame of that name
+        updateDirtyUI();
         if (conflictedUnits.has(State.key(c.id, u.id))) {   // REVIEW FIX CONF-4: refused, not saved
           setSaveStatus(null); setBanner('conflictFoundFmt', { id: u.id, k: State.key(c.id, u.id) }, 'warn');
-        } else setSavedStatus();
+        } else if (State.isDirty(c.id, u.id)) setSaveStatus(null);   // worked on while it was being written: that is not in the folder yet
+        else setSavedStatus();
       }
-      catch (e) { reportWriteFailure(e, u.id, 'saveFailed', State.key(c.id, u.id)); }
+      catch (e) { if (tok === dsToken) reportWriteFailure(e, u.id, 'saveFailed', State.key(c.id, u.id)); }
     }
   }
   // REVIEW FIX SW-1: this built the NAV TARGET's rows (curCase()) while the canvas, the header, and
@@ -2612,30 +3380,84 @@
   // "Keep folder version" and then impatiently "Keep session version" ran two resolutions of the same
   // conflict concurrently, each writing its own backup. One at a time.
   let resolveBusy = false;
+  // Counted up whenever the doctor puts the choice off (Decide later, Esc). A resolution that is still at work
+  // then belongs to a choice that is no longer wanted: it must not go on to change the frame.
+  let conflictOp = 0;
+  function deferConflict() { conflictOp++; hideConflictDialog(); }
   async function resolveConflict(k, choice) {
     if (resolveBusy) return;
     resolveBusy = true;
-    try { return await resolveConflictInner(k, choice, conflictedUnits.get(k)); } finally { resolveBusy = false; }
-  }
-  async function resolveConflictInner(k, choice, rec) {
-    const [cc, uu] = [k.slice(0, k.lastIndexOf('/')), k.slice(k.lastIndexOf('/') + 1)];
-    const cRef = cases.find(x => x.id === cc), unit = cRef && cRef.units.find(x => x.id === uu);
-    if (!unit) return;
+    const op = ++conflictOp;
+    // WHICH frame the choice is about is settled here, at the click — not when its turn comes. The turn can come
+    // seconds later (another tab is resolving the same frame), another folder can have been opened by then, and
+    // its frames carry the same names: looked up then, the choice was carried out on the other folder's frame —
+    // that folder's unsaved work written over its file, or put aside and the frame called clean.
     const tok = dsToken;
-    let r = rec;
-    if (!r || !r.ann) {
-      try {
-        const rr = await Loader.loadAnnotation(unit);
-        r = { ann: rr.annotation, note: rr.note, annMtime: rr.mtime || 0,
-              opaque: !rr.annotation && !!(rr.unreadable || rr.annCorrupt || rr.versionAhead) };
-      } catch (e) { r = { ann: null, note: null, annMtime: 0, opaque: true }; }
+    const cc = k.slice(0, k.lastIndexOf('/')), uu = k.slice(k.lastIndexOf('/') + 1);
+    const cRef = cases.find(x => x.id === cc), unit = cRef && cRef.units.find(x => x.id === uu);
+    // …and so is WHAT the session held: "keep the folder version" is a choice about the copy as it stood at the
+    // click. Work done after it — while the choice waited for its turn, or during its first look at the folder —
+    // was put aside with the rest and the frame went back to the folder's version.
+    const seqAtClick = State.getDirtySeq(cc, uu);
+    // One resolution of a frame at a time among the tabs of this browser: two tabs that both kept the folder
+    // version each found the same backup name free and wrote their own unsaved copy into it — one of the two
+    // copies was gone. (Its own lock name: the save it ends with takes the frame's lock.)
+    try {
+      if (!unit) return;
+      return await siteLock('resolve:' + k, () => {
+        // our turn — if it is still wanted: not after another folder was opened, and not after the choice was
+        // put off (Decide later, Esc) while it waited; a choice nobody wants writes no backup either
+        if (tok !== dsToken || op !== conflictOp) return undefined;
+        return resolveConflictInner(k, choice, conflictedUnits.get(k), op, { tok, cRef, unit, seq: seqAtClick });
+      });
     }
+    catch (e) { if (tok === dsToken) setBanner('saveFailedMsg', { msg: (e && e.message) || String(e) }, 'warn'); }
+    finally { resolveBusy = false; }
+  }
+  async function resolveConflictInner(k, choice, rec, op, bound) {
+    if (op === undefined) op = conflictOp;
+    const [cc, uu] = [k.slice(0, k.lastIndexOf('/')), k.slice(k.lastIndexOf('/') + 1)];
+    const cRef = bound ? bound.cRef : cases.find(x => x.id === cc), unit = bound ? bound.unit : (cRef && cRef.units.find(x => x.id === uu));
+    if (!unit) return;
+    const tok = bound ? bound.tok : dsToken;
     if (tok !== dsToken) return;
+    // Read the folder copy NOW. The record made when the chooser opened can be minutes old, and a save that
+    // a colleague made since then was neither the version we backed up ("keep mine" wrote over it — it was
+    // simply gone) nor the version we adopted ("keep the folder version" took the older one). Only when the
+    // folder cannot be read at this moment does the chooser's own copy stand in.
+    let r, rr0 = null;
+    try {
+      const rr = await Loader.loadAnnotation(unit);
+      rr0 = rr;
+      r = { ann: rr.annotation, note: rr.note, annMtime: rr.mtime || 0,
+            opaque: !rr.annotation && !!(rr.unreadable || rr.annCorrupt || rr.versionAhead),
+            noteOpaque: !!(rr.noteUnreadable || rr.noteCorrupt), sig: sigOfRead(rr) };
+    } catch (e) { r = (rec && rec.ann) ? rec : { ann: null, note: null, annMtime: 0, opaque: true }; }
+    const rSig = r.sig || { ann: r.opaque ? undefined : annSig(r.ann), note: noteSig(r.note) };
+    if (tok !== dsToken) return;
+    // The copy of the session this choice is about is the one that stood at the click — whichever version is
+    // kept. From the first change on it is another copy: the choice is dropped, the newer work stays in the
+    // session (unsaved) and the question stays open.
+    const seqClick = (bound && bound.seq !== undefined) ? bound.seq : State.getDirtySeq(cc, uu);
+    const sameCopy = () => tok === dsToken && op === conflictOp && State.getDirtySeq(cc, uu) === seqClick;
+    const stay = () => { if (tok === dsToken && cur && State.key(cur.caseId, cur.unitId) === k && conflictShownFor !== k) setBanner('conflictFoundFmt', { id: uu, k }, 'warn'); };
     if (choice === 'disk') {
+      // The folder's note.json exists but cannot be read (or parsed) at this moment. "Keep the folder version"
+      // would then take the annotation and an EMPTY note — the note box went blank, the conflict was closed
+      // and the banner said the folder version had been kept. Adopt nothing; the chooser comes back when the
+      // frame is opened again, and the session's version is untouched meanwhile.
+      if (r.noteOpaque) { hideConflictDialog(); setBanner('conflictKeptDiskRefused', null, 'warn'); return; }
       // REVIEW FIX I18N-1: the banner named annotation.unsaved-backup.json unconditionally. When only the
       // NOTE differed, the file actually written was note.unsaved-backup.json — and the doctor went looking
       // for a file that does not exist. Name what we really wrote.
       let backedUp = false; const keptFiles = [];
+      // The session's copy as it stands NOW is what this choice puts aside. Everything below waits on the folder
+      // (looking for a free backup name, writing, reading once more), and the doctor can go on working or put
+      // the choice off meanwhile. From the first change on, this is no longer the copy the choice was made about:
+      // nothing more is written and nothing is adopted. (The count used to be taken after the backup names had
+      // been looked for: a point added during that search was in no backup, and the frame was called clean.)
+      const seq0 = seqClick, fresh = sameCopy;
+      if (!fresh()) { stay(); return; }           // worked on since the click: no backup name is looked for, nothing is written
       try {
         const sz = (r.ann && Array.isArray(r.ann.image_size) && r.ann.image_size.length === 2) ? r.ann.image_size : [0, 0];
         // ROUND-7/R7-7: these four sidecar writes were the last unconditional ones left. Each can land on a
@@ -2644,16 +3466,22 @@
         // family refuses the resolution rather than overwriting, because resolving is not urgent and losing
         // a colleague's only copy is not undoable.
         const localAnn = State.buildAnnotation(cc, uu, sz[0], sz[1]);
-        const needA = State.unitHasContent(cc, uu) && annContentSig(localAnn) !== annContentSig(r.ann);
+        // a layer the doctor only NAMED is content too (SP-2), though it holds no marks yet: without this the
+        // name was dropped with no backup when the folder version was kept
+        const needA = (State.unitHasContent(cc, uu) || annContentSig(localAnn) !== annContentSig({})) && annContentSig(localAnn) !== annContentSig(r.ann);
         const needN = State.hasNoteData(cc, uu) && noteContentSig(State.buildNote(cc, uu)) !== noteContentSig(r.note);
+        // (After every wait: another folder may be open by now, and what is on its screen — its chooser, its
+        // banner — is not this choice's to close or to write over. Frames carry the same names everywhere.)
         const planA = needA ? await parkPlan(unit, 'annotation.unsaved-backup.json', () => JSON.stringify(State.buildAnnotation(cc, uu, sz[0], sz[1]), null, 2)) : null;
+        if (tok !== dsToken) return;
         if (needA && planA === null) { refuseNoSlot(k, uu, 'annotation.unsaved-backup.json'); return; }
         const planN = needN ? await parkPlan(unit, 'note.unsaved-backup.json', () => JSON.stringify(State.buildNote(cc, uu), null, 2)) : null;
+        if (tok !== dsToken) return;
         if (needN && planN === null) { refuseNoSlot(k, uu, 'note.unsaved-backup.json'); return; }
-        const stillOurs = () => tok === dsToken;   // R9-8
-        if (planA) { const nm = await parkWrite(unit, planA, stillOurs); if (nm === null) return; backedUp = true; keptFiles.push(nm); }
-        if (planN) { const nm = await parkWrite(unit, planN, stillOurs); if (nm === null) return; backedUp = true; keptFiles.push(nm); }
-      } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
+        if (!fresh()) { stay(); return; }
+        if (planA) { const nm = await parkWrite(unit, planA, fresh); if (nm === null) { stay(); return; } backedUp = true; keptFiles.push(nm); }
+        if (planN) { const nm = await parkWrite(unit, planN, fresh); if (nm === null) { stay(); return; } backedUp = true; keptFiles.push(nm); }
+      } catch (e) { if (tok === dsToken) setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }   // could not back the loser up: resolve nothing
       if (tok !== dsToken) return;
       // REVIEW FIX R3/L1: adopting a folder copy we could not PARSE used to resetUnit() and import nothing —
       // the frame went blank while the banner said "Kept the folder version." loader.js's own contract says
@@ -2663,10 +3491,45 @@
         setBanner('conflictKeptDiskRefused', null, 'warn');
         return;
       }
+      // Putting the session's copy aside took time (two files on a slow folder). What is adopted has to be what
+      // the folder holds NOW: if it changed meanwhile, the chooser is shown again with that version instead of
+      // the frame showing — as "the folder version" — something the folder no longer contains.
+      let again = null;
+      try { again = await Loader.loadAnnotation(unit); } catch (e) { again = null; }
+      if (tok !== dsToken) return;
+      // The doctor put the choice off (Decide later, Esc) or went on working while the session copy was being
+      // put aside and the folder read once more. What the session holds now is newer than what was put aside:
+      // resetting the frame here wiped it — text typed in those seconds was gone, and the frame counted as
+      // saved. Nothing is adopted; the conflict stays open and the choice is asked again.
+      if (op !== conflictOp || State.getDirtySeq(cc, uu) !== seq0) {
+        if (cur && State.key(cur.caseId, cur.unitId) === k && conflictShownFor !== k) setBanner('conflictFoundFmt', { id: uu, k }, 'warn');
+        return;
+      }
+      const aSig = again ? sigOfRead(again) : null;                // (a read that fails outright leaves the copy read above standing, as before)
+      if (aSig && (aSig.ann !== rSig.ann || aSig.note !== rSig.note)) {
+        conflictedUnits.set(k, null);
+        hideConflictDialog();
+        if (cur && State.key(cur.caseId, cur.unitId) === k) { setBanner('conflictFoundFmt', { id: uu, k }, 'warn'); showConflictDialog(k); }
+        return;
+      }
       State.resetUnit(cc, uu);
       try { if (r.ann) State.importAnnotation(cc, uu, r.ann); if (r.note) State.importNoteJson(cc, uu, r.note); } catch (e) { }
       State.markClean(cc, uu, undefined, r.annMtime);
-      lastSeenMtime.set(k, r.annMtime || 0);
+      lastSeenMtime.set(k, r.annMtime || 0); setSeen(k, rSig);
+      // What was taken over may be only PART of the file (two layers sharing an id: one is skipped). The next
+      // save writes the frame out from what was taken — so, exactly as when such a file is met on opening, the
+      // file itself is put aside first. (The marks said nothing here, and editing just the note then removed the
+      // skipped layer from the file and from every backup.)
+      {
+        const src = again || rr0;
+        if (src) {
+          if (src.annCorrupt) unimportedUnits.add(k); else unimportedUnits.delete(k);
+          corruptBackedUp.delete(k);
+          if (src.annCorrupt || src.annDropped) corruptUnits.add(k); else corruptUnits.delete(k);
+          if (src.noteCorrupt) { noteCorruptUnits.add(k); noteCorruptBackedUp.delete(k); }
+          else if (!src.noteUnreadable) { noteCorruptUnits.delete(k); noteCorruptBackedUp.delete(k); }
+        }
+      }
       // REVIEW FIX F8: evalImportProtection runs only at seed/loadCur/scan time, and the lastSeenMtime we
       // just set makes loadCur take its `unchanged` fast path — so a frame whose file has since been FIXED
       // stayed locked read-only forever. Re-evaluate against the version we just adopted.
@@ -2707,34 +3570,91 @@
       // slot 1 regardless — which by construction holds different, older content. The doctor would open the
       // file the app told them held the irreplaceable bytes and find something else.
       let extAnnName = 'annotation.external-backup.json';
+      if (!sameCopy()) { stay(); return; }        // worked on since the click (while the choice waited for its turn, or during its first look at the folder)
       try {
         // ROUND-7/R7-7: same allocator for the FOLDER side — this is the path that used to destroy the
         // unread-note copy before it was given a name of its own.
         // v102/R102-2: a note-only frame has no annotation.json at all — nothing to preserve, which is not the same as
         // "could not be read" (that refusal used to block 'keep this session' on every note-only conflict).
+        // The copy is the FILE, not what this build read out of it. Written out again from the parsed content, a
+        // file this build only partly understands (a paint encoding from a newer app, a byte-order mark) came back
+        // as different bytes — and "byte for byte" is what the help promises for exactly those.
         let body;
-        if (r.ann) body = JSON.stringify(r.ann, null, 2);
-        else { const pr = await rawFileProbe(unit, 'annotation.json'); body = pr.absent ? undefined : (pr.failed ? null : pr.text); }
+        { const pr = await rawFileProbe(unit, 'annotation.json'); body = pr.absent ? undefined : (pr.failed ? null : rawOf(pr)); }
+        if (tok !== dsToken) return;               // (a read of the folder that was left, failing late, closed the chooser of the folder that is open)
         if (body === null) { hideConflictDialog(); setBanner('conflictDiskUnsavable', null, 'warn'); return; }
         const planA = body === undefined ? null : await parkPlan(unit, 'annotation.external-backup.json', () => body);
+        if (tok !== dsToken) return;
         if (body !== undefined && planA === null) { refuseNoSlot(k, uu, 'annotation.external-backup.json'); return; }
-        const bodyN = r.note ? JSON.stringify(r.note, null, 2) : await rawFileText(unit, 'note.json');
+        let bodyN = null;
+        {
+          const prN = await rawFileProbe(unit, 'note.json');
+          if (tok !== dsToken) return;
+          // there, and no true copy can be made of it just now (not readable, or its bytes are not): nothing is
+          // written over it — whether it parsed a moment ago or not. (Only a note that parsed stopped the choice;
+          // a DAMAGED one, the one that cannot be had again, went on to be replaced with no copy kept.)
+          if (prN.failed) { hideConflictDialog(); setBanner('conflictDiskUnsavable', null, 'warn'); return; }
+          if (!prN.absent) bodyN = rawOf(prN);
+        }
         const planN = bodyN === null ? null : await parkPlan(unit, 'note.external-backup.json', () => bodyN);
+        if (tok !== dsToken) return;
         if (bodyN !== null && planN === null) { refuseNoSlot(k, uu, 'note.external-backup.json'); return; }
-        const stillOurs = () => tok === dsToken;   // R9-8 (these two closures are constants, but the guard costs nothing and the next edit may not be)
-        if (planA) { const nmA = await parkWrite(unit, planA, stillOurs); if (nmA === null) return; extAnnName = nmA; }
-        if (planN && (await parkWrite(unit, planN, stillOurs)) === null) return;
-      } catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+        const stillOurs = sameCopy;                // R9-8; a choice that was put off, or whose copy was worked on since, writes nothing more
+        if (planA) { const nmA = await parkWrite(unit, planA, stillOurs); if (nmA === null) { stay(); return; } extAnnName = nmA; }
+        if (planN && (await parkWrite(unit, planN, stillOurs)) === null) { stay(); return; }
+      } catch (e) { if (tok === dsToken) setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
       if (tok !== dsToken) return;
-      conflictedUnits.delete(k);
       // ROUND-4 FIX: v89 taught ensureSeeded/loadCur/the scan to record max(annotation, note) so the write
       // guard measures like for like — and missed this one. Recording the annotation's mtime alone here
       // meant that resolving a conflict on a frame whose note.json is newer immediately re-armed the guard:
       // the write we were about to make was refused as a fresh conflict, right after telling the doctor
       // their version had been kept.
-      lastSeenMtime.set(k, (await unitDiskMtime(unit)) || 0);   // the file as it stands is KNOWN to us now — our write may proceed over it
+      if (!sameCopy()) { stay(); return; }                       // put off — or worked on — while the folder's copy was being backed up: nothing is written, the conflict stays
+      const knownMs = (await unitDiskMtime(unit)) || 0;
+      // Another folder was opened during that read. Case and frame names repeat in every dataset, so going on
+      // from here recorded THIS folder's file time under the new dataset's frame of the same name and then
+      // queued a write that carried the new dataset's identity: the other folder's annotations and note were
+      // written into this folder's files. Nothing after an await may run for a dataset that is no longer open.
+      if (tok !== dsToken) return;
+      if (!sameCopy()) { stay(); return; }                       // …or put off, or worked on, during that last look: the file stays as it is, the conflict stays
       hideConflictDialog();
-      try { await writeUnit(cc, unit); } catch (e) { }         // failures land in the retry queue like any write
+      let failure = null, wrote;
+      // (The write can still wait — another tab may hold this frame. What is written when its turn comes must be
+      // the copy the choice was made about: text typed during that wait used to go into the file as "my version"
+      // under "Saved", a version nobody had chosen. From the first change on the choice is dropped here too: the
+      // newer work stays in the session, unsaved, and the question is asked again.)
+      // The question counts as answered only when that turn has come and the copy is still the one that was
+      // chosen. Until then the frame stays as it was — conflicted, and not vouched for if it was not. A write
+      // that does not get its turn (another tab holds the frame for longer than the wait) is tried again under
+      // the same condition (see writeUnit), and a page loaded again meanwhile finds the conflict again.
+      // (All of this used to be settled BEFORE the write was queued. A choice that was dropped while it waited
+      // then left work nobody had chosen "known" and "this folder's": the retry, or the next auto-save after a
+      // reload, wrote it over the folder's version without asking.)
+      // What `begun` returns is the way back, for a choice that is dropped after all while its write reads the
+      // folder.
+      const begun = () => {
+        const seenWas = lastSeenSig.get(k), msWas = lastSeenMtime.get(k), sigWas = State.getKnownSig(k);
+        conflictedUnits.delete(k);
+        const stampWas = State.claimUnit(k);                     // kept, for THIS folder: from here on it is this folder's unsaved work like any other
+        lastSeenMtime.set(k, knownMs);                           // the file as it stands is KNOWN to us now — our write may proceed over it
+        // …by CONTENT it is the version we have just preserved, and nothing else: if a third version landed while
+        // the backup was being written, writeUnit finds a file it does not know and refuses (handled just below).
+        setSeen(k, rSig);
+        return () => {
+          conflictedUnits.set(k, null);
+          State.disownUnit(k, stampWas);
+          if (msWas === undefined) lastSeenMtime.delete(k); else lastSeenMtime.set(k, msWas);
+          if (seenWas) lastSeenSig.set(k, seenWas); else lastSeenSig.delete(k);
+          State.setKnownSig(k, sigWas ? sigWas.a : undefined, sigWas ? sigWas.n : undefined);
+        };
+      };
+      try { wrote = await writeUnit(cc, unit, () => tok === dsToken && State.getDirtySeq(cc, uu) === seqClick, begun); } catch (e) { failure = e; }   // failures land in the retry queue like any write — those a retry can cure
+      if (tok !== dsToken) return;                             // …nor may a banner about this frame land on the other folder's frame of the same name
+      if (wrote === 'dropped') { conflictedUnits.set(k, null); highlightNav(); updateDirtyUI(); stay(); return; }
+      // The write failed: say so like any failed write (the retry queue does not take a failure that trying
+      // again cannot cure — permission withdrawn, the folder gone — and "Kept this session's version" + "Saved"
+      // then stood over a file that still held the other version).
+      if (failure) { highlightNav(); updateDirtyUI(); reportWriteFailure(failure, uu, 'saveFailed', k); return; }
       highlightNav(); updateDirtyUI();
       // ROUND-3 FIX: CONF-4's "a write that RETURNS is not a write that HAPPENED" re-check was added to
       // runAutoSave, saveNote, runRetries, toggleStar and cross-frame undo — and missed the one caller that
@@ -2755,6 +3675,9 @@
       // ROUND-10/R10-5: this matched on the KEY alone, so resolving frame A off-screen wiped the warning
       // that belonged to frame B — which was still conflicted and still refusing every write, now with a
       // blank banner. Retire only the message about the frame we actually resolved.
+      // The write has not happened: it waits in the retry queue (another tab holds the frame), or it failed. The
+      // write path has said so; "Kept this session's version" next to "not written yet" would say two things.
+      if (retryQ.has(k) || (lastBanner && lastBanner.key === 'writeFailedBanner' && lastWriteFailKey === k)) return;
       if (!onFrame) {
         // ROUND-11/R11-3: matching on the frame NAME alone was not enough — ids like `frame_1` repeat in
         // every case folder, so resolving one case's frame_1 wiped another case's frame_1 warning, on a
@@ -2767,10 +3690,11 @@
         setSaveStatus(null);
       } else if (r.opaque) {                               // R3: the bytes we could not read are safe in the sidecar
         setBanner('conflictDiskUnreadable', { file: extAnnName }, 'warn');
-        if (!retryQ.size) setSavedStatus();
+        if (State.isDirty(cc, uu)) setSaveStatus(null); else if (!retryQ.size) setSavedStatus();   // (as below)
       } else {
         setBanner(r.ann ? 'conflictKeptLocal' : 'conflictKeptLocalNoBackup', r.ann ? { file: extAnnName } : null, 'ok');
-        if (!retryQ.size) setSavedStatus();
+        // (the version that was kept is in the folder; what was typed while it was being written is not yet)
+        if (State.isDirty(cc, uu)) setSaveStatus(null); else if (!retryQ.size) setSavedStatus();
       }
     }
   }
@@ -2795,6 +3719,7 @@
   const isRescueName = n => RESCUE_NAMES.indexOf(rescueBase(n)) >= 0;
   const rescueFound = new Map();   // State.key() -> [names present at last check] (session cache)
   let rescueShownFor = null, rescueFiles = [], rescueSel = 0;
+  let rescueFor = null, rescueAsk = 0;   // which folder's frame the chooser was filled for; the newest request to fill it
   async function checkRescueFiles(c, u) {
     const k = State.key(c.id, u.id), tok = dsToken;
     try {
@@ -2821,19 +3746,28 @@
   }
   async function openRescueDialog(k) {
     if (!cur || State.key(cur.caseId, cur.unitId) !== k) return;
-    const c = cur.caseId, unit = cur.unit;
+    const unit = cur.unit, tok = dsToken, ask = ++rescueAsk;
     const names = rescueFound.get(k) || [];
     if (!names.length) return;
-    rescueFiles = [];
+    // Read into a list of our own, and shown only if it is still wanted. The reads take time; another folder —
+    // whose frames carry the same names — can be opened meanwhile, and its frame then showed THIS folder's
+    // backups: "Restore" and a save put this folder's note into the other folder's file.
+    const files = [];
     for (const name of names) {
       try {
         const fh = await unit.handle.getFileHandle(name);
         const txt = await (await fh.getFile()).text();
+        const isNote = name.indexOf('note.') === 0;
         let parsed = null; try { parsed = JSON.parse(txt); } catch (e) { }
-        rescueFiles.push({ name, bytes: txt.length, parsed, isNote: name.indexOf('note.') === 0 });
+        // Only what this build can take over can be restored: a document (an object) — for an annotation, one of
+        // a format it knows. JSON that is a list, a number or a text is a file to look at, like one that is not
+        // JSON at all: "restoring" it took nothing over and left the note empty. (The same rule as on opening.)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || (!isNote && Number(parsed.schema_version) > 6)) parsed = null;
+        files.push({ name, bytes: txt.length, parsed, isNote });
       } catch (e) { }
     }
-    if (!cur || State.key(cur.caseId, cur.unitId) !== k || !rescueFiles.length) return;
+    if (tok !== dsToken || ask !== rescueAsk || !cur || cur.unit !== unit || State.key(cur.caseId, cur.unitId) !== k || !files.length) return;
+    rescueFiles = files; rescueFor = { tok, unit };
     rescueShownFor = k; rescueSel = 0;
     $('rescueTitle').textContent = I18n.t('rescueTitleFmt', { id: cur.unitId });
     renderRescueTabs();
@@ -2879,7 +3813,7 @@
       $('btnRescueRestore').classList.add('hidden');   // .corrupt that still does not parse: information only
     }
   }
-  function hideRescueDialog() { $('rescueModal').classList.add('hidden'); rescueShownFor = null; }
+  function hideRescueDialog() { $('rescueModal').classList.add('hidden'); rescueShownFor = null; rescueFor = null; }
   // THE SWAP: current version -> the rescue file's own name; rescue content -> the live State (+ auto-save).
   // The name the DISPLACED version is written to. REVIEW FIX R4: the swap used to write straight back over
   // the rescue file — including `.corrupt` files, whose entire value is content this build cannot represent
@@ -2910,6 +3844,7 @@
     const f = rescueFiles[rescueSel];
     if (!f || !f.parsed || !cur || rescueShownFor !== State.key(cur.caseId, cur.unitId)) return;
     const c = cur.caseId, u = cur.unitId, unit = cur.unit, k = State.key(c, u), tok = dsToken;
+    if (!rescueFor || rescueFor.tok !== tok || rescueFor.unit !== unit) { hideRescueDialog(); return; }   // filled for another folder's frame of this name: never restored here
     const data = cacheTouch(k); if (!data) return;
     // REVIEW FIX R9/SE-3: restoreRescue was the ONE writer with no authority check. "Restoring" is a SWAP,
     // and the version it writes into the rescue file is built from State — so when State is not authoritative
@@ -2922,8 +3857,23 @@
       return;
     }
     const swapBase = rescueSwapTarget(f.name);
+    // Finding a free backup name and writing into it is ONE step among the tabs of this browser, and the same
+    // step as the conflict chooser's: two tabs restoring the same backup each found the same name free for the
+    // version they were replacing, and the second wrote over the first — one of the two unsaved versions was
+    // nowhere any more.
+    // …and it is about the frame as it stood at the click (as a conflict choice is): work done while the restore
+    // waited for its turn — another tab was busy with the frame — was put aside with the rest and replaced.
+    const seqAtClick = State.getDirtySeq(c, u);
+    try { await siteLock('resolve:' + k, () => restoreRescueLocked(f, c, u, unit, k, tok, data, swapBase, seqAtClick)); }
+    catch (e) { if (tok === dsToken) setBanner('saveFailedMsg', { msg: (e && e.message) || String(e) }, 'warn'); }
+  }
+  async function restoreRescueLocked(f, c, u, unit, k, tok, data, swapBase, seqAtClick) {
+    if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k || rescueShownFor !== k || rescueFiles[rescueSel] !== f) return;   // no longer wanted when its turn came
+    // worked on since the click: nothing is put aside and nothing is taken over — the click is dropped, and said so
+    if (seqAtClick !== undefined && State.getDirtySeq(c, u) !== seqAtClick) { setBanner('rescueSupersededFmt', { file: f.name }, 'warn'); return; }
     // ROUND-6/R6-5: BOTH branches park the version they displace, and both must land on a FREE slot — the
     // .unsaved-backup sidecars can already hold something real. Resolve it once, before the swap.
+    const seq0 = seqAtClick !== undefined ? seqAtClick : State.getDirtySeq(c, u);
     const body = f.isNote ? JSON.stringify(State.buildNote(c, u), null, 2)
                           : JSON.stringify(State.buildAnnotation(c, u, data.W, data.H), null, 2);
     const slot = await freeBackupName(unit, swapBase, body);
@@ -2938,19 +3888,27 @@
     // a dead attempt from a frame the doctor had already left closed the chooser they had just opened on
     // the NEW frame — and nulling rescueShownFor then aborted the restore they were in the middle of.
     // Abandon this attempt; touch the screen only when what is on it is ours.
-    if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k) {
+    if (tok !== dsToken) return;                // another folder is open: its chooser for the frame of this name is not ours to close
+    if (!cur || State.key(cur.caseId, cur.unitId) !== k) {
       if (rescueShownFor === k) hideRescueDialog();
       return;
     }
     // ROUND-9/R9-7: leave what they are looking at alone — but a Restore click that does nothing at all is
     // the dead end this project keeps re-learning. Say the click was dropped, and why.
     if (rescueShownFor !== k || rescueFiles[rescueSel] !== f) { setBanner('rescueSupersededFmt', { file: f.name }, 'warn'); return; }
+    // edited while the free name was being looked for: what would be put aside is no longer what the frame holds
+    if (State.getDirtySeq(c, u) !== seq0) { setBanner('rescueSupersededFmt', { file: f.name }, 'warn'); return; }
     if (slot === null) { hideRescueDialog(); setBanner('rescueNoSlotFmt', { id: u, file: swapBase }, 'warn'); return; }
     const swapTo = slot.name;
+    // The write below takes time too, and the doctor can close the chooser and go on working meanwhile. What the
+    // frame holds then is newer than the copy that was just put aside: adopting the backup now wiped it — typed
+    // text and new points were in no file and not on screen, under a banner saying nothing was lost. The copy
+    // stays where it was written (an extra backup), and nothing is adopted.
+    const wanted = () => tok === dsToken && !!cur && State.key(cur.caseId, cur.unitId) === k && rescueShownFor === k && rescueFiles[rescueSel] === f && State.getDirtySeq(c, u) === seq0;
     try {
       if (f.isNote) {
         if (slot.write) await FS.writeText(unit.handle, swapTo, body);
-        if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k) return;   // ROUND-7/R7-1: the write is another await the doctor can navigate across
+        if (!wanted()) return;   // ROUND-7/R7-1: the write is another await the doctor can navigate across
         for (const m of State.markerList(c, u)) State.removeMarker(c, u, m.id);   // clear, then adopt (importNoteJson only fills empty)
         State.setNote(c, u, '');
         State.importNoteJson(c, u, f.parsed);
@@ -2959,7 +3917,7 @@
         refreshMarkers(); buildMarkerChips();
       } else {
         if (slot.write) await FS.writeText(unit.handle, swapTo, body);
-        if (tok !== dsToken || !cur || State.key(cur.caseId, cur.unitId) !== k) return;   // ROUND-7/R7-1
+        if (!wanted()) return;   // ROUND-7/R7-1
         const keepNote = State.buildNote(c, u);                                   // annotation restore must not touch the note
         State.resetUnit(c, u);
         try { State.importAnnotation(c, u, f.parsed); } catch (e) { }
@@ -3015,15 +3973,20 @@
     if (saveRunning) return;
     if (!rootHandle) { setBanner('errOpenFolderFirst', null, 'warn'); return; }
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; } pendingSave = null;
-    try { if (!(await FS.ensureReadWrite(rootHandle))) { setBanner('errNoWritePermission', null, 'warn'); return; } }
-    catch (e) { setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+    // The Save belongs to the folder that is open at the click. The browser's permission question takes time;
+    // another folder can be opened meanwhile, and what follows used to be done to THAT one: its unsaved work was
+    // written and called saved, by a Save nobody pressed there.
+    const tok0 = dsToken;
+    try { if (!(await FS.ensureReadWrite(rootHandle))) { if (tok0 === dsToken) setBanner('errNoWritePermission', null, 'warn'); return; } }
+    catch (e) { if (tok0 === dsToken) setBanner('saveFailedMsg', { msg: e.message }, 'warn'); return; }
+    if (tok0 !== dsToken) return;
     flushGeomWrite(true);     // persist the current unit's radius window on an explicit save, even if auto-save is off
     const map = new Map();
     cases.forEach(c => c.units.forEach(u => map.set(State.key(c.id, u.id), { c, u })));
     // scope filter: a case id is a folder name, it can never contain '/', so prefix+'/' is exact
     const keys = State.unitsWithData().filter(k => !caseId || k.slice(0, caseId.length + 1) === caseId + '/');
     const tok = dsToken;        // the dataset this Save belongs to: if another folder is opened mid-save, every remaining unit's State is foreign and must NOT be written
-    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0, skippedProtected = 0;
+    let n = 0, failed = 0, aborted = false, cancelled = false, done = 0, skippedConflicts = 0, skippedProtected = 0, editedSince = 0;
     const failedKeys = new Set();   // R5-1: which frames the savedPartial banner will be ABOUT
     const protectedKeys = new Set();   // R12-7: …and which read-only frames THIS save skipped
     saveRunning = true;
@@ -3050,9 +4013,12 @@
         // read-only banner, never a chooser. Count them apart and say the right thing about each.
         if (conflictedUnits.has(k)) { skippedConflicts++; continue; }        // chooser-owned
         if (protectedUnits.has(k)) { skippedProtected++; protectedKeys.add(k); continue; }          // read-only: this build cannot fully read it
-        try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else n++; }   // the write itself may detect a fresh conflict and refuse
+        // (A frame counts as saved when it IS: one that was worked on while its write was on its way has that
+        // newer work only in the session — it used to be counted, and the status said "Saved" beside "Unsaved".)
+        try { await writeUnit(ref.c.id, ref.u); if (conflictedUnits.has(k)) skippedConflicts++; else if (tok === dsToken && State.isDirty(ref.c.id, ref.u.id) && !retryQ.has(k)) editedSince++; else n++; }   // the write itself may detect a fresh conflict and refuse
         catch (e) { failed++; failedKeys.add(k); }   // a single unloadable/broken unit must not abort saving the rest
       }
+      if (!aborted && tok !== dsToken) aborted = true;   // …or opened during the LAST write: what follows speaks about this folder, not the new one
     } finally {
       saveRunning = false;
       $('btnOpen').disabled = openBusy || !FS.supported;   // never re-enable Open underneath a still-running openFolder
@@ -3080,12 +4046,15 @@
       // what this save actually fixed.
       const retired = ['writeFailedBanner', 'savedPartial', 'saveAborted', 'conflictScanFmt', 'protectedScanFmt'];
       if (lastBanner && retired.indexOf(lastBanner.key) >= 0) setBanner(null);
-      setBanner('savedAllFmt', { n }, 'ok');
+      // (Not over "the radius window could not be written back": this Save's own write of geometry.json runs
+      // beside the frames and can fail before they are done — "Saved all" then covered the one thing that was
+      // not saved.)
+      if (!(lastBanner && lastBanner.key === 'geomWriteFailedFmt') && (n || !editedSince)) setBanner('savedAllFmt', { n }, 'ok');
     }
     // REVIEW FIX SE-4: `failed` used to fall through to setSavedStatus(). Those failures come from
     // ensureSeeded returning 'unreadable' (app.js:2210), which does NOT queue a retry — so retryQ is empty
     // and setSavedStatus happily printed "Saved HH:MM" right after a Save-all that left frames unwritten.
-    if (failed || skippedConflicts || skippedProtected) setSaveStatus(null); else setSavedStatus();   // anything unwritten — the header must not say Saved
+    if (failed || skippedConflicts || skippedProtected || editedSince) setSaveStatus(null); else setSavedStatus();   // anything unwritten — the header must not say Saved
   }
   function save() { return runSave(null); }
   function saveCase() { if (cur && !cur.virtual) return runSave(cur.caseId); }
@@ -3140,13 +4109,13 @@
     // R8-4, R8-6, R9-4, R9-8) exists because the doctor can act inside that window.
     const first = await rawFileProbe(unit, base);
     if (first.absent) return { name: base, write: true };
-    if (first.text === raw) return { name: base, write: false };   // this exact content is already preserved, HERE
+    if (!first.failed && sameRaw(first, raw)) return { name: base, write: false };   // this exact content is already preserved, HERE
     const names = [];
     for (let i = 2; i <= BACKUP_SLOTS; i++) names.push(base + '-' + i);
     const probes = await Promise.all(names.map(n => rawFileProbe(unit, n)));
     for (let i = 0; i < names.length; i++) {
       if (probes[i].absent) return { name: names[i], write: true };
-      if (probes[i].text === raw) return { name: names[i], write: false };
+      if (!probes[i].failed && sameRaw(probes[i], raw)) return { name: names[i], write: false };
     }
     return null;
   }
@@ -3170,20 +4139,30 @@
   // described nothing, which then overwrote the ORIGINAL folder's backup slot with an empty document the
   // rescue chooser would happily offer back. The guard must be re-checked between the probes and the
   // rebuild, not just before them.
+  // The slot was chosen for the copy as it stood when the search began. If the copy is another one by now, the
+  // slot may be one that was found to hold the OLD copy already ("nothing to write") — writing the new copy
+  // there replaced a backup the doctor may want back. A copy that has changed is not written at all: the
+  // operation it belonged to is out of date, and its caller stops (R8-4 wrote the newer copy; it is kept where
+  // it is now — in the session — instead).
   async function parkWrite(unit, plan, guard) {
     if (guard && !guard()) return null;
-    const body = plan.build();                 // R8-4: whatever State holds NOW, not when the probing started
-    if (plan.slot.write || body !== plan.probe) await FS.writeText(unit.handle, plan.slot.name, body);
+    const body = plan.build();
+    if (body !== plan.probe) return null;
+    if (plan.slot.write) await FS.writeText(unit.handle, plan.slot.name, rawBody(body));
     return plan.slot.name;
   }
-  async function backupCorruptOnce(k, unit) {
+  // `tok`: the folder the frame belongs to. The latch is that folder's: set after another one was opened, it
+  // would say of the NEW folder's frame of this name that its damaged file is already kept — and it is not.
+  async function backupCorruptOnce(k, unit, tok) {
     if (!corruptUnits.has(k) || corruptBackedUp.has(k)) return true;
     try {
-      const fh = await unit.handle.getFileHandle('annotation.json');
-      const raw = await (await fh.getFile()).text();
+      const pr = await rawFileProbe(unit, 'annotation.json');
+      if (pr.absent || pr.failed) return false;
+      const raw = rawOf(pr);
       const slot = await freeBackupName(unit, 'annotation.json.corrupt', raw);
       if (slot === null) return false;
-      if (slot.write) await FS.writeText(unit.handle, slot.name, raw);
+      if (slot.write) await FS.writeText(unit.handle, slot.name, rawBody(raw));
+      if (tok !== undefined && tok !== dsToken) return false;
       corruptBackedUp.add(k);
       return true;
     } catch (e) { return false; }   // never destroy what we could not back up
@@ -3194,14 +4173,16 @@
   // ROUND-8/R8-1: returns true | 'slots' (every backup slot taken by different content — permanent until the
   // doctor frees one) | false (a transient I/O failure — retrying really does clear it). v94 collapsed all of
   // these into one message that told the doctor to go delete rescue files that were not the problem.
-  async function backupNoteCorruptOnce(k, unit) {   // same contract as backupCorruptOnce (REVIEW FIX SE-2)
+  async function backupNoteCorruptOnce(k, unit, tok) {   // same contract as backupCorruptOnce (REVIEW FIX SE-2)
     if (!noteCorruptUnits.has(k) || noteCorruptBackedUp.has(k)) return true;
     try {
-      const fh = await unit.handle.getFileHandle('note.json');
-      const raw = await (await fh.getFile()).text();
+      const pr = await rawFileProbe(unit, 'note.json');
+      if (pr.absent || pr.failed) return false;
+      const raw = rawOf(pr);
       const slot = await freeBackupName(unit, 'note.json.corrupt', raw);   // ROUND-5/R5-11
       if (slot === null) return 'slots';
-      if (slot.write) await FS.writeText(unit.handle, slot.name, raw);
+      if (slot.write) await FS.writeText(unit.handle, slot.name, rawBody(raw));
+      if (tok !== undefined && tok !== dsToken) return false;
       noteCorruptBackedUp.add(k);
       if (slot.write) setBanner('noteCorruptBackedUp', { id: unit.id, file: slot.name }, 'warn');   // ROUND-6/R6-9: name the file we ACTUALLY wrote — it may be a numbered slot
       return true;
@@ -3228,11 +4209,17 @@
     else setSaveStatus(failKey, null, true);                                          // nothing is coming back for this one: never leave the header on 'saving'
   }
   const permanentWriteError = e => !!e && (e.name === 'NotAllowedError' || e.name === 'NotFoundError' || e.name === 'SecurityError');
-  function retryLater(caseId, unit, tok, err) {
+  function retryLater(caseId, unit, tok, err, only, begun) {
     const k = State.key(caseId, unit.id);
+    // A write of the folder that was open before, failing late: nothing of it is queued here (its work went with
+    // the folder), and above all the entry under this name is left alone — frames carry the same names in every
+    // folder, and the entry may be the NEW folder's frame waiting for its retry. It used to be taken over and
+    // then thrown away, and that frame was never written.
+    if (tok !== dsToken) return false;
     if (permanentWriteError(err)) { retryQ.delete(k); return false; }
     const e = retryQ.get(k) || { caseId, unit, tok, tries: 0 };
     e.unit = unit; e.tok = tok; e.tries++;
+    e.only = only || null; e.begun = begun || null;   // (see writeUnit: a write that was asked for under a condition is tried again under it)
     if (e.tries > RETRY_DELAYS.length) { retryQ.delete(k); return false; }   // give up quietly: the banner + dirty flag already say the work is not on disk
     retryQ.set(k, e);
     setSaveStatus('retryPending', { n: retryQ.size }, true);
@@ -3248,21 +4235,29 @@
   // runAutoSave and saveNote already did; the retry queue, the star and cross-frame undo did not.
   async function runRetries() {
     let recovered = false, conflicted = null, conflictedKey = null;   // ROUND-11/R11-3: the full key, so a later retire knows which frame
+    const tok0 = dsToken;
     for (const e of [...retryQ.values()]) {
+      // another folder was opened while a retry was being written: the queue is the new folder's now (entries
+      // under the same frame names), and so are the status line and the banner
+      if (tok0 !== dsToken) return;
       const k = State.key(e.caseId, e.unit.id);
+      if (retryQ.get(k) !== e) continue;                                              // replaced or removed meanwhile
       if (e.tok !== dsToken) { retryQ.delete(k); continue; }                          // queued against a dataset that is no longer open
       const c = cases.find(x => x.id === e.caseId);
       if (!c || !State.isDirty(e.caseId, e.unit.id)) { retryQ.delete(k); continue; }  // gone, or a later write already carried this unit to disk
       let st; try { st = await ensureSeeded(c, e.unit); } catch (err) { st = 'unreadable'; }
+      if (tok0 !== dsToken) return;
       if (st !== 'seeded' && st !== 'already') { retryLater(e.caseId, e.unit, e.tok, null); continue; }   // still cannot verify the file: count it as one more attempt
       try {
-        await writeUnit(e.caseId, e.unit);
-        retryQ.delete(k);
+        const wrote = await writeUnit(e.caseId, e.unit, e.only || undefined, e.begun || undefined);
+        if (tok0 !== dsToken) return;
+        if (retryQ.get(k) === e) retryQ.delete(k);
         if (conflictedUnits.has(k)) { if (!conflicted) { conflicted = e.unit.id; conflictedKey = k; } }   // REFUSED, not recovered
-        else recovered = true;
+        else if (wrote !== 'dropped') recovered = true;
       }
       catch (err) { }                          // writeUnit's own hook has already re-queued (or dropped) it
     }
+    if (tok0 !== dsToken) return;
     if (retryQ.size) { setSaveStatus('retryPending', { n: retryQ.size }, true); armRetry(RETRY_DELAYS[RETRY_DELAYS.length - 1]); }
     else if (conflicted) {                     // the retry found a NEWER file and refused: nothing was written
       setSaveStatus(null);                     // never claim Saved
@@ -3314,6 +4309,50 @@
       try { await writeUnit(ref.c.id, ref.u); } catch (e) { }            // failures land in the retry queue through writeUnit's hook
     }
     updateDirtyUI();
+    // What this catch-up could not write — the folder holds something else, or nothing shows that the unsaved
+    // work that came back belongs to this folder — has to be SAID. It used to end without a word: the frame kept
+    // its "unsaved" mark and was write-protected, and nothing was asked until it was opened again or edited.
+    // The frame on the screen asks now; the others are counted, and ask when they are opened.
+    if (tok !== dsToken || !conflictedUnits.size) return;
+    const onScreen = cur ? State.key(cur.caseId, cur.unitId) : null;
+    if (onScreen && conflictedUnits.has(onScreen)) {
+      if (conflictShownFor !== onScreen) { setBanner('conflictFoundFmt', { id: cur.unitId, k: onScreen }, 'warn'); showConflictDialog(onScreen); }
+    } else setBanner('conflictScanFmt', { n: conflictedUnits.size }, 'warn');
+  }
+  // One writer at a time across TABS as well. A save looks at the folder copy and then writes; two tabs of this
+  // site with the same folder open could both look, both find it as they knew it, and write one after the
+  // other — the second over the first, unseen, with "Saved" in both. A Web Lock named after the dataset and
+  // the file makes look-and-write one step among the tabs of this browser. It cannot reach another browser or
+  // another computer: there the look still narrows the gap, and nothing can close it without a server.
+  // A tab that does not get the lock within LOCK_WAIT_MS fails this save like any failed write (the retry
+  // queue takes it); it never writes without the lock, and it never waits for ever on a tab that hangs.
+  const LOCK_WAIT_MS = 20000;
+  function siteLock(what, fn, folder) {
+    const locks = typeof navigator !== 'undefined' && navigator.locks;
+    if (!locks || !locks.request) return fn();
+    // Named after the FOLDER, not after the id in .annotator_dataset.json. Two tabs that opened a new folder at
+    // the same moment each made an id of their own, so their locks had different names and they wrote over
+    // each other. The folder's name is the same in every tab from the first moment. (Two different folders
+    // that share a name share the lock: one waits a moment for the other, nothing more.)
+    const name = 'collateral-annotator:' + (folder !== undefined ? folder : (rootHandle ? rootHandle.name : '')) + ':' + what;
+    if (typeof AbortController === 'undefined') {
+      // No way to take the request back: it stays in the queue, and when its turn comes late it does nothing.
+      // (Without this the wait had no end at all here.)
+      let state = 0;                                             // 0 waiting · 1 at work · 2 given up
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (state !== 0) return;
+          state = 2;
+          const err = new Error('another tab of this site is still saving (' + what + ')'); err.lockTimeout = true; reject(err);
+        }, LOCK_WAIT_MS);
+        locks.request(name, () => { if (state === 2) return undefined; state = 1; clearTimeout(timer); return fn(); }).then(resolve, reject);
+      });
+    }
+    const ac = new AbortController();
+    let got = false;
+    const timer = setTimeout(() => { if (!got) ac.abort(); }, LOCK_WAIT_MS);
+    return locks.request(name, { signal: ac.signal }, () => { got = true; clearTimeout(timer); return fn(); })
+      .catch(e => { clearTimeout(timer); if (!got) { const err = new Error('another tab of this site is still saving (' + what + ')'); err.lockTimeout = true; throw err; } throw e; });
   }
   const writeBegin = k => writingUnits.set(k, (writingUnits.get(k) || 0) + 1);
   const writeEnd = k => { const n = (writingUnits.get(k) || 1) - 1; if (n > 0) writingUnits.set(k, n); else writingUnits.delete(k); };
@@ -3322,20 +4361,39 @@
   // disk under a "Synced" UI. The dataset identity is captured HERE, at ENQUEUE time, and passed in: reading
   // it inside the queued body would pick up whatever dataset is open when the turn finally comes, which is
   // exactly the cross-dataset write the guard exists to prevent.
-  function writeUnit(caseId, unit) {   // write one unit's annotation.json (+ note.json) and mark it clean
-    const k = State.key(caseId, unit.id), tok = dsToken;
+  // `only` (optional): asked when the write's turn has come and the frame's lock is held, and once more just
+  // before the first of the frame's files is written — a write that is no longer wanted by then does nothing
+  // (more) and resolves 'dropped' (see resolveConflictInner: "keep mine" is a choice about the copy as it stood
+  // at the click, also while the write waits for another tab to let go of the frame, and while it reads the
+  // folder). `begun` (optional): called once, when the turn has come and the write is still wanted; what it
+  // returns is called if the write is dropped after that (the way back). A write that fails is tried again
+  // under the same condition: the retry queue must not write, as an ordinary save, what was only to be written
+  // if the copy was still the one that was chosen. A write under a condition writes that copy, whole: see
+  // `pinned` in writeUnitInner.
+  function writeUnit(caseId, unit, only, begun) {   // write one unit's annotation.json (+ note.json) and mark it clean
+    const k = State.key(caseId, unit.id), tok = dsToken, folder = rootHandle ? rootHandle.name : '';
     writeBegin(k);                                    // the stale-dirty reconcile must not race a save — from the moment it is QUEUED, not just while it runs
     const prev = writeChain.get(k) || Promise.resolve();
-    const p = prev.catch(() => { }).then(() => writeUnitInner(caseId, unit, tok, k));   // a failed predecessor must not cancel the writes queued behind it
+    let started = false;
+    const go = begun ? () => { started = true; return begun(); } : null;
+    const p = prev.catch(() => { }).then(() => siteLock('frame:' + k, () => writeUnitInner(caseId, unit, tok, k, only, go), folder));   // a failed predecessor must not cancel the writes queued behind it
     writeChain.set(k, p);
-    const done = () => { writeEnd(k); if (writeChain.get(k) === p) writeChain.delete(k); };
+    // The queue belongs to the dataset it was filled for (openFolder empties both maps): a write of the folder
+    // that was open before must not touch the books of the one that is open now — and a write that hangs
+    // there must not keep the frame of the same name here from being saved.
+    const done = () => { if (tok !== dsToken) return; writeEnd(k); if (writeChain.get(k) === p) writeChain.delete(k); };
     p.then(done, done);                               // NOT .finally(): the promise it derives adopts p's rejection and nobody would handle THAT one
-    p.catch(err => { retryLater(caseId, unit, tok, err); });   // every failed write is re-queued against the dataset it was queued for — never silently dropped
+    // (The condition stays with the write for as long as it is tried again — also once it has begun: what a
+    // retry writes is the copy that was chosen, or nothing. It used to become an ordinary save from then on,
+    // and wrote whatever the frame held two seconds later.)
+    p.catch(err => { retryLater(caseId, unit, tok, err, only, started ? null : begun); });   // every failed write is re-queued against the dataset it was queued for — never silently dropped
     return p;                                         // the caller's own catch still sees the failure
   }
-  async function writeUnitInner(caseId, unit, tok, k) {
+  async function writeUnitInner(caseId, unit, tok, k, only, begun) {
     const seq = State.getDirtySeq(caseId, unit.id);   // an edit landing during the awaits below bumps this — markClean then declines, so the edit stays dirty and gets its own save
     if (tok !== dsToken) return;                      // a folder switch happened before our turn came — State now belongs to ANOTHER dataset; writing would clobber the old folder with foreign/empty content
+    if (only && !only()) return 'dropped';
+    const undo = begun ? begun() : null;
     // ensureSeeded()/loadCur() deliberately leave a unit OUT of sessionLoaded when its annotation.json could
     // not be read. Building the file from that State would replace real annotations with an empty document,
     // so refuse: the throw surfaces the write-failure banner and puts the unit in the retry queue.
@@ -3352,11 +4410,93 @@
     // SWG-5: annotation.json OR note.json, whichever is newer. v102: while our note.json read failed, measure annotation.json only —
     // the unread-backup path below preserves whatever note.json holds before writing over it, and on a note-only frame (no
     // annotation.json, nothing stamped) the unread note's own mtime would otherwise turn every retry into a false conflict.
-    const diskMs = (State.hasNoteData(caseId, unit.id) && noteUnreadableUnits.has(k)) ? await annFileMtime(unit) : await unitDiskMtime(unit);
+    //
+    // ONE read of the frame's two files answers both questions — when each was written and what each holds.
+    // (They used to be statted for the first and then read again for the second.)
+    const hasNote = State.hasNoteData(caseId, unit.id);
+    // Unsaved work that nothing vouches for as this folder's (FOREIGN) is weighed as it stands NOW, before the
+    // folder is read: its annotation, whether it has a note, and the count of its edits are taken together, of
+    // one and the same version. (The annotation used to be built, and the count taken, after the read — next to
+    // a note that had been looked for before it. A first note typed while a slow folder was being read then
+    // passed for saved, and was gone after a reload.)
+    const pre = State.isForeign(k) ? { seq: State.getDirtySeq(caseId, unit.id), ann: annSig(State.buildAnnotation(caseId, unit.id, data.W, data.H)), note: hasNote ? noteSig(State.buildNote(caseId, unit.id)) : undefined } : null;
+    let onDisk = null;
+    try { onDisk = await Loader.loadAnnotation(unit); } catch (e) { onDisk = null; }
     if (tok !== dsToken) return;
-    if (diskMs && diskMs > Math.max(ownWriteMs(caseId, unit.id, k), lastSeenMtime.get(k) || 0) + 2000) {
+    // A file this build cannot use, whose bytes could not be read this once (see below): it is read again before
+    // anything is decided on a reading that says less than the file does. (One failed reading of a damaged note
+    // that had replaced a good one sent it down the path of a note that cannot be read — kept, and then written
+    // over without the question a changed file is owed.)
+    for (let i = 0; i < 2 && onDisk && (((onDisk.annCorrupt || onDisk.versionAhead) && onDisk.annBytes === false) || (onDisk.noteCorrupt && onDisk.noteBytes === false)); i++) {
+      await new Promise(r => setTimeout(r, 120));
+      try { onDisk = await Loader.loadAnnotation(unit); } catch (e) { onDisk = null; }
+      if (tok !== dsToken) return;
+    }
+    let noteNewer = false, mine = null, built = null;
+    if (onDisk) {
+      // What the folder holds NOW decides how it may be written over, because a file can turn into any of
+      // these while its frame is open — and a save that only knew what the file was when it was opened then
+      // replaced it with no copy kept.
+      //  * annotation.json is there and cannot be read at this moment: not written over unseen. The throw puts
+      //    the frame in the retry queue, like any failed write.
+      if (onDisk.unreadable) throw new Error('refusing to write ' + k + ': its annotation.json cannot be read right now');
+      //  * annotation.json is one this build cannot use (from a newer app, or not JSON) and its BYTES cannot be
+      //    read at this moment — they are needed wherever the text is not the whole file (a byte-order mark,
+      //    bytes that are not UTF-8). Whether it is the file this session saw cannot be said then, so it is not
+      //    written over either: the frame stays unsaved and the retry queue comes back, like above. (The file's
+      //    time used to decide in that case — and a file from a newer app that had been moved in with an older
+      //    date was replaced by one in this build's format, with no copy kept and no question asked.)
+      if ((onDisk.annCorrupt || onDisk.versionAhead) && onDisk.annBytes === false) throw new Error('refusing to write ' + k + ': its annotation.json cannot be read right now');
+      //  * the same for a note.json that is not a note: it takes the path of a note that cannot be read (below) —
+      //    its bytes are kept under their own name before it is replaced, or the note waits.
+      if (onDisk.noteCorrupt && onDisk.noteBytes === false) noteUnreadableUnits.add(k);
+      //  * a file that was readable when this session last saw it and is now from a newer app, or not JSON at
+      //    all, was changed by somebody: diskVerdict says so (the two have different fingerprints), and the
+      //    chooser keeps its bytes before anything replaces it. One that was ALREADY like that when the frame
+      //    was read compares equal and keeps its own path (backupCorruptOnce / backupNoteCorruptOnce, below).
+      //  * note.json cannot be read right now: the unread-note path below keeps it, or holds the note back.
+      if (onDisk.noteUnreadable) noteUnreadableUnits.add(k);
+      noteNewer = !!(onDisk.note && Number(onDisk.note.schema_version) > 1);
+      built = { seq: State.getDirtySeq(caseId, unit.id), ann: State.buildAnnotation(caseId, unit.id, data.W, data.H), note: hasNote ? State.buildNote(caseId, unit.id) : null };
+      mine = { ann: annSig(built.ann), note: hasNote ? noteSig(built.note) : undefined };
+    }
+    // The CONTENT decides (see lastSeenSig): a file that no longer holds what this session last knew it to
+    // hold was changed by someone else, whatever its time says — and a file that still holds it was not,
+    // whatever its time says (a sync client re-stamping it, or our own write whose time could not be read
+    // back). Only where the content cannot be asked — a file unreadable or unparseable right now, or the
+    // folder not answering at all — does the file's time decide, as it did before content was compared.
+    const verdict = onDisk ? diskVerdict(k, onDisk, pre || mine) : 'unknown';   // (pre: see above — the version that was weighed)
+    let conflict = verdict === 'changed';
+    if (verdict === 'unknown') {
+      const annOnly = hasNote && noteUnreadableUnits.has(k);
+      const diskMs = onDisk ? ((annOnly ? onDisk.annMtime : onDisk.mtime) || 0) : (annOnly ? await annFileMtime(unit) : await unitDiskMtime(unit));
+      if (tok !== dsToken) return;
+      conflict = !!(diskMs && diskMs > Math.max(ownWriteMs(caseId, unit.id, k), lastSeenMtime.get(k) || 0) + 2000);
+    }
+    if (conflict) {
       conflictedUnits.set(k, null);                   // parsed lazily when the chooser opens
       return;
+    }
+    // Unsaved work that nothing vouches for as this folder's, and every file this save would write already
+    // holds what it would write. Then nothing is written — not one of the two files, whether or not the folder
+    // has a note the work never had: the frame counts as saved. (They used to be written out again from this
+    // build's own form of them, which dropped every field of theirs this build does not know, in a folder the
+    // work may not even belong to, and without a question. And with a colleague's note in the folder the
+    // annotation was written out again after all.)
+    // "Saved" is said of the version that was weighed (pre.seq). What was done while this save was reading the
+    // folder — a first note, typed on a slow folder — stays unsaved and in the browser's copy; it was made
+    // here, on top of work the folder already holds, so it is this folder's own from now on and the next save
+    // writes it like any other. A note the folder holds and this session never had stays "not known" (FOREIGN):
+    // typing one over it is asked about.
+    if (onDisk && pre) {
+      const now = sigOfRead(onDisk);
+      if (now.ann !== undefined && now.ann === pre.ann && (pre.note === undefined || (now.note !== undefined && now.note === pre.note))) {
+        State.claimUnit(k);
+        State.markClean(caseId, unit.id, pre.seq, onDisk.mtime || lastSeenMtime.get(k) || State.getWrittenAt(caseId, unit.id) || 1);
+        lastSeenMtime.set(k, onDisk.mtime || 0);
+        setSeen(k, { ann: now.ann, note: (pre.note !== undefined || fileAbsent(onDisk, 'note')) ? now.note : FOREIGN });
+        return;
+      }
     }
     // REVIEW FIX SE-2/SE-1: BOTH sidecar backups happen BEFORE either file is written. A failed backup
     // throws — the unit stays dirty, lands in the retry queue and raises the write-failure banner — instead
@@ -3369,9 +4509,13 @@
     // out to prevent, only pointed the other way. A note the doctor authored must reach disk. The original
     // we could not read is preserved byte-for-byte first; if even THAT read fails we refuse the whole unit
     // write, so the frame stays dirty, the retry queue takes it, and the write-failure banner says so.
-    const hasNote = State.hasNoteData(caseId, unit.id);
     let noteBlocked = false, noteBlockReason = 'read';   // ROUND-7/R7-2: 'read' really is a Drive hiccup that clears itself; 'slots' never will
-    if (hasNote && noteUnreadableUnits.has(k)) {
+    // A note.json from a NEWER app (schema_version above the 1 this build writes) that says what our note says
+    // is left alone further down. One that says something else is about to be replaced by a file of this
+    // build's format, which drops every field this build does not know — so its bytes are kept first, by the
+    // same path as a note that could not be read.
+    const keepNewerNote = hasNote && noteNewer && !!mine && noteSig(onDisk.note) !== mine.note;
+    if (hasNote && (noteUnreadableUnits.has(k) || keepNewerNote)) {
       const probe = await rawFileProbe(unit, 'note.json');
       if (tok !== dsToken) return;
       if (probe.absent) noteUnreadableUnits.delete(k);          // nothing on disk to lose — create it normally
@@ -3390,10 +4534,11 @@
         // note.json holds by then, straight over the first copy, which existed nowhere else. Same hazard
         // R5-11 built freeBackupName for; this was the one writer that did not use it.
         try {
-          const nb = await freeBackupName(unit, 'note.unread-backup.json', probe.text);
+          const nb = await freeBackupName(unit, 'note.unread-backup.json', rawOf(probe));
+          if (tok !== dsToken) return;             // (as after every wait in here: the flags and the banner below belong to the folder that is open NOW)
           if (nb === null) { noteBlocked = true; noteBlockReason = 'slots'; }   // every slot holds DIFFERENT content: defer the note rather than destroy one
           else {
-            if (nb.write) { await FS.writeText(unit.handle, nb.name, probe.text); setBanner('noteExternalBackedUp', { id: unit.id, file: nb.name }, 'warn'); }
+            if (nb.write) { await FS.writeText(unit.handle, nb.name, rawBody(rawOf(probe))); if (tok !== dsToken) return; setBanner('noteExternalBackedUp', { id: unit.id, file: nb.name }, 'warn'); }
             noteUnreadableUnits.delete(k);
           }
         }
@@ -3405,12 +4550,16 @@
     // doctor could not save the segments they had just drawn. The annotation always goes to disk. Only the
     // note waits, and the frame deliberately stays dirty so the retry queue comes back for it.
     let needNote = hasNote && !noteBlocked;
-    if (!(await backupCorruptOnce(k, unit))) throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up');
+    // A note.json from a NEWER app (schema_version above the 1 this build writes) that says what our note says
+    // is left alone: rewriting it changed nothing the doctor can see, downgraded the file and dropped every
+    // field this build does not know.
+    if (needNote && noteNewer && mine && noteSig(onDisk.note) === mine.note) needNote = false;
+    if (!(await backupCorruptOnce(k, unit, tok))) { if (tok !== dsToken) return; throw new Error('refusing to overwrite ' + k + ': its corrupt annotation.json could not be backed up'); }
     if (tok !== dsToken) return;
     // ROUND-6/R6-6: this used to throw, which refused the ANNOTATION too — the doctor could not save the
     // segments they had just drawn because a sidecar for a DIFFERENT file could not be written. Same rule as
     // OT-3: defer the note, land the annotation, keep the frame dirty and let the retry queue come back.
-    const noteBk = needNote ? await backupNoteCorruptOnce(k, unit) : true;
+    const noteBk = needNote ? await backupNoteCorruptOnce(k, unit, tok) : true;
     if (noteBk !== true) { noteBlocked = true; noteBlockReason = (noteBk === 'slots' ? 'slots' : 'read'); needNote = false; }   // ROUND-8/R8-1: only a FULL family is permanent
     if (tok !== dsToken) return;
     // v102: never CREATE a bare annotation.json. A note-only edit (or a marker) on a frame that has no annotation.json
@@ -3424,7 +4573,26 @@
       catch (e) { if (e && e.name === 'NotFoundError') writeAnn = false; }
       if (tok !== dsToken) return;
     }
-    if (writeAnn) await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(State.buildAnnotation(caseId, unit.id, data.W, data.H), null, 2));
+    // (Asked once more, now that the folder has been read and the copies it is owed are made: what goes into the
+    // frame's files from here on has to be the copy the choice was made about — work done while this write was
+    // reading the folder used to go in with it.)
+    if (only && !only()) { if (undo) undo(); return 'dropped'; }
+    // A write that carries out a CHOICE writes the copy the choice was made about, and nothing else. That copy
+    // is taken here — the last moment at which it is known to be that copy — and both files are written from
+    // it; work done while the first file is on its way stays in the session, unsaved. (The second file used to
+    // be built from what the frame held when its turn came: text typed while a slow folder took annotation.json
+    // went into note.json as part of the version that had been chosen.)
+    const pinned = !only ? null : (built && State.getDirtySeq(caseId, unit.id) === built.seq) ? built
+      : { ann: State.buildAnnotation(caseId, unit.id, data.W, data.H), note: hasNote ? State.buildNote(caseId, unit.id) : null };
+    if (writeAnn) {
+      // What goes into the file is what the frame holds NOW (an ordinary save). When nothing was edited since the
+      // check above, that is the document built and fingerprinted there — it is not built, parsed and
+      // fingerprinted again (on a frame with tens of thousands of points that was most of the time a save took).
+      const sameA = pinned ? pinned === built : (!!built && State.getDirtySeq(caseId, unit.id) === built.seq);
+      const annObj = pinned ? pinned.ann : sameA ? built.ann : State.buildAnnotation(caseId, unit.id, data.W, data.H);
+      await FS.writeText(unit.handle, 'annotation.json', JSON.stringify(annObj, null, 2));
+      if (tok === dsToken) sawOnDisk(k, 'ann', sameA ? mine.ann : annSig(annObj));   // what a later read of this file will see — recorded the moment it lands, like the time stamp below (SE-1)
+    }
     // REVIEW FIX SE-1: the "this file on disk is OURS" stamp lived only at the very end, after BOTH writes.
     // If note.json's write then failed — creating a new file is a different operation from replacing one —
     // the throw left ownWriteAt/lastSeenMtime/writtenAt at 0 even though annotation.json WAS on disk with a
@@ -3445,10 +4613,17 @@
     }   // ROUND-3 FIX: the token was tested BEFORE the await and never after, so an in-flight write could stamp the NEW dataset's map
     if (needNote) {
       if (tok !== dsToken) return;   // ROUND-4 FIX: v89's B-2 guard was added to the annotation stamp above but not here — the note write itself could still land after a folder switch
-      await FS.writeText(unit.handle, 'note.json', JSON.stringify(State.buildNote(caseId, unit.id), null, 2));
+      const fixedN = !!(pinned && pinned.note);          // (see `pinned`, above)
+      const sameN = fixedN ? pinned === built : (!!built && !!built.note && State.getDirtySeq(caseId, unit.id) === built.seq);
+      const noteObj = fixedN ? pinned.note : sameN ? built.note : State.buildNote(caseId, unit.id);
+      await FS.writeText(unit.handle, 'note.json', JSON.stringify(noteObj, null, 2));
       if (tok !== dsToken) return;
+      sawOnDisk(k, 'note', sameN ? mine.note : noteSig(noteObj));
       noteCorruptUnits.delete(k); noteUnreadableUnits.delete(k);   // the file on disk is valid JSON again, and readable
     }
+    // (Not after another folder was opened during the write: frames carry the same names everywhere, and these
+    // flags would be the new folder's — its damaged file of that name would then be rewritten with no copy kept.)
+    if (tok !== dsToken) return;
     corruptUnits.delete(k); unimportedUnits.delete(k);   // the file on disk is valid JSON again (ROUND-4: unimportedUnits is corruptUnits' new sibling and was left add-only)
     // ROUND-5/R5-6 (CRITICAL): these stamps are UNIT-wide — unitDiskMtime is max(annotation, note), and
     // ownWriteAt/lastSeenMtime cover the whole frame. On the noteBlocked path we wrote annotation.json and
@@ -3511,8 +4686,11 @@
     saveTimer = null;
     const p = pendingSave; pendingSave = null;
     if (!p || !rootHandle || !$('autoSave').checked) return;
+    const tok = dsToken;
     try {
-      setSaveStatus('saving'); await writeUnit(p.c, p.unit); updateDirtyUI();
+      setSaveStatus('saving'); await writeUnit(p.c, p.unit);
+      if (tok !== dsToken) return;               // another folder was opened during the write: "Saved" would be said about ITS frame of that name, which is not
+      updateDirtyUI();
       const k2 = State.key(p.c, p.unit.id);
       if (conflictedUnits.has(k2)) {                  // the write refused: a newer differing file appeared on disk
         setSaveStatus(null);                          // the frame is NOT saved — never claim it is
@@ -3521,7 +4699,8 @@
       } else if (protectedUnits.has(k2)) {            // REVIEW FIX BT-6: read-only is the OTHER silent refusal
         setSaveStatus(null);
         setBanner('protectedFrameFmt', { id: p.unit.id, what: (protectedUnits.get(k2) || {}).what || '?' }, 'warn');
-      } else setSavedStatus();
+      } else if (State.isDirty(p.c, p.unit.id)) setSaveStatus(null);   // worked on while it was being written: that is not in the folder yet (its own save follows)
+      else setSavedStatus();
     }
     // ROUND-5/R5-7: writeFailedBanner is BANNER_CRITICAL (priority 2) and is NOT in the per-unit clear
     // list, so it buried the precise "note.json is the file holding this up" message and then followed the
@@ -3532,7 +4711,7 @@
     // header sat on the 'saving' set two lines above, for ever, with an empty queue and a dirty frame.
     // Skip only the BANNER (the blocked note raised its own, more precise one); always tell the truth about
     // whether anything is still coming.
-    catch (e) { reportWriteFailure(e, p.unit.id, 'autoSaveFailed', State.key(p.c, p.unit.id)); }
+    catch (e) { if (tok === dsToken) reportWriteFailure(e, p.unit.id, 'autoSaveFailed', State.key(p.c, p.unit.id)); }
   }
 
   // REVIEW FIX R10: undo() is async — when the top entry is a paint change on an OFF-SCREEN frame that the
@@ -3551,9 +4730,10 @@
   async function undo() {
     if (undoBusy) { if (undoQueued < UNDO_QUEUE_MAX) undoQueued++; return; }
     undoBusy = true;
+    const tok = dsToken;                                      // presses made in one folder are not carried out in another
     try {
       await undoInner();
-      while (undoQueued > 0) { undoQueued--; if (painting || selecting) break; await undoInner(); }   // ROUND-3 FIX B-9: the queued replay skipped the guard the first press had — a stroke started while the first undo was fetching would have had an undo applied into it
+      while (undoQueued > 0) { undoQueued--; if (painting || selecting || tok !== dsToken) break; await undoInner(); }   // ROUND-3 FIX B-9: the queued replay skipped the guard the first press had — a stroke started while the first undo was fetching would have had an undo applied into it
     } finally { undoBusy = false; undoQueued = 0; }
   }
   async function undoInner() {
@@ -3561,12 +4741,17 @@
     // Peek BEFORE popping: an offscreen paint entry needs the unit's dims; after LRU eviction (or a reopen)
     // the cache may not have them and the entry would be consumed with no effect. Pre-load, THEN pop.
     const top = State.peekUndo && State.peekUndo();
+    const tok = dsToken;
     if (top && top.kind === 'paint' && cur && !(top.c === cur.caseId && top.u === cur.unitId)) {
       const k = State.key(top.c, top.u);
       if (!cache.has(k)) {
         const oc = cases.find(cc => cc.id === top.c), ou = oc && oc.units.find(uu => uu.id === top.u);
         if (ou && !ou.virtual) { try { await loadUnitCached(ou, k, false); } catch (err) { return; } }   // can't get dims: leave the entry ON the stack for a later retry
       }
+      // That read can take seconds, and another folder can be opened meanwhile: the history is the new folder's
+      // then, and the step that was being fetched for is not on top of it — what is, is something done THERE
+      // (a point just placed in the new folder was taken away). Only the step this press was about is undone.
+      if (tok !== dsToken || State.peekUndo() !== top) return;
       // REVIEW FIX UI-6: `cur` is dereferenced all the way down without re-checking, and openFolderTxn holds
       // cur === null for seconds while it reads a folder. An undo landing there popped its entry and then
       // threw it away on the null dereference. Bail BEFORE popping.
@@ -3612,14 +4797,16 @@
       if (ou && rootHandle && State.getAutoSave()) {
         setSaveStatus('saving');
         writeUnit(e.c, ou).then(() => {
+          if (tok !== dsToken) return;
           updateDirtyUI();
           const uk = State.key(e.c, e.u);
           if (conflictedUnits.has(uk)) {                   // REVIEW FIX CONF-4: refused, not saved
             setSaveStatus(null); setBanner('conflictFoundFmt', { id: e.u, k: uk }, 'warn');
           } else if (protectedUnits.has(uk)) {             // REVIEW FIX F7: read-only frame — also refused
             setSaveStatus(null); setBanner('protectedFrameFmt', { id: e.u, what: (protectedUnits.get(uk) || {}).what || '?' }, 'warn');
-          } else setSavedStatus();
-        }).catch(err => { reportWriteFailure(err, e.u, 'saveFailed', State.key(e.c, e.u)); });
+          } else if (State.isDirty(e.c, e.u)) setSaveStatus(null);
+          else setSavedStatus();
+        }).catch(err => { if (tok === dsToken) reportWriteFailure(err, e.u, 'saveFailed', State.key(e.c, e.u)); });
       }
       return;
     }
@@ -3693,7 +4880,7 @@
     $('btnSaveCancel').onclick = () => { saveCancel = true; $('btnSaveCancel').disabled = true; };
     $('btnConflictDisk').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'disk'); };
     $('btnConflictLocal').onclick = () => { if (conflictShownFor) resolveConflict(conflictShownFor, 'local'); };
-    $('btnConflictLater').onclick = hideConflictDialog;   // unresolved: frame stays dirty + protected; reopening the frame asks again
+    $('btnConflictLater').onclick = deferConflict;   // unresolved: frame stays dirty + protected; reopening the frame asks again
     $('btnRescueRestore').onclick = restoreRescue;
     $('btnRescueClose').onclick = hideRescueDialog;
     $('btnSaveClose').onclick = () => $('saveModal').classList.add('hidden');
@@ -3804,7 +4991,7 @@
       if (e.key === 'Escape' && markerArm) { exitMarkerArm(); return; }
       if (e.key === 'Escape' && copyPickMode) { exitCopyPick(); return; }
       if (e.key === 'Escape' && !$('rescueModal').classList.contains('hidden')) { hideRescueDialog(); return; }
-      if (e.key === 'Escape' && !$('conflictModal').classList.contains('hidden')) { hideConflictDialog(); return; }   // = "decide later"
+      if (e.key === 'Escape' && !$('conflictModal').classList.contains('hidden')) { deferConflict(); return; }   // = "decide later"
       if (e.key === 'Escape' && !$('confirmClear').classList.contains('hidden')) { closeClear(); return; }
       // While ANY full-screen overlay is up, swallow every other hotkey. #confirmClear was already
       // handled; dataformat.js's #dfModal was not, so arrows loaded another frame, digits changed the

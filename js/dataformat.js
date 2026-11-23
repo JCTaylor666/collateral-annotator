@@ -38,7 +38,7 @@
 <div class="doc-sec"><h4><code>mask.npy</code> — input, optional</h4><ul>
 <li>2-D <code>(H, W)</code> uint8 array of 0/1: the vessel mask. Rendered as the bright-blue overlay; also limits the brush when “Foreground only” is checked.</li>
 <li><b>Shape rule:</b> <code>frames.png</code>, <code>label.npy</code>, and <code>mask.npy</code> (when present) must all share one H×W. If any disagree, the frame becomes a view-only grey placeholder that lists the shapes — it is never annotated or saved.</li>
-<li>If <code>mask.npy</code> is <b>absent</b> there is simply no overlay (everything else works). A mask that is <b>present and parses but has the wrong shape</b> triggers the grey placeholder above. A mask that is <b>present but cannot be parsed at all</b> (truncated, non-2-D, unsupported dtype) does <em>not</em>: the frame stays fully annotatable and shows a warning saying the overlay and the “foreground only” brush limit are off for it — decision 4.6, so a broken mask never blocks annotation.</li>
+<li>If <code>mask.npy</code> is <b>absent</b> there is simply no overlay, and “Foreground only” has no mask to limit the brush with — paint lands wherever you drag (everything else works). A mask that is <b>present and parses but has the wrong shape</b> triggers the grey placeholder above. A mask that is <b>present but cannot be parsed at all</b> (truncated, non-2-D, unsupported dtype) does <em>not</em>: the frame stays fully annotatable and shows a warning saying the overlay and the “foreground only” brush limit are off for it — decision 4.6, so a broken mask never blocks annotation.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>geometry.json</code> — input + output, optional</h4>
 <pre class="doc-tree">{ "segments": {
@@ -49,7 +49,7 @@
 <ul>
 <li><code>segments</code> — keyed by <b>label segment id</b> (the pixel value in label.npy; background 0 excluded). Each entry is an object of <b>named metrics</b> your pipeline computes — any names, any number (radius, length, …). Drives the “Segment geometry” panel: pick a metric, see stats (count / min / max / mean / median) and filter by its range. (Legacy form <code>"1": 2.0</code> with a top-level <code>"metric"</code> is still accepted.)</li>
 <li><code>filter</code> — the reviewer's window: which <code>metric</code> + <code>min</code>/<code>max</code>. The tool writes it back whenever you move the sliders or switch metric, so each frame reopens with its last-used metric and range. Default at generation = the first metric's full range. The on/off toggle is a global app preference, not stored here.</li>
-<li>Absent or unparseable → the panel doesn't appear. Only <code>filter</code> is ever written; <code>segments</code> and any other fields are preserved. Segments with no value for the active metric are always shown.</li>
+<li>Absent or unparseable → the panel doesn't appear. Only <code>filter</code> is ever changed: the file is read again right before it is written, and <code>segments</code> and every other field go back as they were read then (the file is re-formatted). Writes of one frame's file go one after another, so the file ends with the window you set last. If it cannot be read at that moment it is not written, and a banner says so. Segments with no value for the active metric are always shown.</li>
 </ul></div>
 <div class="doc-sec"><h4><code>annotation.json</code> — output</h4>
 <p class="doc-p">Written into each frame folder on save / auto-save:</p>
@@ -122,11 +122,11 @@
 <div class="doc-sec"><h4><code>.annotator_dataset.json</code> — output, dataset root</h4>
 <pre class="doc-tree">{ "id": "d3f1a2…" }</pre>
 <ul>
-<li>Hidden file created the first time you open the folder. Your in-browser progress (visited flags, unsaved edits, per-frame layer choice) is keyed to this id, so two different datasets that both use <code>case_1/frame_0</code> never bleed into each other.</li>
+<li>Hidden file created the first time you open the folder. Your in-browser progress (visited flags, unsaved edits, per-frame layer choice) is filed per folder: under this id the first time a folder is opened, and by the folder itself from then on — the browser remembers which folder it was. So, as long as the browser has that record, a <b>copy</b> of the folder, which carries the same file, is not shown the original's unsaved work (it is kept for the original); and a folder that was moved or renamed is a new folder to the browser. (What the browser cannot tell apart: a folder replaced, at the same place and under the same name, by a copy of itself. And a folder exchanged for another dataset while it is open is only noticed when it is opened again — open a folder again after replacing it.) Unsaved work that comes back without that record — left by an older version of this app, or kept at a time when the browser's record of folders could not be read or written — is compared with the folder as soon as its frame is read: where it says what the folder already holds, nothing is asked and the next save writes nothing (the frame then counts as saved); where it differs, it is shown and you are asked about it at once, and nothing of it is written before you answer (see <b>Conflicts</b>). If you go on working on such a frame before answering, the browser keeps the result, not the work as it came back. If the file is there but cannot be read just now, a folder the browser has not seen before is not opened — try again in a moment; if it is damaged, or cannot be created, the folder's name stands in for the id.</li>
 <li>Safe to delete — a new id is minted on next open, which resets only the browser-side state, never the annotations on disk. Safe to leave out of an archive.</li>
 </ul></div>
 <div class="doc-sec"><h4>Recovery files — output, written only when something is wrong</h4>
-<p class="doc-p">The tool never discards work silently. The files below exist purely so that a bad file or a lost race is always recoverable. In normal use you will never see any of them.</p>
+<p class="doc-p">The tool is built not to discard work silently. The files below are where it keeps the version that would otherwise be lost — a damaged file, the side of a conflict that was not kept — before anything replaces it; when such a copy cannot be made, the step that needed it is not carried out. What it cannot protect against is said under <b>Conflicts</b> below (“What the app cannot see”). In normal use you will never see any of these files.</p>
 <ul>
 <li><code>annotation.json.corrupt</code> (in the frame) — an <code>annotation.json</code> that cannot be parsed is copied here before anything overwrites it. The frame opens with a warning and shows no marks until the file is fixed. If the file is later fixed and then breaks <b>again</b> with different content, the second original goes to <code>annotation.json.corrupt-2</code>, and so on up to <code>-9</code>: a rescue copy is never overwritten by a later one. All of them appear in the [View backups] chooser.</li>
 <li><code>classes.json.corrupt</code> (at the root) — same, for an unparseable <code>classes.json</code>. The tool will not auto-overwrite it with placeholder names until the original is safely copied.</li>
@@ -135,10 +135,10 @@
 <li><code>note.json.corrupt</code> (in the frame) — an unparseable <code>note.json</code> is copied here before any save replaces it (same protection <code>annotation.json</code> has), with the same <code>-2</code>…<code>-9</code> numbering for later, different breakages.</li>
 <li><code>note.unread-backup.json</code> (in the frame) — the folder already held a <code>note.json</code> that this session never managed to read (a Drive or permission hiccup), and you then wrote a note of your own. The unread original is preserved here before yours replaces it. It is NOT a damaged file: nothing is known to be wrong with it beyond one failed read.</li>
 </ul>
-<p class="doc-p"><b>Conflicts.</b> If a frame's file on disk is <b>newer</b> than this session's copy AND differs (a colleague's save, a copy from another machine, a sync), nothing is auto-resolved: the frame becomes write-protected and OPENING it shows a two-thumbnail chooser — keep the folder version or the session version; the loser always lands in one of the backup files above. Identical content with only a newer timestamp is adopted silently.</p>
-<p class="doc-p"><b>Recovery.</b> Opening a frame that has any of these backup files shows a banner with a <i>View</i> action: a chooser compares the current version with each backup. Restoring is a TRADE, never a deletion: the version being replaced is written to a free backup slot first — the same name if that slot is empty, otherwise the next free <code>-2</code>…<code>-9</code> — so no existing backup is ever overwritten and everything stays listed in the chooser. The <code>.corrupt</code> files and <code>note.unread-backup.json</code> are the exception to "same name": their whole value is content this session cannot reproduce, so what they displace is parked in the matching <code>.unsaved-backup.json</code> family instead of on top of them. If every slot of the destination family is taken by different content, the restore is refused rather than performed, and the banner names that family so you know which files to move aside.</p>
-<p class="doc-p"><b>Version safety.</b> A file this app version cannot fully understand (a <code>schema_version</code> above its own, or an unknown <code>paint.encoding</code>) makes the frame READ-ONLY: it is never overwritten, and the banner offers a copyable diagnostic. Update the app or ask an agent — do not edit the file by hand.</p>
-<p class="doc-p"><b>Browser-local mirror.</b> Unsaved work is additionally mirrored in the browser's localStorage under <code>vessel_annotator_v2:*</code> keys (one small record per frame, full content only while a frame is unsaved). It is a crash net, not part of the dataset — nothing in the folder depends on it.</p></div>
+<p class="doc-p"><b>Conflicts.</b> If a frame's file in the folder no longer holds what this session last read or wrote (a colleague's save, a copy from another machine, a sync, another program — or the file was deleted) while the session has unsaved work on that frame, nothing is auto-resolved: the frame becomes write-protected and OPENING it shows a two-thumbnail chooser — keep the folder version or the session version. The version you do not keep is first written to one of the backup files above; if that backup cannot be written, the choice is not carried out. (A session version with nothing in it — you had cleared the frame — leaves nothing to back up.) What counts is the content, not the file's time: the same content with a newer timestamp, or the same marks listed in another order, is not a conflict. A choice is about the frame as it stood when you made it: if you go on editing the frame before the choice has been carried out — while it waits for another tab, or while the copies are being made — it is dropped: your newer work stays, unsaved, and you are asked again. (Once the kept version itself is being written, that write is finished; what you type during it stays in the session, unsaved, and nothing says “Saved”.) The exception is unsaved work that comes back to a folder without the browser's record that it was made there — left by an older version of this app, or kept while that record could not be read or written: nothing shows whose it is or what it started from, so unless the folder already holds exactly that work you are asked before any of it is written — also where the folder has no such file yet. Tabs of this browser take turns when they save; a tab that does not get its turn within 20 seconds reports the save as failed and tries again. <b>What the app cannot see:</b> a change that reaches the folder between its last look at a file and its own write (a moment; longer on a slow synced folder) from anything that is not a tab of this browser — another computer, another browser or program on this computer, a sync client delivering a colleague's save late. There the later save replaces the earlier one, with no chooser and no backup.</p>
+<p class="doc-p"><b>Recovery.</b> Opening a frame that has any of these backup files shows a banner with a <i>View</i> action: a chooser compares the current version with each backup. Restoring is a TRADE, never a deletion: the version being replaced is written to a free backup slot first — the same name if that slot is empty, otherwise the next free <code>-2</code>…<code>-9</code> — so no existing backup is ever overwritten and everything stays listed in the chooser. If you go on editing the frame while a restore is still at work or waiting for its turn, the restore is dropped: your newer work stays, and a copy it had already written remains as one more backup. Only a backup this version can take over can be restored — a document; one that is not JSON, that is a bare value or a list, or an annotation of a newer format is shown and left alone. The <code>.corrupt</code> files and <code>note.unread-backup.json</code> are the exception to "same name": their whole value is content this session cannot reproduce, so what they displace is parked in the matching <code>.unsaved-backup.json</code> family instead of on top of them. If every slot of the destination family is taken by different content, the restore is refused rather than performed, and the banner names that family so you know which files to move aside.</p>
+<p class="doc-p"><b>Version safety.</b> A file this app version cannot fully understand (a <code>schema_version</code> above its own, or an unknown <code>paint.encoding</code>) makes the frame READ-ONLY: no save overwrites it, and the banner offers a copyable diagnostic. Update the app or ask an agent — do not edit the file by hand. If such a file replaces a readable one while the frame is open with unsaved work, that is a conflict like any other; choosing the session's version there first copies the file, byte for byte, to <code>annotation.external-backup.json</code>. (While such a file cannot be read in full at that moment, nothing is written over it: the save waits and tries again.) A <code>note.json</code> written by a newer version is treated differently: it stays editable; the file as it was is first kept as <code>note.unread-backup.json</code>, and the note is then written in this version's format.</p>
+<p class="doc-p"><b>Browser-local mirror.</b> Unsaved work is additionally mirrored in the browser's localStorage under <code>vessel_annotator_v2:*</code> keys (one small record per frame, full content only while a frame is unsaved). It is a crash net, not part of the dataset — nothing in the folder depends on it. It holds one copy per frame for the whole browser: when two tabs both have unsaved work on the same frame, only the work of the tab that edited last is in it.</p></div>
 <div class="doc-sec"><h4>The <code>perfusion</code> unit — computed, not read from disk</h4><ul>
 <li>Every case gets one extra unit after <code>minip</code>, computed from that case's frames. It has <b>no folder and no files</b>; do not create one. It is view-only: no label, no mask, no geometry panel, and it can never be annotated or saved.</li>
 <li>The smoothness slider re-colours it live. It can be downloaded as <code>&lt;case&gt;_perfusion.png</code> — that is a browser download, not a file in the dataset.</li>
@@ -171,7 +171,7 @@
 <li>Give every package <b>its own copy of <code>classes.json</code></b>, or each one invents its own class names.</li>
 <li>Keep each case whole — all of its frames and its <code>minip</code> go to one person.</li>
 <li>Merging is a plain copy: case folder names are unique, so nothing collides. Take the <b>union</b> of the <code>classes.json</code> files if anyone added a class.</li>
-<li>What comes back changed: <code>annotation.json</code>, <code>note.json</code>, the <code>filter</code> block of <code>geometry.json</code>, <code>classes.json</code>, and <code>.annotator_dataset.json</code>. Nothing else is ever written.</li>
+<li>What comes back changed: <code>annotation.json</code>, <code>note.json</code>, the <code>filter</code> block of <code>geometry.json</code>, <code>classes.json</code>, and <code>.annotator_dataset.json</code>. Apart from these the tool writes only the recovery files described above (the <code>.corrupt</code> and <code>-backup.json</code> copies), and only when something had to be protected.</li>
 </ul></div>
 <div class="doc-sec"><h4>Copying an annotation from another frame</h4><ul>
 <li>The <b>Copy from frame</b> button only writes into a <b>completely empty</b> frame — it is disabled if the frame holds any segment, point or paint on <em>any</em> layer, or any numbered marker. (A star or a note does not block it.)</li>
@@ -211,7 +211,7 @@
 <div class="doc-sec"><h4><code>mask.npy</code> — 输入，可选</h4><ul>
 <li>二维 <code>(H, W)</code> uint8 的 0/1 血管 mask。显示为亮蓝叠加层；勾选“仅前景”时限制笔刷范围。</li>
 <li><b>尺寸规则：</b><code>frames.png</code>、<code>label.npy</code>、以及存在时的 <code>mask.npy</code> 必须同为一个 H×W。任一不符，该帧就变成只读的灰色占位面板并列出各自尺寸，不会被标注或保存。</li>
-<li><code>mask.npy</code> <b>缺失</b>时只是没有叠加层（其它功能正常）；<b>存在</b>时必须尺寸完全一致——存在但尺寸不符、或被截断/非二维的 mask 会触发上面的占位面板，<em>不是</em>静默忽略。</li>
+<li><code>mask.npy</code> <b>缺失</b>时只是没有叠加层，“仅前景”也没有 mask 可以用来限制笔刷——拖到哪里就涂到哪里（其它功能正常）；<b>存在且能解析</b>时必须尺寸完全一致——尺寸不符的 mask 会触发上面的占位面板，<em>不是</em>静默忽略。<b>存在但完全无法解析</b>（被截断、非二维、不支持的 dtype）的 mask 则<em>不会</em>：该帧照常可以标注，并提示叠加层和“仅前景”限制对这一帧已关闭（决策 4.6，损坏的 mask 不会挡住标注）。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>geometry.json</code> — 输入 + 输出，可选</h4>
 <pre class="doc-tree">{ "segments": {
@@ -222,7 +222,7 @@
 <ul>
 <li><code>segments</code> — 键 = <b>label 分区 id</b>(即 label.npy 里的像素值,背景 0 除外)。每项是一个<b>命名参数对象</b>,放你流水线算的任意个参数(名字随意,如 radius、length)。驱动“分区几何”面板:选一个参数,看统计(段数/最小/最大/均值/中位)并按其区间过滤。(旧格式 <code>"1": 2.0</code> 配顶层 <code>"metric"</code> 仍兼容。)</li>
 <li><code>filter</code> — 医生用的窗口:哪个 <code>metric</code> + <code>min</code>/<code>max</code>。拖滑块或切换参数时工具写回,这样每帧重开恢复上次的参数和区间。生成默认 = 第一个参数的满量程。过滤开/关是全局偏好,不存这里。</li>
-<li>缺失或无法解析 → 面板不出现。只写回 <code>filter</code>;<code>segments</code> 及其它字段都保留。当前参数下没值的分区始终显示。</li>
+<li>缺失或无法解析 → 面板不出现。工具只改 <code>filter</code>:写入前会重新读一次文件,<code>segments</code> 及其它字段按当时读到的内容写回(文件会重新排版)。同一帧的多次写入依次进行,所以文件里最后留下的是你最后设的窗口。那一刻读不出来就不写,并用横幅提示。当前参数下没值的分区始终显示。</li>
 </ul></div>
 <div class="doc-sec"><h4><code>annotation.json</code> — 输出</h4>
 <p class="doc-p">保存 / 自动保存时写入每个帧文件夹：</p>
@@ -295,11 +295,11 @@
 <div class="doc-sec"><h4><code>.annotator_dataset.json</code> — 输出，位于数据根目录</h4>
 <pre class="doc-tree">{ "id": "d3f1a2…" }</pre>
 <ul>
-<li>第一次打开该文件夹时创建的隐藏文件。你在浏览器里的进度（已访问标记、未保存的修改、每帧的图层选择）都以这个 id 为键，所以两份都用 <code>case_1/frame_0</code> 命名的不同数据集不会互相串扰。</li>
+<li>第一次打开该文件夹时创建的隐藏文件。你在浏览器里的进度（已访问标记、未保存的修改、每帧的图层选择）是按「文件夹」归档的:第一次打开某个文件夹时记在这个 id 名下,此后浏览器记住的是这个文件夹本身。所以只要浏览器里有这份记录,文件夹的<b>副本</b>(带着同一个文件)就不会看到原件未保存的内容(那些内容仍留给原件);被移动或改名的文件夹,对浏览器来说也是一个新文件夹。(浏览器分辨不出的情况:在原位置、用原名字,把文件夹换成它自己的一份副本。另外,文件夹在打开期间被换成另一个数据集,要到重新打开时才会发现——替换文件夹之后请重新打开。)没有这份记录而回来的未保存内容——旧版本程序留下的,或者浏览器当时读不了、写不了文件夹记录时留下的——会在读到这一帧时和文件夹里的内容比较:和文件夹已有的内容相同,就不询问,下一次保存也不写文件(这一帧随即算作已保存);不同,则显示出来并立刻询问你,在你回答之前不会写入(见<b>冲突</b>)。如果在回答之前继续修改这一帧,浏览器里留下的是修改后的结果,而不是它回来时的样子。这个文件在、但此刻读不出来时,浏览器没见过的文件夹这一次不会打开——请稍后再试;文件已损坏或无法创建时,用文件夹名代替 id。</li>
 <li>可以放心删除 — 下次打开会重新生成一个新 id，只会重置浏览器端的状态，<b>绝不影响</b>磁盘上的标注。打包时不带也没关系。</li>
 </ul></div>
 <div class="doc-sec"><h4>恢复文件 — 输出，只在出问题时产生</h4>
-<p class="doc-p">工具从不静默丢弃工作。下面这些文件存在的唯一目的，就是让「文件坏了」或「写入撞车」永远可恢复。正常使用时你一个都不会见到。</p>
+<p class="doc-p">工具的设计原则是不静默丢弃工作。下面这些文件用来保存本来会丢掉的那一版——损坏的文件、冲突中没被保留的一方——而且是先保存、后替换；副本写不成时，需要它的那一步就不执行。它防不住的情况见下面「冲突」一段里的「程序看不出来的情况」。正常使用时这些文件你一个都不会见到。</p>
 <ul>
 <li><code>annotation.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>annotation.json</code> 会在被任何东西覆盖之前备份到这里。该帧带警告打开，在文件修好之前不显示任何标记。如果文件后来修好了、之后<b>又</b>坏了一次而且内容不同，第二份原件会写到 <code>annotation.json.corrupt-2</code>，依此类推直到 <code>-9</code>：已有的救援副本绝不会被后来的覆盖。它们都会出现在「查看备份」对话框里。</li>
 <li><code>classes.json.corrupt</code>（在根目录）—— 同理，针对无法解析的 <code>classes.json</code>。在原文件被安全备份之前，工具不会用占位名去自动覆盖它。</li>
@@ -308,10 +308,10 @@
 <li><code>note.json.corrupt</code>（在帧文件夹里）—— 无法解析的 <code>note.json</code> 在任何保存替换它之前会先复制到这里（与 <code>annotation.json</code> 同等保护），后续不同的损坏同样按 <code>-2</code>…<code>-9</code> 编号。</li>
 <li><code>note.unread-backup.json</code>（在帧文件夹里）—— 文件夹里本来就有一份 <code>note.json</code>，但本次会话始终没能把它读出来（Drive 或权限的临时问题），而你又写了自己的笔记。那份没读到的原件会在被你的笔记覆盖之前保留到这里。它<b>不是</b>损坏文件：除了读取失败过一次，没有任何证据说明它有问题。</li>
 </ul>
-<p class="doc-p"><b>冲突。</b>若磁盘上的文件比本次会话的副本<b>新</b>且内容不同(同事保存过、从别的机器拷来、同步所致),程序不会自动取舍:该帧进入写保护,<b>打开它</b>会弹出双缩略图对比,由你选择保留哪个版本;落选的一方总会存进上面的备份文件。内容相同、仅时间戳变新的情况会静默采纳,不打扰。</p>
-<p class="doc-p"><b>恢复。</b>打开带有上述备份文件的帧会出现横幅和「查看」按钮:对比当前版本与各备份。恢复是<b>置换</b>,绝不是删除:被替换下来的那一版会先写进空着的备份槽位 —— 同名槽位空着就用同名,否则用下一个空着的 <code>-2</code>…<code>-9</code> —— 所以已有的备份一个都不会被覆盖,而且全都留在对话框里可以再换回来。<code>.corrupt</code> 系列和 <code>note.unread-backup.json</code> 是「同名」这条的例外:它们的全部价值就在于那是本次会话再也造不出来的内容,所以被它们替换下来的那一版会存到对应的 <code>.unsaved-backup.json</code> 一族,而不是压在它们身上。如果目标族的槽位全被不同的内容占满了,恢复会被拒绝而不是执行,横幅会点出是哪一族,你就知道该挪走哪些文件。</p>
-<p class="doc-p"><b>版本安全。</b>本程序版本读不懂的文件(更高的 <code>schema_version</code>,或陌生的 <code>paint.encoding</code>)会使该帧变为只读:绝不覆盖,横幅提供可复制的诊断信息。请升级程序或交给 agent 判断,不要手工改文件。</p>
-<p class="doc-p"><b>浏览器本地镜像。</b>未保存的工作还会镜像在浏览器 localStorage 的 <code>vessel_annotator_v2:*</code> 键下(每帧一条小记录,仅未保存时保留全量内容)。它只是崩溃保险,不属于数据集——文件夹里的任何东西都不依赖它。</p></div>
+<p class="doc-p"><b>冲突。</b>若文件夹里某一帧的文件已经不是本次会话上次读到或写入的内容(同事保存过、从别的机器拷来、同步所致、别的程序改过,或者文件被删掉了),而本次会话在这一帧上还有未保存的改动,程序不会自动取舍:该帧进入写保护,<b>打开它</b>会弹出双缩略图对比,由你选择保留哪个版本。没被保留的那一版会先写进上面的备份文件;如果备份写不进去,这次选择就不会执行。(本次会话的版本里什么都没有——你把这一帧清空了——也就没有东西可备份。)判断依据是内容而不是文件时间:内容相同、只是时间戳变新,或者同一批标注只是排列顺序不同,都不算冲突。你的选择针对的是做选择那一刻的这一帧:如果在选择真正执行之前(排队等另一个标签页时,或正在做副本时)你又继续编辑了这一帧,这次选择就作废——新改的内容留在会话里(未保存),之后会再问你一次。(一旦已经开始写入被保留的那一版,这次写入会完成;写入期间你输入的内容留在会话里、未保存,界面不会显示“已保存”。)例外是「回到某个文件夹、却没有浏览器记录证明是在这个文件夹里做的」未保存改动——旧版本程序留下的,或是那份记录当时读不了、写不了时留下的:看不出它属于谁、从什么内容开始改的,所以除非文件夹里已经正好是这些内容,否则写入之前一定先问你——文件夹里还没有这个文件时也一样。同一浏览器的多个标签页保存时会排队;某个标签页 20 秒内没排到,会报告这次保存失败并自动重试。<b>程序看不出来的情况:</b>在它最后一次查看文件和自己写入之间(一瞬间;同步慢的文件夹会更长)到达文件夹的改动,只要不是来自本浏览器的标签页——另一台电脑、本机的另一个浏览器或程序、同步客户端迟到送达的同事保存。这时后保存的会替换先保存的,不弹对比,也没有备份。</p>
+<p class="doc-p"><b>恢复。</b>打开带有上述备份文件的帧会出现横幅和「查看」按钮:对比当前版本与各备份。恢复是<b>置换</b>,绝不是删除:被替换下来的那一版会先写进空着的备份槽位 —— 同名槽位空着就用同名,否则用下一个空着的 <code>-2</code>…<code>-9</code> —— 所以已有的备份一个都不会被覆盖,而且全都留在对话框里可以再换回来。如果恢复还在进行或还在排队时你又继续编辑了这一帧,这次恢复就作废:新改的内容保留,已经写出的副本留作多出来的一个备份。只有这一版能接收的备份才能恢复——必须是一份文档;不是 JSON、只是一个值或一个列表、或是更新格式的标注,只能查看,不会被改动。<code>.corrupt</code> 系列和 <code>note.unread-backup.json</code> 是「同名」这条的例外:它们的全部价值就在于那是本次会话再也造不出来的内容,所以被它们替换下来的那一版会存到对应的 <code>.unsaved-backup.json</code> 一族,而不是压在它们身上。如果目标族的槽位全被不同的内容占满了,恢复会被拒绝而不是执行,横幅会点出是哪一族,你就知道该挪走哪些文件。</p>
+<p class="doc-p"><b>版本安全。</b>本程序版本读不懂的文件(更高的 <code>schema_version</code>,或陌生的 <code>paint.encoding</code>)会使该帧变为只读:任何保存都不会覆盖它,横幅提供可复制的诊断信息。请升级程序或交给 agent 判断,不要手工改文件。如果这样的文件是在该帧已打开、且有未保存改动时才替换掉原来可读的文件,那就和其他冲突一样处理;此时选择保留本次会话的版本,程序会先把该文件原样(逐字节)复制为 <code>annotation.external-backup.json</code>。(这样的文件此刻读不完整时,不会有任何内容覆盖它:保存会等待并重试。)更高版本写的 <code>note.json</code> 处理方式不同:它仍然可以编辑;原文件先保存为 <code>note.unread-backup.json</code>,然后按本版本的格式写入笔记。</p>
+<p class="doc-p"><b>浏览器本地镜像。</b>未保存的工作还会镜像在浏览器 localStorage 的 <code>vessel_annotator_v2:*</code> 键下(每帧一条小记录,仅未保存时保留全量内容)。它只是崩溃保险,不属于数据集——文件夹里的任何东西都不依赖它。整个浏览器里每一帧只有一份:两个标签页在同一帧上都有未保存改动时,里面只有最后编辑的那个标签页的内容。</p></div>
 <div class="doc-sec"><h4><code>perfusion</code> 单元 — 计算得出，不来自磁盘</h4><ul>
 <li>每个病例在 <code>minip</code> 之后会自动多出一个单元，由该病例的各帧计算得到。它<b>没有文件夹、没有文件</b>，不要去创建。它是只读的：没有 label、没有 mask、没有几何面板，永远不能标注也不会保存。</li>
 <li>平滑度滑块会实时重新着色。可以下载为 <code>&lt;case&gt;_perfusion.png</code> — 那是浏览器下载，不是数据集里的文件。</li>
@@ -344,7 +344,7 @@
 <li>每个分包都要带<b>自己的一份 <code>classes.json</code></b>，否则每个人会各自编出不同的类别名。</li>
 <li>每个病例必须整体分给同一个人 —— 它的所有帧和 <code>minip</code> 不能拆开。</li>
 <li>合并就是直接复制：病例文件夹名唯一，不会冲突。如果有人加过类别，<code>classes.json</code> 要取<b>并集</b>。</li>
-<li>会被改动的只有：<code>annotation.json</code>、<code>note.json</code>、<code>geometry.json</code> 的 <code>filter</code> 块、<code>classes.json</code>、以及 <code>.annotator_dataset.json</code>。除此之外工具不写任何文件。</li>
+<li>会被改动的只有：<code>annotation.json</code>、<code>note.json</code>、<code>geometry.json</code> 的 <code>filter</code> 块、<code>classes.json</code>、以及 <code>.annotator_dataset.json</code>。除此之外,工具只会写上文所说的恢复文件(<code>.corrupt</code> 和 <code>-backup.json</code> 副本),而且只在有东西需要保护时才写。</li>
 </ul></div>
 <div class="doc-sec"><h4>从其他帧复制标注</h4><ul>
 <li><b>从其他帧复制</b>按钮只能写入<b>完全空白</b>的帧 —— 只要该帧在<em>任何</em>图层上有 segment、点或 paint，或者有编号标记，按钮就是禁用的。（打星或写笔记不影响。）</li>
@@ -375,17 +375,54 @@ FOLDER STRUCTURE
       annotation.json         (tool OUTPUT)
       note.json               (tool OUTPUT)
       annotation.json.corrupt          (tool OUTPUT, recovery -- see below)
-      note.unread-backup.json          (tool OUTPUT, recovery -- see below)
+      note.json.corrupt                (tool OUTPUT, recovery -- see below)
       annotation.unsaved-backup.json   (tool OUTPUT, recovery -- see below)
       note.unsaved-backup.json         (tool OUTPUT, recovery -- see below)
+      annotation.external-backup.json  (tool OUTPUT, recovery -- see below)
+      note.external-backup.json        (tool OUTPUT, recovery -- see below)
+      note.unread-backup.json          (tool OUTPUT, recovery -- see below)
 
-RECOVERY FILES. Written only when something is wrong; never read back
-automatically; never create them yourself.
-  annotation.json.corrupt / classes.json.corrupt (the latter at the root) -- an
-    unparseable file is copied here ONCE before anything overwrites it.
-  annotation.unsaved-backup.json / note.unsaved-backup.json -- if the browser
-    holds unsaved edits and the file on disk turns out to be NEWER, the edits are
-    written here instead of being dropped or overwriting the newer file.
+RECOVERY FILES -- written by the tool only when something needs protecting.
+Never create them yourself; nothing reads them back automatically. The app can
+show and RESTORE them (opening the frame offers a "View" banner; restoring is a
+swap: the version it replaces is first written to a free backup name).
+  annotation.json.corrupt / note.json.corrupt / classes.json.corrupt (the last
+    one at the root) -- a file that cannot be parsed, or that this version can
+    take over only in part, is copied here, byte for byte, before a save
+    rewrites it.
+  annotation.unsaved-backup.json / note.unsaved-backup.json -- the session's
+    side of a resolved conflict (the folder's version was kept).
+  annotation.external-backup.json / note.external-backup.json -- the folder's
+    side of a resolved conflict (the session's version was kept): the file as it
+    was, byte for byte.
+  note.unread-backup.json -- the folder held a note.json this session never
+    managed to READ (a Drive or permission hiccup) and a note was then written;
+    the unread original is kept here first. It is not a damaged file.
+  A backup name that already holds DIFFERENT content is never written over: the
+  copy goes to ...-2, and so on up to -9; when all nine are taken, the operation
+  is refused instead.
+CONFLICTS -- decided by CONTENT, not by file time. When a frame's file no longer
+holds what the session last read or wrote, and the session has unsaved work on
+that frame, nothing is resolved automatically: the frame is write-protected and
+opening it shows a two-version chooser; the version that is not kept goes to one
+of the backup files above first, and if that copy cannot be made the choice is
+not carried out. (Unsaved work that came back from the browser without its
+record that it was made in THIS folder -- work left by an older version of the
+app, or kept while that record could not be read or written -- is asked about
+unless the folder already holds exactly that work, also where the folder has no
+such file yet.) What this cannot see: a write by another computer, another
+browser or another program that lands in the moment between the app's last look
+at a file and its own write -- the later write then replaces the earlier one,
+with no chooser and no backup.
+NEWER FORMATS -- an annotation.json with a schema_version above the app's own,
+or with an unknown paint.encoding, makes the frame READ-ONLY: saving does not
+rewrite it. The one way it is replaced: it appears while the frame is open with
+unsaved work -- a conflict like any other -- and the session's version is
+chosen; the file is then first copied, byte for byte, to
+annotation.external-backup.json. (While such a file cannot be read in full,
+nothing is written over it: the save waits.) A note.json from a newer version is
+treated differently: it can still be edited; the file as it was is first kept as
+note.unread-backup.json, and the note is then written in this version's format.
 
 Do NOT create a "perfusion" folder. The tool appends one computed, view-only
 "perfusion" unit to every case, after minip. It has no files on disk, no label,
@@ -424,7 +461,8 @@ FILE: mask.npy   (INPUT, optional) -- vessel foreground mask
 ========================================
 - 2-D (H, W) uint8 of 0/1 (0 = background, 1 = vessel). Same W x H as label.npy.
 - If present it MUST match the frames.png / label.npy size (see the shape contract above).
-- Rendered as a blue overlay; also limits the pixel-paint brush when "foreground only" is on.
+- A mask.npy that cannot be parsed at all (truncated, not 2-D, unsupported dtype) does NOT block the frame: it opens for annotation with a warning, without the overlay and without the "foreground only" limit.
+- Rendered as a blue overlay; also limits the pixel-paint brush when "foreground only" is on. Without a mask.npy there is no overlay and no such limit.
 - Python: np.save("mask.npy", (label_HxW > 0).astype(np.uint8))
 
 ========================================
@@ -432,7 +470,7 @@ FILE: geometry.json   (INPUT + OUTPUT, optional) -- per-segment metrics + saved 
 ========================================
 - JSON. "segments" is keyed by SEGMENT ID (the SAME integer as the label.npy pixel value, written as a string; background 0 excluded). Each value is an OBJECT of named numeric metrics your pipeline computes -- any names, any count.
 - Optional "filter" records the reviewer's last-used filter window: which metric + min + max. The tool WRITES this back when the reviewer drags the sliders. You may set a default (e.g. the first metric's full range) or omit it.
-- The tool NEVER changes "segments"; it only writes "filter", and preserves any other fields.
+- The tool changes only "filter": it reads the file again right before it writes, sets "filter" and writes everything else back as it read it then (as re-formatted JSON, not byte for byte). A geometry.json that cannot be read at that moment, or is no longer a JSON object, is not written.
 - Example:
   {
     "segments": {
@@ -582,7 +620,9 @@ used only for ordering.
 - Merging is a plain copy; case folder names are unique so nothing collides. Take
   the UNION of the classes.json files if anyone added a class.
 - What comes back changed: annotation.json, note.json, the "filter" block of
-  geometry.json, classes.json, .annotator_dataset.json. Nothing else is written.
+  geometry.json, classes.json, .annotator_dataset.json. Apart from these the tool
+  writes only the recovery files (*.corrupt, *-backup.json), and only when
+  something had to be protected.
 
 ========================================
 COPY FROM FRAME

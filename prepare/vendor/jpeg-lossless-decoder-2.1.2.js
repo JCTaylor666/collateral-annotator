@@ -1,3 +1,17 @@
+// jpeg-lossless-decoder-js 2.1.2 (release/lossless.js) WITH FIVE CORRECTIONS, each marked "PATCH" below.
+// The original decodes the common case (no restart markers, no point transform, values far from the 16-bit
+// limits) correctly and everything else silently wrong. Checked sample by sample against GDCM, libjpeg-turbo and
+// the arrays the test streams were built from (review-2026-11-22/make_dicom_fixtures.py, compare_dicom.py).
+// prepare/dicom.js runs a self-test of all five when it first decodes a frame, so replacing this file with an
+// unpatched one cannot go unnoticed. Only the one-component path (decodeSingle) is corrected and used; the
+// three-component path (decodeRGB) is as published — dicom.js refuses colour frames before they get here.
+//   PATCH 1  point transform: the prediction starts at 2^(P-Pt-1), not 2^(P-1)            (ITU-T T.81 H.1.2.1)
+//   PATCH 2  a sample whose last bit is directly followed by a marker (no padding bit) was dropped
+//   PATCH 3  the first line of every restart interval is predicted from the left neighbour (T.81 H.1.2.1)
+//   PATCH 4  predictor 7 is (Ra + Rb) >> 1 in integers, not a fraction
+//   PATCH 5  a scan that is cut short gives no samples it has no bits for: the end of the data is the end of the
+//            scan (not zero bits), the last sample may not take bits of the marker after it, and a sample that
+//            could not be decoded is not written as its prediction. dicom.js then sees that samples are missing.
 var __defProp = Object.defineProperty;
 var __export = (target, all) => {
   for (var name in all)
@@ -586,6 +600,7 @@ var Decoder = class _Decoder {
     this.buffer = null;
     this.xLoc = 0;
     this.yLoc = 0;
+    this.restartY = 0;   // PATCH 3: the line on which the current restart interval began
     let current = this.stream.get16();
     if (current !== 65496) {
       throw new Error("Not a JPEG file");
@@ -755,6 +770,7 @@ var Decoder = class _Decoder {
           current = this.decodeUnit(pred, temp, index);
           while (current === 0 && this.xLoc < this.xDim && this.yLoc < this.yDim) {
             this.output(pred);
+            if (this.yLoc >= this.yDim) this.noteTail(temp, index);   // PATCH 5
             current = this.decodeUnit(pred, temp, index);
           }
           break;
@@ -762,10 +778,14 @@ var Decoder = class _Decoder {
         for (mcuNum = 0; mcuNum < this.restartInterval; mcuNum += 1) {
           this.restarting = mcuNum === 0;
           current = this.decodeUnit(pred, temp, index);
-          this.output(pred);
+          // PATCH 5: was output first, then the test. A marker instead of a sample means the interval ended
+          // before this sample (the scan is over, or its data is cut short): there is no value to write. The
+          // prediction was written, the position moved on, and the rest of the frame was shifted by one.
           if (current !== 0) {
             break;
           }
+          this.output(pred);
+          if (this.yLoc >= this.yDim && this.tailPad === undefined) this.noteTail(temp, index);   // PATCH 5
         }
         if (current === 0) {
           if (this.markerIndex !== 0) {
@@ -814,7 +834,10 @@ var Decoder = class _Decoder {
     return this.getPreviousY(compOffset) + (this.getPreviousX(compOffset) - this.getPreviousXY(compOffset) >> 1);
   }
   select7(compOffset) {
-    return (this.getPreviousX(compOffset) + this.getPreviousY(compOffset)) / 2;
+    // PATCH 4: was "/ 2". An odd sum left a prediction ending in .5; where prediction + difference is
+    // negative (16-bit samples: the sum is taken modulo 2^16) the later "& mask" rounded it the wrong way,
+    // one too high, and every sample predicted from that one inherited the error.
+    return this.getPreviousX(compOffset) + this.getPreviousY(compOffset) >> 1;
   }
   decodeRGB(prev, temp, index) {
     if (this.selector === null)
@@ -861,7 +884,14 @@ var Decoder = class _Decoder {
     let value, i, n, nRestart;
     if (this.restarting) {
       this.restarting = false;
-      prev[0] = 1 << this.frame.precision - 1;
+      this.restartY = this.yLoc;
+      prev[0] = 1 << this.frame.precision - this.scan.al - 1;   // PATCH 1 (was: 1 << precision - 1)
+    } else if (this.yLoc === this.restartY) {
+      // PATCH 3: the first line of the scan and of every restart interval uses the sample to the left, whatever
+      // predictor the scan selects. The original used the selected predictor, which reaches into the line
+      // above — the previous restart interval. (Line 0 is unaffected: there every predictor reduces to this.)
+      // A restart interval is a whole number of lines in lossless JPEG (T.81 Table B.7); the caller checks it.
+      prev[0] = this.getPreviousX();
     } else {
       prev[0] = this.selector();
     }
@@ -872,7 +902,10 @@ var Decoder = class _Decoder {
       }
       n = this.getn(prev, value, temp, index);
       nRestart = n >> 8;
-      if (nRestart >= _Decoder.RESTART_MARKER_BEGIN && nRestart <= _Decoder.RESTART_MARKER_END) {
+      // PATCH 5: was "a restart marker (FFD0-FFD7)". getn answers with ANY marker it ran into — the end-of-image
+      // marker too, when the bits of this sample's difference are missing — and that one was added to the
+      // prediction as if it were the difference. (A difference is at most 16 bits: n >> 8 never gets near.)
+      if (nRestart >= 65280) {
         return nRestart;
       }
       prev[0] += n;
@@ -910,6 +943,37 @@ var Decoder = class _Decoder {
   //	        and marker_index=9
   //	      If marker_index=9 then index is always > 8, or HuffmanValue()
   //	        will not be called
+  // The next byte of entropy-coded data, as the bit buffer wants it.
+  // PATCH 2 (markerIndex): was 9. The 0xFF of a marker is put into the bit buffer as 8 bits, so "fewer than
+  // markerIndex bits left" has to mean "fewer than those 8", i.e. bits of the marker itself were consumed. With 9
+  // the test also fired when exactly the 8 marker bits were left — when the data ended on a byte boundary — and
+  // the value just decoded was thrown away: the last sample of a restart interval kept its prediction, and the
+  // last sample of the image was not written at all when its difference was 0.
+  // PATCH 5: past the end of the data there is nothing. The original read `undefined` there, the bit buffer took
+  // it for zero bits, and samples were made of them — a frame whose last bytes were missing came back complete
+  // and wrong. The end of the data is treated as the end-of-image marker that should have stood there.
+  // PATCH 5: what is left of the byte in which the last sample ended — how many bits, and whether they are all
+  // ones, as the padding of a complete scan is (T.81 F.1.2.3). The caller needs it for a scan that no marker
+  // closes: there, bits of whatever follows the data (a pad byte) can have been taken for the last sample's.
+  // (The low 8 unread bits are not of that byte when a marker's FF, or a whole byte read ahead, sits there.)
+  // `used`: how many bytes of the data the samples took bits from (a byte read ahead is not one of them).
+  noteTail(temp, index) {
+    let r = index[0], t = temp[0];
+    const used = this.stream.index - (this.markerIndex === 0 && r >= 8 ? 1 : 0);
+    if (this.markerIndex !== 0 || r >= 8) { r -= 8; t >>= 8; }
+    this.tailPad = r < 0 ? { bits: 0, ones: false, used } : { bits: r, ones: (t & ((1 << r) - 1)) === (1 << r) - 1, used };
+  }
+  entropyByte() {
+    const s = this.stream;
+    if (s.index >= s.buffer.length) { this.marker = 217; this.markerIndex = 8; return 255; }
+    const input = s.get8();
+    if (input === 255) {
+      if (s.index >= s.buffer.length) { this.marker = 217; this.markerIndex = 8; return 255; }
+      this.marker = s.get8();
+      if (this.marker !== 0) this.markerIndex = 8;
+    }
+    return input;
+  }
   getHuffmanValue(table, temp, index) {
     let code, input;
     const mask = 65535;
@@ -917,13 +981,7 @@ var Decoder = class _Decoder {
       throw new Error("stream not initialized");
     if (index[0] < 8) {
       temp[0] <<= 8;
-      input = this.stream.get8();
-      if (input === 255) {
-        this.marker = this.stream.get8();
-        if (this.marker !== 0) {
-          this.markerIndex = 9;
-        }
-      }
+      input = this.entropyByte();   // PATCH 2 and 5
       temp[0] |= input;
     } else {
       index[0] -= 8;
@@ -936,13 +994,7 @@ var Decoder = class _Decoder {
       }
       temp[0] &= mask >> 16 - index[0];
       temp[0] <<= 8;
-      input = this.stream.get8();
-      if (input === 255) {
-        this.marker = this.stream.get8();
-        if (this.marker !== 0) {
-          this.markerIndex = 9;
-        }
-      }
+      input = this.entropyByte();   // PATCH 2 and 5
       temp[0] |= input;
       code = table[(code & 255) * 256 + (temp[0] >> index[0])];
       index[0] += 8;
@@ -977,7 +1029,10 @@ var Decoder = class _Decoder {
     }
     index[0] -= n;
     if (index[0] >= 0) {
-      if (index[0] < this.markerIndex && !this.isLastPixel()) {
+      // PATCH 5: was "&& !this.isLastPixel()". That let the last sample take its difference bits from the marker
+      // after it (all ones) when its own were missing. It made up for the off-by-one PATCH 2 removed; a complete
+      // sample never reaches into the marker.
+      if (index[0] < this.markerIndex) {
         this.markerIndex = 0;
         return (65280 | this.marker) << 8;
       }
@@ -985,13 +1040,7 @@ var Decoder = class _Decoder {
       temp[0] &= mask >> 16 - index[0];
     } else {
       temp[0] <<= 8;
-      input = this.stream.get8();
-      if (input === 255) {
-        this.marker = this.stream.get8();
-        if (this.marker !== 0) {
-          this.markerIndex = 9;
-        }
-      }
+      input = this.entropyByte();   // PATCH 2 and 5
       temp[0] |= input;
       index[0] += 8;
       if (index[0] < 0) {
@@ -1000,13 +1049,7 @@ var Decoder = class _Decoder {
           return (65280 | this.marker) << 8;
         }
         temp[0] <<= 8;
-        input = this.stream.get8();
-        if (input === 255) {
-          this.marker = this.stream.get8();
-          if (this.marker !== 0) {
-            this.markerIndex = 9;
-          }
-        }
+        input = this.entropyByte();   // PATCH 2 and 5
         temp[0] |= input;
         index[0] += 8;
       }
@@ -1033,7 +1076,7 @@ var Decoder = class _Decoder {
     } else if (this.yLoc > 0) {
       return this.getPreviousY(compOffset);
     } else {
-      return 1 << this.frame.precision - 1;
+      return 1 << this.frame.precision - this.scan.al - 1;   // PATCH 1 (was: 1 << precision - 1)
     }
   }
   getPreviousXY(compOffset = 0) {
