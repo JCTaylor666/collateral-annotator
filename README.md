@@ -2,6 +2,13 @@
 
 **English** · [中文](README.zh-CN.md)
 
+> [!CAUTION]
+> **One tab per computer. Annotating together in a shared folder has not been tested.**
+>
+> - On each computer, open the annotator in **one tab of one browser**. A second tab in the same browser is stopped with a notice; another browser or a private window is not detected.
+> - Working in the **same data folder** from several computers or by several people — for example a folder shared through Google Drive, Dropbox or OneDrive — **has not been tested**.
+> - To avoid conflicts, **split the work before you start**: prepare the data folder once and create the classes, then give everyone a copy and their own cases (for example `s_0`–`s_9`, `s_10`–`s_19`, …). Each person annotates only their own cases, on their own computer, and leaves the classes as they are, so that a class number means the same in every copy. At the end, copy the finished case folders back into one data folder.
+
 Mark collateral vessel segments on DSA frames, right in the browser. Your files stay on your computer.
 
 **▶ [Open the annotator](https://jctaylor666.github.io/collateral-annotator/)** · **[Prepare data from DICOM](https://jctaylor666.github.io/collateral-annotator/prepare.html)**
